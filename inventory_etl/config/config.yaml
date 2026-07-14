@@ -1,0 +1,90 @@
+# ══════════════════════════════════════════════════════════════════
+# Inventory Planning Agent — ETL configuration
+# Business rules & assumptions live here so they are auditable and easy
+# to change without touching code. Values marked ASSUMPTION are NOT in
+# the source database (see schema analysis §gaps) and must be reconciled
+# with the Naheed buying team.
+# ══════════════════════════════════════════════════════════════════
+
+# ---- Data cleansing thresholds (FR-A4) --------------------------------
+cleansing:
+  # Stock qty at or above this is treated as a "sentinel / unlimited" value
+  # (drop-ship & vendor items use 99986/99991-style markers, not real counts).
+  stock_sentinel_threshold: 10000
+  # Negative on-hand quantities are clamped up to this floor and logged.
+  stock_negative_floor: 0
+  # A snapshot older than this many days is flagged "stale" (never silently 0).
+  snapshot_stale_days: 2
+
+# ---- Channel taxonomy (FR-F1) -----------------------------------------
+# Magento has ONE website; channel is derived from sales_order.shipping_method.
+# carrier code (text before the first underscore) -> canonical channel.
+channels:
+  mapping:
+    storepickup: store
+    foodpanda: foodpanda
+    careem: foodpanda          # marketplace-style; group with quick-commerce
+    zambeel: online_delivery
+    tcsshipping: online_delivery
+    blueexshipping: online_delivery
+    naheedexpressshipping: online_delivery
+    expressshipping: online_delivery
+    flatrate: online_delivery
+    freeshipping: online_delivery
+    tablerate: online_delivery
+  default: online_delivery      # anything unmatched
+  # Seed values for channel_master (ASSUMPTION — not in DB).
+  master:
+    store:           { fulfillment_cost_factor: 1.00, service_level_target: 0.95 }
+    naheed_web:      { fulfillment_cost_factor: 1.15, service_level_target: 0.95 }
+    online_delivery: { fulfillment_cost_factor: 1.15, service_level_target: 0.95 }
+    foodpanda:       { fulfillment_cost_factor: 1.35, service_level_target: 0.97 }
+
+# ---- Cost / margin sourcing (see analysis: EAV `cost` is empty) --------
+cost:
+  # staging_margin has DUPLICATE rows per product with conflicting costs.
+  # strategy: how to collapse them. one of:
+  #   max      -> most conservative margin (recommended default)
+  #   min      -> ignores obvious unit-vs-pack low outliers poorly; not advised
+  #   median   -> robust to a single bad row
+  #   nearest_price -> the cost row closest to final_price
+  strategy: max
+  # Fall back to catalog_product_flat_1.cost when staging_margin has no row.
+  fallback_to_flat: true
+
+# ---- Perishability (FR-G1) --------------------------------------------
+perishability:
+  # EAV attribute code carrying shelf life (days). Present in production.
+  shelf_life_attribute: expire_after_day
+  # A SKU is perishable when shelf_life_days is present AND <= this.
+  perishable_max_days: 365
+
+# ---- Replenishment inputs NOT in the DB (ASSUMPTION — FR-A5) ----------
+replenishment:
+  default_supplier_lead_time_days: 7      # global fallback lead time
+  default_moq: 1                          # minimum order quantity
+  # per fulfillment/picking mode overrides (from nhd_product_flat.picking_mode)
+  lead_time_by_picking_mode:
+    "Drop Shipping": 10
+    "Drop by Vendor": 10
+    "Collect from Vendor": 5
+    "Naheed Super Market": 3
+  # picking modes whose items are NOT replenished into own warehouses
+  dropship_modes: ["Drop Shipping", "Drop by Vendor"]
+
+# ---- External signals (FR-A6) -----------------------------------------
+external_signals:
+  country: PK                    # for the public-holiday calendar
+  start_date: "2020-01-01"       # date spine start (covers sales history)
+  # Pakistan payday window: last 2 and first 3 days of each month.
+  payday_days_month_start: [1, 2, 3]
+  payday_days_month_end: [30, 31]
+  # Weather is a documented follow-up (needs an API key); left disabled here.
+  weather_enabled: false
+
+# ---- Product scope ----------------------------------------------------
+scope:
+  # Product types to include as stock-carrying SKUs.
+  include_product_types: [simple]
+  # Include disabled products? (status=2). Usually no for planning.
+  include_disabled: false

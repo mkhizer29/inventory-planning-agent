@@ -1,0 +1,9 @@
+# secrets
+.env
+# build / output artifacts
+output/*.db
+output/*.md
+output/csv/
+__pycache__/
+*.pyc
+.pytest_cache/

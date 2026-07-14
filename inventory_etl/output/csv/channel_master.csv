@@ -1,0 +1,5 @@
+﻿channel_id,channel_name,fulfillment_cost_factor,service_level_target
+store,store,1.0,0.95
+naheed_web,naheed_web,1.15,0.95
+online_delivery,online_delivery,1.15,0.95
+foodpanda,foodpanda,1.35,0.97
