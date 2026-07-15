@@ -8,5 +8,21 @@ version = "0.1.0"
 description = "Inventory Planning Agent — ETL (Layer 2): Magento pg_1 -> canonical warehouse"
 requires-python = ">=3.11"
 
+# The Python package `etl` lives at inventory_etl/etl. Tell setuptools the import
+# root is the `inventory_etl` directory so `import etl` works after
+# `pip install -e .` run from the repository root.
 [tool.setuptools]
-packages = ["etl"]
+package-dir = {"" = "inventory_etl"}
+
+[tool.setuptools.packages.find]
+where = ["inventory_etl"]
+include = ["etl*"]
+
+# Ship the .sql extract files with the installed package.
+[tool.setuptools.package-data]
+etl = ["sql/*.sql"]
+
+# Canonical pytest configuration (single source of truth, at the repo root).
+[tool.pytest.ini_options]
+pythonpath = ["inventory_etl"]
+testpaths = ["inventory_etl/tests"]

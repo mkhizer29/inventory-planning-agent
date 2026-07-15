@@ -1,9 +1,20 @@
 # secrets
 .env
-# build / output artifacts
-output/*.db
-output/*.md
-output/csv/
+
+# python virtual environment
+.venv/
+
+# editable-install / build metadata
+*.egg-info/
+build/
+dist/
+
+# generated ETL outputs (live under inventory_etl/output)
+inventory_etl/output/*.db
+inventory_etl/output/*.md
+inventory_etl/output/csv/
+
+# python caches
 __pycache__/
 *.pyc
 .pytest_cache/

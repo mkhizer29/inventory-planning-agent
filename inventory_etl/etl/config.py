@@ -1,4 +1,16 @@
-"""Configuration loading: `.env` (secrets/connection) + `config.yaml` (business rules)."""
+"""Configuration loading: `.env` (secrets/connection) + `config.yaml` (business rules).
+
+Path strategy (repo layout: Inventory-Planning-Agent/inventory_etl/etl/config.py):
+
+    ETL_ROOT    = .../Inventory-Planning-Agent/inventory_etl   (this package's home)
+    REPO_ROOT   = .../Inventory-Planning-Agent                 (git repository root)
+    ENV_PATH    = REPO_ROOT/.env                               (secrets; git-ignored)
+    CONFIG_PATH = ETL_ROOT/config/config.yaml                  (business rules)
+
+Relative TARGET_SQLITE_PATH values in .env resolve against REPO_ROOT, so
+`inventory_etl/output/inventory.db` lands inside the ETL project. If unset,
+the target defaults to ETL_ROOT/output/inventory.db.
+"""
 from __future__ import annotations
 
 import os
@@ -8,20 +20,32 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-# Project root = the directory that contains this `etl/` package's parent.
-ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = ROOT / "config" / "config.yaml"
-ENV_PATH = ROOT / ".env"
+# --- explicit, unambiguous path anchors ---
+ETL_ROOT = Path(__file__).resolve().parent.parent          # .../inventory_etl
+REPO_ROOT = ETL_ROOT.parent                                # .../Inventory-Planning-Agent
+ENV_PATH = REPO_ROOT / ".env"
+CONFIG_PATH = ETL_ROOT / "config" / "config.yaml"
+DEFAULT_SQLITE_PATH = ETL_ROOT / "output" / "inventory.db"
 
-# Load .env once at import (silent if missing — env vars may come from the shell).
+# Load .env from the repo root once at import (silent if missing — real
+# environment variables set by the shell/CI still take effect).
 load_dotenv(ENV_PATH)
 
 
 @lru_cache(maxsize=1)
 def settings() -> dict:
-    """Business rules from config.yaml (cached)."""
+    """Business rules from config.yaml (cached). Fails loudly if missing/malformed."""
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(
+            f"ETL configuration not found at: {CONFIG_PATH}\n"
+            f"Expected 'inventory_etl/config/config.yaml' under the repo root ({REPO_ROOT}). "
+            f"Run commands from the repository root and keep the config file in place."
+        )
     with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+        data = yaml.safe_load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"Config at {CONFIG_PATH} did not parse to a mapping/object.")
+    return data
 
 
 def _env(key: str, default: str | None = None) -> str | None:
@@ -33,6 +57,7 @@ def source_profile(name: str | None = None) -> dict:
     """Return the MySQL connection profile for the selected source.
 
     `name` overrides ETL_SOURCE; one of {"staging", "local_backup"}.
+    (Passwords are read from the environment and never logged here.)
     """
     name = (name or _env("ETL_SOURCE", "staging") or "staging").lower()
     if name in ("staging", "stage"):
@@ -57,6 +82,14 @@ def source_profile(name: str | None = None) -> dict:
 
 
 def target_sqlite_path() -> Path:
-    raw = _env("TARGET_SQLITE_PATH", "output/inventory.db")
+    """Resolve the SQLite warehouse path.
+
+    - unset  -> ETL_ROOT/output/inventory.db (default)
+    - absolute -> used as-is
+    - relative -> resolved against REPO_ROOT (so 'inventory_etl/output/inventory.db' works)
+    """
+    raw = _env("TARGET_SQLITE_PATH")
+    if not raw:
+        return DEFAULT_SQLITE_PATH
     p = Path(raw)
-    return p if p.is_absolute() else (ROOT / p)
+    return p if p.is_absolute() else (REPO_ROOT / p)

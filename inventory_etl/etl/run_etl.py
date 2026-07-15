@@ -11,7 +11,6 @@ import argparse
 import datetime as dt
 import logging
 import sys
-from pathlib import Path
 
 from . import config, db, extract, external_signals, load, quality_report, transform
 
@@ -45,8 +44,9 @@ def run(source: str | None, sales_since: str | None, run_date: str | None) -> in
     history = load.append_inventory_history(tgt, frames["inventory_snapshot"], run_date)
     frames["inventory_snapshot_history"] = history
 
-    out_dir = Path(config.ROOT) / "output"
-    out_dir.mkdir(exist_ok=True)
+    # keep DB, CSVs and report co-located with the SQLite target
+    out_dir = config.target_sqlite_path().parent
+    out_dir.mkdir(parents=True, exist_ok=True)
     load.export_csvs(frames, out_dir / "csv")
 
     report = quality_report.build_report(frames, profile, run_date)
