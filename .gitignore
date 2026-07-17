@@ -18,3 +18,16 @@ inventory_etl/output/csv/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# ── forecasting pilot ──────────────────────────────────────────
+# pipeline data is regenerated from code, never committed
+data/
+
+# database dumps / archives — but keep the ETL's own query files
+*.sql
+*.zip
+!inventory_etl/etl/sql/*.sql
+
+# model scorecard results (keep the folder via .gitkeep, ignore the CSVs)
+outputs/*.csv
+!outputs/.gitkeep
