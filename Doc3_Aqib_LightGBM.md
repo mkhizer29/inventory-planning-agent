@@ -18,6 +18,31 @@ cloning, the Python environment, regenerating the data, and the branch workflow.
 
 ---
 
+## ⚠️ Contract update (v2 — daily, ecommerce-only) — READ THIS FIRST
+
+The pilot moved from **weekly** to **daily**, and to **ecommerce-only**. The weekly
+sections below are background; the **binding contract is here**:
+
+- **Inputs** (already generated in `data/processed/`):
+  - `model_panel.parquet` — daily history, one row per `sku × channel × date`; target = **`units_observed`**.
+  - `forecast_features.parquet` — the next **14 future days** per SKU (leakage-safe: **no** actual sales, **no** realized future discounts).
+- **Channel**: ecommerce only → **`naheed_web`** (physical `store` excluded).
+- **Horizons**: forecast **7 and 14 daily** steps, **chronological** split — `TEST_WEEKS` is gone.
+- **Scoring**: `from evaluation import evaluate` → `evaluate(preds, horizon=7 or 14)`.
+  Submit **`sku, channel, date, y_pred`** only — **never pass `y_true`**. Optional `lower_bound`/`upper_bound`.
+  Reported: **WAPE, MAE, MASE, RMSE, bias** + interval coverage.
+- Supplier **lead time & MOQ are downstream configurable assumptions**, **not forecasting features**.
+
+**Your model (global LightGBM, daily).** Leakage-safe daily features:
+`lag_1, lag_2, lag_3, lag_7, lag_14, lag_28, rolling_mean_7, rolling_mean_14, rolling_std_7,
+day_of_week, is_public_holiday, is_payday_window, on_promo (historical), price, category, brand, channel`.
+Train only on rows with `date <= cutoff`. For **future** rows use only what's in
+`forecast_features.parquet` — planned/calendar signals — **never** realized future discounts
+(`planned_promo` is currently `unavailable`, so treat promo as off for the future window).
+Forecast 7 & 14 days recursively; submit `preds[sku, channel, date, y_pred]` (no `y_true`).
+
+---
+
 ## 0. How your piece fits the team
 
 | Person | Method | Document |

@@ -25,8 +25,10 @@ data/*
 # teammates can start without DB access or re-running the ETL.
 !data/processed/
 data/processed/*
-!data/processed/weekly_sales.parquet
-!data/processed/weekly_signals.parquet
+!data/processed/model_panel.parquet
+!data/processed/forecast_features.parquet
+!data/processed/inventory_context.parquet
+!data/processed/pilot_manifest.json
 
 # database dumps / archives — but keep the ETL's own query files
 *.sql

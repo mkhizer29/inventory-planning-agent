@@ -17,6 +17,28 @@ scorecard that Khizer and Aqib import — coordinate any change to it with the t
 
 ---
 
+## ⚠️ Contract update (v2 — daily, ecommerce-only) — READ THIS FIRST
+
+The pilot moved from **weekly** to **daily**, and to **ecommerce-only**. The weekly
+sections below are background; the **binding contract is here**:
+
+- **Inputs** (already generated in `data/processed/`, built by `src/prepare_pilot_data.py`):
+  - `model_panel.parquet` — daily history, one row per `sku × channel × date`; target = **`units_observed`**.
+  - `forecast_features.parquet` — the next **14 future days** per SKU (leakage-safe: no actuals, no realized future discounts).
+- **Channel**: ecommerce only → **`naheed_web`** (physical `store` excluded; `foodpanda` has no data yet, column kept).
+- **Horizons**: forecast **7 and 14 daily** steps. Splits are **chronological** — `TEST_WEEKS` is gone.
+- **Scoring** (you own `src/evaluation.py`, now v2): `from evaluation import evaluate` → `evaluate(preds, horizon=7)` / `evaluate(preds, horizon=14)`.
+  Submit predictions with **`sku, channel, date, y_pred`** only — **never pass `y_true`** (the evaluator holds it). Optional `lower_bound`/`upper_bound`.
+  Reported: **WAPE, MAE, MASE, RMSE, bias** (overall / per-SKU / per-channel) + interval coverage.
+- Supplier **lead time & MOQ are downstream configurable assumptions** (in `inventory_context.parquet` / config), **not forecasting features**.
+
+**Your daily baselines:** last-day naive · same-day-last-week seasonal naive (m=7) ·
+7-day moving average · 14-day moving average (optional intermittent-demand/Croston if needed).
+Build `preds[sku, channel, date, y_pred]` for the held-out horizon and call `evaluate()`.
+Your **lowest-WAPE/MASE baseline is the bar** Khizer and Aqib must beat.
+
+---
+
 ## 0. How your piece fits the team
 
 Three of us are each building a different forecasting method on the **same 30

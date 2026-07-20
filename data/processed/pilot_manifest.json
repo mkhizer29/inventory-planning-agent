@@ -1,0 +1,132 @@
+{
+  "schema_version": "2.0-daily-ecommerce",
+  "generated_at": "2026-07-20T03:40:25",
+  "as_of_date": "2026-07-15",
+  "source_database_profile": "sqlite:inventory.db",
+  "source_warehouse_path": "C:\\Users\\Bilal\\Documents\\Naheed Ai Internship\\Inventory-Planning-Agent\\inventory_etl\\output\\inventory.db",
+  "data_frequency": "daily",
+  "forecast_horizons": [
+    7,
+    14
+  ],
+  "history_start": "2026-01-15",
+  "history_end": "2026-07-15",
+  "selection_cutoff": null,
+  "sku_count": 30,
+  "ecommerce_channels": [
+    "naheed_web"
+  ],
+  "model_panel_row_count": 5429,
+  "forecast_feature_row_count": 420,
+  "inventory_context_row_count": 30,
+  "selected_skus": [
+    "IC-1055803",
+    "IC-1018771",
+    "IC-1053521",
+    "IC-1147930",
+    "IC-1032718",
+    "IC-1166005",
+    "IC-1138507",
+    "IC-1116441",
+    "IC-1053526",
+    "IC-1057685",
+    "IC-1133439",
+    "IC-1018988",
+    "IC-1037570",
+    "IC-1177117",
+    "IC-1005194",
+    "IC-1044359",
+    "IC-1088406",
+    "IC-1134493",
+    "IC-1166220",
+    "IC-1001018",
+    "IC-1178594",
+    "IC-1166218",
+    "IC-1178591",
+    "IC-1185817",
+    "IC-1094191",
+    "IC-1020926",
+    "IC-1097379",
+    "IC-1044104",
+    "IC-1042719",
+    "IC-1172128"
+  ],
+  "category_distribution": {
+    "Health & Beauty": 15,
+    "Groceries & Pets": 15
+  },
+  "channel_distribution": {
+    "naheed_web": 5429
+  },
+  "physical_store_rows_excluded": 498,
+  "unknown_channel_rows": {},
+  "zero_sales_rate": 0.2177,
+  "stockout_rate": 0.0022,
+  "censored_demand_rate": 0.0022,
+  "stock_observation_coverage": 0.0111,
+  "promotion_coverage": 0.0759,
+  "perishability_coverage": 0.0,
+  "assumed_lead_time_count": 30,
+  "assumed_moq_count": 30,
+  "assumed_pack_size_count": 30,
+  "missing_value_counts": {
+    "model_panel_stock_on_hand": 5369,
+    "inventory_unit_cost": 30,
+    "inventory_shelf_life_days": 30
+  },
+  "duplicate_key_counts": {
+    "model_panel": 0,
+    "forecast_features": 0,
+    "inventory_context": 0
+  },
+  "configuration_used": {
+    "replenishment": {
+      "default_supplier_lead_time_days": 7,
+      "default_moq": 1,
+      "lead_time_by_picking_mode": {
+        "Drop Shipping": 10,
+        "Drop by Vendor": 10,
+        "Collect from Vendor": 5,
+        "Naheed Super Market": 3
+      },
+      "dropship_modes": [
+        "Drop Shipping",
+        "Drop by Vendor"
+      ]
+    },
+    "pilot": {
+      "frequency": "daily",
+      "forecast_horizons": [
+        7,
+        14
+      ],
+      "forecast_feature_days": 14,
+      "top_n_per_category": 15,
+      "n_categories": 2,
+      "min_history_days": 28,
+      "ecommerce_channel_map": {
+        "online_delivery": "naheed_web",
+        "naheed_web": "naheed_web",
+        "foodpanda": "foodpanda"
+      },
+      "physical_channels": [
+        "store",
+        "storepickup"
+      ],
+      "max_stock_staleness_days": 3,
+      "assume_stock_in_transit_zero": true
+    }
+  },
+  "assumptions": [
+    "Supplier lead time is a configured assumption (no supplier data).",
+    "MOQ is a configured assumption (no supplier data).",
+    "Stock-in-transit assumed 0 (no source in warehouse).",
+    "Pack size defaults to 1 (nhd_box_products empty) unless real box data exists.",
+    "Perishability unknown (shelf-life absent) \u2014 not classified as durable.",
+    "Product activation inferred from first ecommerce sale (listing dates unknown).",
+    "planned_promo unavailable: no promo calendar with valid start/end dates.",
+    "foodpanda has no rows in this warehouse; only naheed_web is modelled."
+  ],
+  "warnings": [],
+  "validation_status": "passed"
+}

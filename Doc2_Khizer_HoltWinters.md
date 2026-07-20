@@ -16,6 +16,29 @@ cloning, the Python environment, regenerating the data, and the branch workflow.
 
 ---
 
+## ⚠️ Contract update (v2 — daily, ecommerce-only) — READ THIS FIRST
+
+The pilot moved from **weekly** to **daily**, and to **ecommerce-only**. The weekly
+sections below are background; the **binding contract is here**:
+
+- **Inputs** (already generated in `data/processed/`):
+  - `model_panel.parquet` — daily history, one row per `sku × channel × date`; target = **`units_observed`**.
+  - `forecast_features.parquet` — the next **14 future days** per SKU (leakage-safe).
+- **Channel**: ecommerce only → **`naheed_web`** (physical `store` excluded).
+- **Horizons**: forecast **7 and 14 daily** steps. Splits are **chronological** — `TEST_WEEKS` is gone.
+- **Scoring**: `from evaluation import evaluate` → `evaluate(preds, horizon=7 or 14)`.
+  Submit **`sku, channel, date, y_pred`** only — **never pass `y_true`**. Optional `lower_bound`/`upper_bound`.
+  Reported: **WAPE, MAE, MASE, RMSE, bias** + interval coverage.
+- Supplier **lead time & MOQ are downstream configurable assumptions**, **not forecasting features**.
+
+**Your model (daily exponential smoothing).** Fit per SKU on the chronological training
+slice; forecast 7 and 14 days ahead. Evaluate **SES → Holt (trend) → damped Holt**, and
+**Holt-Winters with weekly seasonality (m=7) only if there are enough repeated 7-day cycles**
+(≈25 weeks of daily data here is borderline — justify if you use it). **Additive only**
+(zeros are present). Submit `preds[sku, channel, date, y_pred]` (no `y_true`).
+
+---
+
 ## 0. How your piece fits the team
 
 Three of us build different methods on the **same 30 products** and the **same

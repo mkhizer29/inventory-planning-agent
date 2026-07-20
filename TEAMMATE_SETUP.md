@@ -41,31 +41,35 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-## 3. Get the data — it's already provided ✅
+## 3. Get the data — it's already provided ✅  (daily, ecommerce-only)
 
-The two shared input files are **committed to the repo** as the locked pilot contract
-(they're tiny — 30 SKUs × ~24 weeks), so after cloning you already have them:
+The shared inputs are **committed to the repo** as the locked pilot contract, so after
+cloning you already have them (in `data/processed/`):
 
 ```
-data/processed/weekly_sales.parquet     <- 30 pilot SKUs, weekly, zero-filled
-data/processed/weekly_signals.parquet   <- holiday/payday day-counts per week
+model_panel.parquet        daily history — one row per sku × channel × date (target: units_observed)
+forecast_features.parquet  the next 14 future days per SKU (leakage-safe: no actuals/discounts)
+inventory_context.parquet  as-of stock + replenishment context (assumptions flagged)
+pilot_manifest.json         validation stats, coverage, and the explicit assumptions block
 ```
 
-**You do NOT need database access or to run the ETL to start modelling.** Just read
-these via `src/evaluation.py` (`load_weekly_sales()` / `load_signals()`).
+- **Frequency is daily; horizons are 7 and 14 days.** Channel is ecommerce-only:
+  **`naheed_web`** (physical `store` excluded; `foodpanda` has no data yet).
+- **You do NOT need database access or the ETL to model.** Load + score via `src/evaluation.py`:
+  `load_model_panel()`, then `evaluate(preds, horizon=7 or 14)` where `preds` has
+  **`sku, channel, date, y_pred`** (never pass `y_true`).
 
-> These files are a **locked contract** — everyone models the exact same 30 SKUs,
-> weeks, and split. Don't regenerate or edit them on your model branch.
+> Locked contract — everyone models the same 30 SKUs, days and chronological split.
+> Don't regenerate or edit these on your model branch. Read `pilot_manifest.json` to see
+> which values are real vs assumed (lead time, MOQ, stock-in-transit, perishability are assumptions).
 
-**Only the pipeline owner regenerates them** (when the source data changes), with:
+**Only the pipeline owner regenerates them** (when source data changes):
 ```bash
 # needs DB credentials in .env (copied from .env.example); see the root README
 python -m etl.run_etl --source staging --sales-since 2026-01-15   # -> inventory_etl/output/inventory.db
-python src/prepare_pilot_data.py                                   # -> data/processed/*.parquet
+python src/prepare_pilot_data.py --as-of-date 2026-07-15          # -> data/processed/ (4 files)
 ```
-`prepare_pilot_data.py` picks the 30 pilot SKUs (frozen in `pilot_skus.csv`),
-aggregates weekly sales (zero-filled), tags promo weeks, and rolls up holiday/payday
-signals. Modelers can ignore this step — the outputs are already in the repo.
+Modelers can ignore this step — the outputs are already in the repo.
 
 ## 4. Branch-per-person workflow
 

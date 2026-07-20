@@ -88,3 +88,24 @@ scope:
   include_product_types: [simple]
   # Include disabled products? (status=2). Usually no for planning.
   include_disabled: false
+
+# ---- Pilot dataset (daily, ecommerce-only) — used by src/prepare_pilot_data.py ----
+pilot:
+  frequency: daily
+  forecast_horizons: [7, 14]        # official brief: 7–14 day demand forecasts
+  forecast_feature_days: 14         # forecast_features covers exactly 14 future days
+  top_n_per_category: 15
+  n_categories: 2
+  min_history_days: 28              # a usable pilot SKU needs >= this many active days
+  # source channel -> canonical ecommerce channel (inspect actual values first)
+  ecommerce_channel_map:
+    online_delivery: naheed_web
+    naheed_web: naheed_web
+    foodpanda: foodpanda
+  physical_channels: [store, storepickup]   # excluded from ecommerce scope, counted
+  # as-of stock join: a snapshot older than this many days is treated as STALE
+  # (never forward-filled indefinitely; missing stock is never treated as zero).
+  max_stock_staleness_days: 3
+  # No stock-in-transit source exists in the warehouse. If true, use a temporary
+  # zero assumption (clearly flagged); if false, leave it null/unknown.
+  assume_stock_in_transit_zero: true
