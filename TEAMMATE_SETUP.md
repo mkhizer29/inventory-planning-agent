@@ -41,30 +41,31 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-## 3. Get the data — regenerate it from code, don't pass files around
+## 3. Get the data — it's already provided ✅
 
-The whole point: **data is rebuilt from the pipeline, never emailed/copied as files.**
-Nobody commits data — it's git-ignored.
+The two shared input files are **committed to the repo** as the locked pilot contract
+(they're tiny — 30 SKUs × ~24 weeks), so after cloning you already have them:
 
-> ### ⚠️ Known blocker (read this before you start modelling)
-> The models read `data/processed/weekly_sales.parquet` and
-> `data/processed/weekly_signals.parquet`. **The data-prep step that produces those
-> two parquet files does not exist yet — it is currently in progress.**
->
-> **Until that prep step lands, you cannot run your model against the real data.**
-> What you *can* do now:
-> - build and **dry-run your model against a small hand-made sample** (create a tiny
->   `weekly_sales.parquet` / `weekly_signals.parquet` with a few SKUs and weeks so
->   your code path and `score_model(...)` run end-to-end), and
-> - get your model file and its call into `src/evaluation.py` working.
->
-> Watch `main` / ask Aiman for when the prep step is merged; after that, regenerate
-> the real parquet files and re-run. **Do not treat step 3 as a working step yet.**
+```
+data/processed/weekly_sales.parquet     <- 30 pilot SKUs, weekly, zero-filled
+data/processed/weekly_signals.parquet   <- holiday/payday day-counts per week
+```
 
-Once the prep step exists, the flow will be: run the ETL locally to build the
-processed data (see the root `README.md` for the ETL — it needs your database
-credentials in `.env`, copied from `.env.example`), which lands the parquet files in
-`data/processed/`. You then run your model, which writes to `outputs/`.
+**You do NOT need database access or to run the ETL to start modelling.** Just read
+these via `src/evaluation.py` (`load_weekly_sales()` / `load_signals()`).
+
+> These files are a **locked contract** — everyone models the exact same 30 SKUs,
+> weeks, and split. Don't regenerate or edit them on your model branch.
+
+**Only the pipeline owner regenerates them** (when the source data changes), with:
+```bash
+# needs DB credentials in .env (copied from .env.example); see the root README
+python -m etl.run_etl --source staging --sales-since 2026-01-15   # -> inventory_etl/output/inventory.db
+python src/prepare_pilot_data.py                                   # -> data/processed/*.parquet
+```
+`prepare_pilot_data.py` picks the 30 pilot SKUs (frozen in `pilot_skus.csv`),
+aggregates weekly sales (zero-filled), tags promo weeks, and rolls up holiday/payday
+signals. Modelers can ignore this step — the outputs are already in the repo.
 
 ## 4. Branch-per-person workflow
 

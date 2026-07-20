@@ -9,10 +9,8 @@
 build/
 dist/
 
-# generated ETL outputs (live under inventory_etl/output)
-inventory_etl/output/*.db
-inventory_etl/output/*.md
-inventory_etl/output/csv/
+# generated ETL outputs (everything under inventory_etl/output is regenerated)
+inventory_etl/output/
 
 # python caches
 __pycache__/
@@ -20,8 +18,15 @@ __pycache__/
 .pytest_cache/
 
 # ── forecasting pilot ──────────────────────────────────────────
-# pipeline data is regenerated from code, never committed
-data/
+# Raw/large pipeline data is regenerated from code, never committed...
+data/*
+# ...EXCEPT the two tiny processed pilot inputs, which are the LOCKED shared
+# contract all three models read (like evaluation.py) — commit these so
+# teammates can start without DB access or re-running the ETL.
+!data/processed/
+data/processed/*
+!data/processed/weekly_sales.parquet
+!data/processed/weekly_signals.parquet
 
 # database dumps / archives — but keep the ETL's own query files
 *.sql
