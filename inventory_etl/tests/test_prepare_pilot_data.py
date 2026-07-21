@@ -53,6 +53,7 @@ def ctx(tmp_path):
     _make_db(db)
     con = sqlite3.connect(db)
     cfg = prep.load_config()
+    cfg["stock"]["mode"] = "real"          # exercise the real as-of stock logic here
     pilot = pd.DataFrame({"sku": ["A", "B"], "category": ["Cat1", "Cat2"]})
     panel, stats = prep.build_model_panel(con, pilot, cfg, None, "2026-03-06")
     yield types.SimpleNamespace(con=con, cfg=cfg, pilot=pilot, panel=panel, stats=stats,
@@ -108,7 +109,7 @@ def test_forecast_features_no_leakage(ctx):
 
 
 def test_lead_time_and_moq_are_flagged_assumptions(ctx):
-    inv = prep.build_inventory_context(ctx.con, ctx.pilot, ctx.cfg, ctx.as_of)
+    inv = prep.build_inventory_context(ctx.con, ctx.pilot, ctx.cfg, ctx.as_of, ctx.panel)
     assert inv["lead_time_is_assumed"].all() and inv["moq_is_assumed"].all()
     assert (inv["supplier_lead_time_days"] == 7).all() and (inv["moq"] == 1).all()
     assert inv["stock_in_transit_is_assumed"].all() and inv["perishability_is_assumed"].all()
@@ -118,7 +119,7 @@ def test_lead_time_and_moq_are_flagged_assumptions(ctx):
 
 def test_schemas_validate_and_manifest_passes(ctx):
     ff = prep.build_forecast_features(ctx.panel, ctx.con, ctx.pilot, ctx.cfg, ctx.as_of)
-    inv = prep.build_inventory_context(ctx.con, ctx.pilot, ctx.cfg, ctx.as_of)
+    inv = prep.build_inventory_context(ctx.con, ctx.pilot, ctx.cfg, ctx.as_of, ctx.panel)
     problems = prep.validate_outputs(ctx.panel, ff, inv, ctx.cfg)
     assert problems == []
     assert list(ctx.panel.columns) == prep.MODEL_PANEL_COLS
@@ -129,3 +130,18 @@ def test_schemas_validate_and_manifest_passes(ctx):
     assert man["data_frequency"] == "daily"
     assert man["physical_store_rows_excluded"] == 1
     assert man["ecommerce_channels"] == ["naheed_web"]
+
+
+def test_synthetic_stock_fills_flags_and_is_deterministic(ctx):
+    cfg = prep.load_config()
+    cfg["stock"]["mode"] = "synthetic"
+    panel, _ = prep.build_model_panel(ctx.con, ctx.pilot, cfg, None, "2026-03-06")
+    assert panel["stock_is_synthetic"].all()                       # every row flagged synthetic
+    assert panel["stock_on_hand"].notna().all()                    # full daily coverage (not sparse)
+    assert panel["stock_observation_available"].all()
+    assert panel["data_quality_flag"].str.contains("stock_synthetic").all()
+    # never contradicts real sales: on-hand >= units sold that day
+    assert (panel["stock_on_hand"] >= panel["units_observed"]).all()
+    # deterministic: same seed -> identical series
+    panel2, _ = prep.build_model_panel(ctx.con, ctx.pilot, cfg, None, "2026-03-06")
+    assert panel["stock_on_hand"].tolist() == panel2["stock_on_hand"].tolist()

@@ -17,17 +17,22 @@ def build_sku_master(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
     prod = raw["products"].copy()
     ops = raw.get("product_ops", pd.DataFrame())
 
-    # --- cost (staging_margin dedup, then flat fallback) ---
-    cost = cleanse.resolve_cost(raw.get("cost_rows", pd.DataFrame()),
-                                strategy=cfg["cost"]["strategy"])
-    prod = prod.merge(cost, on="product_id", how="left")
+    # --- cost: prefer the Magento `cost` attribute (populated in pg_new_1),
+    #     then staging_margin (deduped), then catalog_product_flat_1 ---
+    prod = prod.rename(columns={"cost": "eav_cost"})
+    margin_cost = cleanse.resolve_cost(raw.get("cost_rows", pd.DataFrame()),
+                                       strategy=cfg["cost"]["strategy"])
+    prod = prod.merge(margin_cost, on="product_id", how="left")   # adds unit_cost, cost_row_count
     flat_cost = raw.get("flat_cost", pd.DataFrame())
     if not flat_cost.empty:
         prod = prod.merge(flat_cost.rename(columns={"cost": "flat_cost"}),
                           on="product_id", how="left")
-        prod["unit_cost"] = (pd.to_numeric(prod["unit_cost"], errors="coerce")
-                             .fillna(pd.to_numeric(prod["flat_cost"], errors="coerce")))
-        prod.drop(columns=["flat_cost"], inplace=True)
+    else:
+        prod["flat_cost"] = pd.NA
+    prod["unit_cost"] = (pd.to_numeric(prod["eav_cost"], errors="coerce")
+                         .fillna(pd.to_numeric(prod.get("unit_cost"), errors="coerce"))
+                         .fillna(pd.to_numeric(prod["flat_cost"], errors="coerce")))
+    prod.drop(columns=["eav_cost", "flat_cost", "cost_row_count"], inplace=True, errors="ignore")
 
     # --- ops enrichment (brand/category/picking_mode) ---
     if not ops.empty:

@@ -23,12 +23,13 @@ data/*
 # ...EXCEPT the two tiny processed pilot inputs, which are the LOCKED shared
 # contract all three models read (like evaluation.py) — commit these so
 # teammates can start without DB access or re-running the ETL.
-!data/processed/
-data/processed/*
-!data/processed/model_panel.parquet
-!data/processed/forecast_features.parquet
-!data/processed/inventory_context.parquet
-!data/processed/pilot_manifest.json
+
+#!data/processed/
+#data/processed/*
+#!data/processed/model_panel.parquet
+#!data/processed/forecast_features.parquet
+#!data/processed/inventory_context.parquet
+#!data/processed/pilot_manifest.json
 
 # database dumps / archives — but keep the ETL's own query files
 *.sql

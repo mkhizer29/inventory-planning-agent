@@ -22,6 +22,7 @@ SELECT
     CAST(v_price.value   AS DECIMAL(20,4))  AS price,
     CAST(v_special.value AS DECIMAL(20,4))  AS special_price,
     CAST(v_weight.value  AS DECIMAL(20,4))  AS weight,
+    CAST(v_cost.value    AS DECIMAL(20,4))  AS cost,
     v_shelf.value                           AS shelf_life_days
 FROM catalog_product_entity e
 
@@ -91,6 +92,14 @@ LEFT JOIN eav_attribute a_weight
 LEFT JOIN catalog_product_entity_decimal v_weight
        ON v_weight.entity_id = e.entity_id AND v_weight.store_id = 0
       AND v_weight.attribute_id = a_weight.attribute_id
+-- cost (Magento `cost` attribute; populated in pg_new_1 — primary unit-cost source)
+LEFT JOIN eav_attribute a_cost
+       ON a_cost.attribute_code = 'cost'
+      AND a_cost.entity_type_id = (SELECT entity_type_id FROM eav_entity_type
+                                   WHERE entity_type_code = 'catalog_product' LIMIT 1)
+LEFT JOIN catalog_product_entity_decimal v_cost
+       ON v_cost.entity_id = e.entity_id AND v_cost.store_id = 0
+      AND v_cost.attribute_id = a_cost.attribute_id
 -- shelf life (expire_after_day) — may live in int OR decimal backend
 LEFT JOIN eav_attribute a_shelf
        ON a_shelf.attribute_code = 'expire_after_day'

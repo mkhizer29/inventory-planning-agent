@@ -109,3 +109,14 @@ pilot:
   # No stock-in-transit source exists in the warehouse. If true, use a temporary
   # zero assumption (clearly flagged); if false, leave it null/unknown.
   assume_stock_in_transit_zero: true
+
+# ---- Daily stock series (sir-approved: Naheed keeps NO daily stock history) --------
+# 'synthetic' = a seeded, sales-driven reorder simulation (reproducible, flagged
+# synthetic everywhere so it is never mistaken for real data). 'real' = the sparse
+# warehouse snapshots via an as-of join. Lead time reuses replenishment.default_supplier_lead_time_days.
+stock:
+  mode: synthetic
+  seed: 42                  # base seed -> fully deterministic per SKU
+  target_cover_days: 14     # order-up-to level ≈ this many days of avg demand above the reorder point
+  safety_days: 5            # safety stock in days of average demand
+  reorder_jitter_days: 3    # random delivery lateness -> realistic occasional stockouts

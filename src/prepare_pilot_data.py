@@ -30,6 +30,7 @@ import json
 import os
 import sqlite3
 import sys
+import zlib
 from pathlib import Path
 from typing import Iterable
 
@@ -56,8 +57,8 @@ MODEL_PANEL_COLS = [
     "on_promo", "promo_known_in_advance", "is_public_holiday", "holiday_name",
     "is_payday_window", "day_of_week", "is_weekend", "week_of_year", "month",
     "stock_on_hand", "stock_observation_available", "stock_snapshot_stale",
-    "is_available", "is_stockout", "demand_censored", "product_active",
-    "training_eligible", "data_quality_flag",
+    "stock_is_synthetic", "is_available", "is_stockout", "demand_censored",
+    "product_active", "training_eligible", "data_quality_flag",
 ]
 FORECAST_COLS = [
     "sku", "product_id", "channel", "date", "forecast_horizon_day", "category",
@@ -221,6 +222,55 @@ def asof_stock(keys: pd.DataFrame, stock: pd.DataFrame, max_staleness: int) -> p
     return merged
 
 
+def generate_synthetic_stock(panel: pd.DataFrame, cfg: dict) -> pd.Series:
+    """SIR-APPROVED synthetic daily stock (Naheed keeps no real history).
+
+    A seeded, per-SKU reorder simulation driven by the REAL daily sales:
+    start at an order-up-to level, deplete by actual units sold, and replenish
+    (after the configured lead time, with random lateness) when stock crosses the
+    reorder point. Start-of-day stock is forced to cover that day's real sales, so
+    the series never contradicts observed demand; stockouts therefore land on
+    zero-sale days. Deterministic (same seed -> same output). Returns a
+    stock_on_hand Series aligned to `panel.index`. Values are SYNTHETIC and are
+    flagged as such everywhere downstream.
+    """
+    rep, sc = cfg["replenishment"], cfg["stock"]
+    lead = int(rep["default_supplier_lead_time_days"])
+    cover, safety = int(sc["target_cover_days"]), int(sc["safety_days"])
+    jitter, base_seed = int(sc["reorder_jitter_days"]), int(sc["seed"])
+
+    out = pd.Series(index=panel.index, dtype="float64")
+    for (sku, ch), g in panel.groupby(["sku", "channel"], sort=False):
+        u = pd.to_numeric(g["units_observed"], errors="coerce").fillna(0).to_numpy(dtype=float)
+        n = len(u)
+        seed = (base_seed + zlib.crc32(f"{sku}|{ch}".encode())) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        avg = max(float(u.mean()), 0.1)
+        rop = avg * lead + avg * safety           # reorder point
+        order_up_to = rop + avg * cover           # target level after ordering
+        buf = n + lead + jitter + 5
+        arrivals = np.zeros(buf)
+        soh = np.zeros(n)
+        stock = order_up_to
+        pending_until = -1
+        for i in range(n):
+            stock += arrivals[i]
+            if pending_until == i:
+                pending_until = -1
+            if stock < u[i]:                      # can't have sold more than was on hand
+                stock = u[i]
+            soh[i] = stock                        # start-of-day available stock
+            stock = max(stock - u[i], 0.0)        # end of day
+            if stock <= rop and pending_until < 0:
+                lag = lead + int(rng.integers(0, jitter + 1))
+                j = i + lag
+                if j < buf:
+                    arrivals[j] += max(order_up_to - stock, avg * cover)
+                    pending_until = j
+        out.loc[g.index] = np.round(soh)
+    return out
+
+
 # ── builders ─────────────────────────────────────────────────────────────────────
 def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
                       start: str | None, end: str | None
@@ -292,19 +342,28 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
     # attributes
     panel = panel.merge(attrs.drop(columns=["price"]), on="sku", how="left")
 
-    # stock as-of join (product_id keyed history)
-    stock_hist = pd.read_sql(
-        "SELECT product_id, snapshot_date, stock_on_hand, stock_flag "
-        "FROM inventory_snapshot_history", con)
-    stock_hist["snapshot_date"] = pd.to_datetime(stock_hist["snapshot_date"])
-    keys = panel[["product_id", "date"]].copy()
-    st = asof_stock(keys.assign(_i=range(len(keys))), stock_hist,
-                    cfg["pilot"]["max_stock_staleness_days"]).sort_values("_i")
-    panel["stock_on_hand"] = st["stock_on_hand"].to_numpy()
-    panel["stock_flag"] = st["stock_flag"].to_numpy()
-    age = st["snapshot_age_days"].to_numpy()
-    panel["stock_observation_available"] = ~pd.isna(panel["stock_on_hand"])
-    panel["stock_snapshot_stale"] = panel["stock_observation_available"] & (np.nan_to_num(age, nan=0) > 0)
+    # stock: synthetic (seeded reorder sim) OR real (sparse warehouse as-of join)
+    stock_mode = cfg.get("stock", {}).get("mode", "real")
+    if stock_mode == "synthetic":
+        panel["stock_on_hand"] = generate_synthetic_stock(panel, cfg).to_numpy()
+        panel["stock_flag"] = "synthetic"
+        panel["stock_is_synthetic"] = True
+        panel["stock_observation_available"] = True
+        panel["stock_snapshot_stale"] = False
+    else:
+        stock_hist = pd.read_sql(
+            "SELECT product_id, snapshot_date, stock_on_hand, stock_flag "
+            "FROM inventory_snapshot_history", con)
+        stock_hist["snapshot_date"] = pd.to_datetime(stock_hist["snapshot_date"])
+        keys = panel[["product_id", "date"]].copy()
+        st = asof_stock(keys.assign(_i=range(len(keys))), stock_hist,
+                        cfg["pilot"]["max_stock_staleness_days"]).sort_values("_i")
+        panel["stock_on_hand"] = st["stock_on_hand"].to_numpy()
+        panel["stock_flag"] = st["stock_flag"].to_numpy()
+        age = st["snapshot_age_days"].to_numpy()
+        panel["stock_is_synthetic"] = False
+        panel["stock_observation_available"] = ~pd.isna(panel["stock_on_hand"])
+        panel["stock_snapshot_stale"] = panel["stock_observation_available"] & (np.nan_to_num(age, nan=0) > 0)
 
     soh = pd.to_numeric(panel["stock_on_hand"], errors="coerce")
     panel["is_stockout"] = (panel["stock_observation_available"] & (soh <= 0)).fillna(False)
@@ -315,7 +374,9 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
     # data quality flag (compact, honest)
     def flag(row) -> str:
         flags = ["activation_inferred_from_first_sale"]
-        if not row["stock_observation_available"]:
+        if row["stock_is_synthetic"]:
+            flags.append("stock_synthetic")
+        elif not row["stock_observation_available"]:
             flags.append("stock_unobserved")
         elif row["stock_snapshot_stale"]:
             flags.append("stock_stale")
@@ -371,8 +432,9 @@ def build_forecast_features(panel: pd.DataFrame, con: sqlite3.Connection, pilot:
 
 
 def build_inventory_context(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
-                            as_of: pd.Timestamp) -> pd.DataFrame:
-    """One row per SKU x location at as_of. Every replenishment assumption is flagged."""
+                            as_of: pd.Timestamp, panel: pd.DataFrame) -> pd.DataFrame:
+    """One row per SKU x location at as_of. Every replenishment assumption is flagged.
+    Stock-on-hand comes from the synthetic series (if enabled) or the warehouse snapshot."""
     rep = cfg["replenishment"]
     skus = pilot["sku"].astype(str).tolist()
     ph = ",".join("?" * len(skus))
@@ -381,13 +443,20 @@ def build_inventory_context(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: d
         f"       price, pack_size, is_dropship FROM sku_master WHERE sku_id IN ({ph})",
         con, params=skus)
 
-    stock_hist = pd.read_sql(
-        "SELECT product_id, snapshot_date, stock_on_hand, stock_flag, location_id "
-        "FROM inventory_snapshot_history", con)
-    stock_hist["snapshot_date"] = pd.to_datetime(stock_hist["snapshot_date"])
-    stock_hist = stock_hist[stock_hist["snapshot_date"] <= as_of]
-    latest = (stock_hist.sort_values("snapshot_date").groupby("product_id").tail(1)
-              if not stock_hist.empty else stock_hist)
+    synthetic = cfg.get("stock", {}).get("mode", "real") == "synthetic"
+    synth_soh: dict = {}
+    latest = pd.DataFrame()
+    if synthetic:
+        h = panel[panel["date"] <= as_of]
+        synth_soh = h.sort_values("date").groupby("sku")["stock_on_hand"].last().to_dict()
+    else:
+        stock_hist = pd.read_sql(
+            "SELECT product_id, snapshot_date, stock_on_hand, stock_flag, location_id "
+            "FROM inventory_snapshot_history", con)
+        stock_hist["snapshot_date"] = pd.to_datetime(stock_hist["snapshot_date"])
+        stock_hist = stock_hist[stock_hist["snapshot_date"] <= as_of]
+        latest = (stock_hist.sort_values("snapshot_date").groupby("product_id").tail(1)
+                  if not stock_hist.empty else stock_hist)
 
     lead = int(rep["default_supplier_lead_time_days"])
     moq = int(rep["default_moq"])
@@ -396,14 +465,21 @@ def build_inventory_context(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: d
             f"lead-time data is unavailable. MOQ uses the configured default of {moq} because "
             f"supplier MOQ data is unavailable. Stock-in-transit "
             + ("assumed 0 (no source in warehouse). " if assume_transit0 else "left unknown. ")
-            + "Perishability unknown (shelf-life data absent) — not confirmed durable.")
+            + "Perishability unknown (shelf-life data absent) — not confirmed durable."
+            + (" stock_on_hand is SYNTHETIC (seeded reorder simulation, not real Naheed data)."
+               if synthetic else ""))
 
     rows = []
     for _, r in sm.iterrows():
-        m = latest[latest["product_id"] == r["product_id"]] if not latest.empty else latest
-        soh = float(m["stock_on_hand"].iloc[0]) if len(m) else np.nan
-        sflag = m["stock_flag"].iloc[0] if len(m) else None
-        loc = m["location_id"].iloc[0] if len(m) else "ALL"
+        if synthetic:
+            val = synth_soh.get(r["sku"], np.nan)
+            soh = float(val) if pd.notna(val) else np.nan
+            sflag, loc = "synthetic", "ALL"
+        else:
+            m = latest[latest["product_id"] == r["product_id"]] if not latest.empty else latest
+            soh = float(m["stock_on_hand"].iloc[0]) if len(m) else np.nan
+            sflag = m["stock_flag"].iloc[0] if len(m) else None
+            loc = m["location_id"].iloc[0] if len(m) else "ALL"
         ps = r["pack_size"]
         ps_ok = pd.notna(ps) and int(ps) >= 1
         pack = int(ps) if ps_ok else 1
@@ -469,6 +545,9 @@ def build_manifest(panel, ff, inv, pilot, cfg, args, stats, as_of, warnings, pro
         "source_database_profile": "sqlite:inventory.db",
         "source_warehouse_path": str(Path(args.db_path)),
         "data_frequency": "daily",
+        "stock_source": ("synthetic (seeded reorder simulation — NOT real Naheed data)"
+                         if cfg.get("stock", {}).get("mode") == "synthetic"
+                         else "warehouse snapshots (as-of join)"),
         "forecast_horizons": cfg["pilot"]["forecast_horizons"],
         "history_start": panel["date"].min().date().isoformat(),
         "history_end": panel["date"].max().date().isoformat(),
@@ -504,7 +583,10 @@ def build_manifest(panel, ff, inv, pilot, cfg, args, stats, as_of, warnings, pro
         },
         "configuration_used": {
             "replenishment": cfg["replenishment"], "pilot": cfg["pilot"]},
-        "assumptions": [
+        "assumptions": ([
+            "Daily stock_on_hand is SYNTHETIC — a seeded reorder simulation driven by real "
+            "sales (Naheed keeps no daily stock history). Flagged stock_is_synthetic=True."
+        ] if cfg.get("stock", {}).get("mode") == "synthetic" else []) + [
             "Supplier lead time is a configured assumption (no supplier data).",
             "MOQ is a configured assumption (no supplier data).",
             "Stock-in-transit assumed 0 (no source in warehouse).",
@@ -567,7 +649,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         panel, stats = build_model_panel(con, pilot, cfg, args.start_date, args.end_date)
         as_of = pd.Timestamp(args.as_of_date) if args.as_of_date else stats["window_end"]
         ff = build_forecast_features(panel, con, pilot, cfg, as_of)
-        inv = build_inventory_context(con, pilot, cfg, as_of)
+        inv = build_inventory_context(con, pilot, cfg, as_of, panel)
 
     problems = validate_outputs(panel, ff, inv, cfg)
     manifest = build_manifest(panel, ff, inv, pilot, cfg, args, stats, as_of, warnings, problems)

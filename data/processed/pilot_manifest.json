@@ -1,22 +1,23 @@
 {
   "schema_version": "2.0-daily-ecommerce",
-  "generated_at": "2026-07-20T03:40:25",
-  "as_of_date": "2026-07-15",
+  "generated_at": "2026-07-21T07:20:58",
+  "as_of_date": "2026-06-30",
   "source_database_profile": "sqlite:inventory.db",
   "source_warehouse_path": "C:\\Users\\Bilal\\Documents\\Naheed Ai Internship\\Inventory-Planning-Agent\\inventory_etl\\output\\inventory.db",
   "data_frequency": "daily",
+  "stock_source": "synthetic (seeded reorder simulation \u2014 NOT real Naheed data)",
   "forecast_horizons": [
     7,
     14
   ],
-  "history_start": "2026-01-15",
-  "history_end": "2026-07-15",
+  "history_start": "2026-01-16",
+  "history_end": "2026-06-30",
   "selection_cutoff": null,
   "sku_count": 30,
   "ecommerce_channels": [
     "naheed_web"
   ],
-  "model_panel_row_count": 5429,
+  "model_panel_row_count": 4956,
   "forecast_feature_row_count": 420,
   "inventory_context_row_count": 30,
   "selected_skus": [
@@ -56,22 +57,22 @@
     "Groceries & Pets": 15
   },
   "channel_distribution": {
-    "naheed_web": 5429
+    "naheed_web": 4956
   },
   "physical_store_rows_excluded": 498,
   "unknown_channel_rows": {},
-  "zero_sales_rate": 0.2177,
-  "stockout_rate": 0.0022,
-  "censored_demand_rate": 0.0022,
-  "stock_observation_coverage": 0.0111,
-  "promotion_coverage": 0.0759,
+  "zero_sales_rate": 0.2173,
+  "stockout_rate": 0.0071,
+  "censored_demand_rate": 0.0071,
+  "stock_observation_coverage": 1.0,
+  "promotion_coverage": 0.0789,
   "perishability_coverage": 0.0,
   "assumed_lead_time_count": 30,
   "assumed_moq_count": 30,
   "assumed_pack_size_count": 30,
   "missing_value_counts": {
-    "model_panel_stock_on_hand": 5369,
-    "inventory_unit_cost": 30,
+    "model_panel_stock_on_hand": 0,
+    "inventory_unit_cost": 0,
     "inventory_shelf_life_days": 30
   },
   "duplicate_key_counts": {
@@ -118,6 +119,7 @@
     }
   },
   "assumptions": [
+    "Daily stock_on_hand is SYNTHETIC \u2014 a seeded reorder simulation driven by real sales (Naheed keeps no daily stock history). Flagged stock_is_synthetic=True.",
     "Supplier lead time is a configured assumption (no supplier data).",
     "MOQ is a configured assumption (no supplier data).",
     "Stock-in-transit assumed 0 (no source in warehouse).",
