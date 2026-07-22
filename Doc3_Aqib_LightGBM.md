@@ -26,6 +26,14 @@ sections below are background; the **binding contract is here**:
 - **Inputs** (already generated in `data/processed/`):
   - `model_panel.parquet` — daily history, one row per `sku × channel × date`; target = **`units_observed`**.
   - `forecast_features.parquet` — the next **14 future days** per SKU (leakage-safe: **no** actual sales, **no** realized future discounts).
+
+> **🔄 v3 update — REAL demand vs SYNTHETIC inventory (supersedes the above where they conflict):**
+> - **Demand forecasting uses REAL sales.** `units_observed` is real Naheed e-commerce demand, never altered — train/backtest on it.
+> - **`model_panel.parquet` is real-only:** no stock/stockout columns. Use only the demand-feature whitelist (`units_lag_1/7/14`, `units_roll_mean_7/28`, `units_roll_std_7`, price/discount/promo, calendar). **Never** use inventory fields or `unit_cost` as a forecast feature — this matters most for LightGBM, which will greedily use any column you hand it.
+> - **Row eligibility = `forecast_training_eligible`** (real-data quality + ≥14 days history). It is **independent of any synthetic stock/stockout label** — `evaluate()` asserts at runtime that flipping synthetic labels cannot change your scored rows.
+> - **Inventory, stockouts, lost sales, replenishment are SYNTHETIC** (causal seeded simulation in `data/synthetic/`; Naheed keeps no daily stock history). They power the stockout-risk pilot only and **never** touch demand training/eval. Do not call them real historical stockouts.
+> - **Report separately:** demand = *"real historical sales backtesting"*; stockout = *"synthetic simulation-based"*.
+> - Lead time / MOQ / pack size / review period are **pilot assumptions** (flagged). Unit cost is validated in `inventory_context.parquet`; currency PKR and cost unit/pack **basis await Naheed confirmation**. Real inventory snapshots can replace the synthetic ones later with **no schema change** (`config synthetic.inventory_context_source: real`).
 - **Channel**: ecommerce only → **`naheed_web`** (physical `store` excluded).
 - **Horizons**: forecast **7 and 14 daily** steps, **chronological** split — `TEST_WEEKS` is gone.
 - **Scoring**: `from evaluation import evaluate` → `evaluate(preds, horizon=7 or 14)`.

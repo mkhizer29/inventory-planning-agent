@@ -1,24 +1,31 @@
 """prepare_pilot_data.py — build the daily, ecommerce-only, leakage-free pilot dataset.
 
-Reads the ETL warehouse (inventory_etl/output/inventory.db) and writes four files to
-data/processed/:
+Reads the ETL warehouse (inventory_etl/output/inventory.db) and writes:
 
-  model_panel.parquet        history for training/backtesting (SKU x channel x active day)
-  forecast_features.parquet  next-14-day prediction inputs, known-at-as_of only (no leakage)
-  inventory_context.parquet  as-of stock + replenishment context (SKU x location), assumptions flagged
-  pilot_manifest.json        validation stats, reproducibility and an explicit assumptions block
+  data/processed/model_panel.parquet        REAL demand history for forecast training/backtesting
+  data/processed/forecast_features.parquet  next-14-day inputs, known at as_of only (no leakage, no cost)
+  data/processed/inventory_context.parquet  as-of stock + validated cost + replenishment context
+  data/processed/pilot_manifest.json        validation stats, reproducibility, assumptions
+
+  data/synthetic/stockout_scenarios.parquet   causal synthetic inventory/stockout trajectories
+  data/synthetic/replenishment_events.parquet  synthetic replenishment orders
+  data/synthetic/simulation_parameters.json    what is real vs synthetic, method, assumptions
+
+REAL vs SYNTHETIC (this is the whole point of the redesign):
+  * `units_observed` in model_panel is REAL e-commerce sales and is NEVER overwritten by
+    synthetic sales. Demand forecasting is trained/evaluated only on this.
+  * Inventory levels, stockouts, lost sales and replenishment are a SEPARATE causal,
+    seeded SIMULATION on a separate latent demand series (src/synthetic_inventory.py).
+    They live under data/synthetic/ and are flagged is_synthetic / stock_is_synthetic /
+    stockout_label_is_synthetic. They do NOT affect forecast training eligibility or
+    forecast evaluation.
+  * Validated unit cost is a FINANCIAL field only (inventory_context) — never a demand feature.
 
 Scope: ECOMMERCE ONLY. `online_delivery` is normalised to `naheed_web`; `store`/`storepickup`
-are excluded (and counted). `foodpanda` has no rows in this warehouse — documented as a
-limitation; the `channel` column is kept so it can be added later with no schema change.
-
-Design rules (see the project brief): daily frequency; 7 & 14 day horizons; chronological
-splits only; missing stock is never treated as zero; stockout days are marked demand-censored
-(not proven zero demand); pre-activation dates are not zero-filled; supplier lead time / MOQ /
-stock-in-transit / perishability are configurable assumptions, always flagged.
+are excluded (and counted). `foodpanda` has no rows in this warehouse (documented).
 
 Run from the repo root:
-    python src/prepare_pilot_data.py --as-of-date 2026-07-15
+    python src/prepare_pilot_data.py --as-of-date 2026-06-30
     python src/prepare_pilot_data.py --reselect-pilot-skus --selection-cutoff 2026-05-31
 """
 from __future__ import annotations
@@ -27,10 +34,10 @@ import argparse
 import contextlib
 import datetime as dt
 import json
+import math
 import os
 import sqlite3
 import sys
-import zlib
 from pathlib import Path
 from typing import Iterable
 
@@ -38,41 +45,73 @@ import numpy as np
 import pandas as pd
 import yaml
 
+import synthetic_inventory  # sibling module in src/
+
 try:
     import holidays as _holidays
 except ImportError:  # calendar features degrade gracefully if the lib is absent
     _holidays = None
 
-SCHEMA_VERSION = "2.0-daily-ecommerce"
+SCHEMA_VERSION = "3.0-real-synthetic-split"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = REPO_ROOT / "inventory_etl" / "output" / "inventory.db"
 DEFAULT_OUT = REPO_ROOT / "data" / "processed"
+DEFAULT_SYNTH = REPO_ROOT / "data" / "synthetic"
 CONFIG_PATH = REPO_ROOT / "inventory_etl" / "config" / "config.yaml"
 PILOT_LIST = REPO_ROOT / "pilot_skus.csv"
 CANDIDATE_LIST = REPO_ROOT / "pilot_skus_candidate.csv"
 
+# model_panel is REAL-ONLY. Synthetic-inventory columns are deliberately ABSENT here;
+# the three "*_synthetic / historical_*" flags below are constant markers documenting
+# that no synthetic stock is attached to the demand panel.
 MODEL_PANEL_COLS = [
     "sku", "product_id", "channel", "date", "category", "sub_category", "brand",
     "units_observed", "effective_unit_price", "discount_amount", "discount_pct",
     "on_promo", "promo_known_in_advance", "is_public_holiday", "holiday_name",
     "is_payday_window", "day_of_week", "is_weekend", "week_of_year", "month",
-    "stock_on_hand", "stock_observation_available", "stock_snapshot_stale",
-    "stock_is_synthetic", "is_available", "is_stockout", "demand_censored",
-    "product_active", "training_eligible", "data_quality_flag",
+    "units_lag_1", "units_lag_7", "units_lag_14",
+    "units_roll_mean_7", "units_roll_mean_28", "units_roll_std_7",
+    "product_active", "historical_stockout_observed", "observed_demand_censored",
+    "stock_is_synthetic", "stockout_label_is_synthetic",
+    "forecast_training_eligible", "data_quality_flag",
+]
+# The ONLY columns a demand model may use as features. Everything inventory/cost/synthetic
+# is excluded by construction (they are not in model_panel) and enumerated here for tests/docs.
+DEMAND_FEATURE_WHITELIST = [
+    "units_lag_1", "units_lag_7", "units_lag_14",
+    "units_roll_mean_7", "units_roll_mean_28", "units_roll_std_7",
+    "effective_unit_price", "discount_pct", "on_promo",
+    "is_public_holiday", "is_payday_window", "day_of_week", "is_weekend",
+    "week_of_year", "month",
+]
+DEMAND_FEATURE_FORBIDDEN = [
+    "stock_on_hand", "opening_stock", "ending_stock", "is_stockout", "is_available",
+    "lost_sales", "replenishment_received", "inventory_position", "on_order_quantity",
+    "stockout_within_2d", "stockout_within_7d", "days_until_stockout",
+    "unit_cost", "unit_cost_observed", "unit_cost_effective",
 ]
 FORECAST_COLS = [
     "sku", "product_id", "channel", "date", "forecast_horizon_day", "category",
-    "sub_category", "brand", "latest_known_price", "planned_promo",
-    "planned_discount_pct", "is_public_holiday", "holiday_name", "is_payday_window",
-    "day_of_week", "is_weekend", "week_of_year", "month", "feature_availability_flag",
+    "sub_category", "brand", "latest_known_price", "trailing_units_mean_7",
+    "trailing_units_mean_28", "planned_promo", "planned_discount_pct",
+    "is_public_holiday", "holiday_name", "is_payday_window", "day_of_week",
+    "is_weekend", "week_of_year", "month", "feature_availability_flag",
 ]
 INVENTORY_COLS = [
-    "as_of_date", "sku", "product_id", "location_id", "stock_on_hand",
+    "as_of_date", "sku", "product_id", "location_id",
+    "stock_on_hand", "stock_is_synthetic", "scenario_id", "simulation_version",
+    "stock_snapshot_timing", "inventory_position", "on_order_quantity",
+    "reorder_point", "safety_stock", "days_of_cover", "is_stockout",
     "stock_in_transit", "supplier_lead_time_days", "moq", "pack_size",
-    "is_perishable", "shelf_life_days", "unit_cost", "price", "is_dropship",
-    "stock_flag", "lead_time_is_assumed", "moq_is_assumed", "pack_size_is_assumed",
+    "is_perishable", "shelf_life_days", "price",
+    "unit_cost_observed", "unit_cost_effective", "cost_source", "cost_is_valid",
+    "cost_is_imputed", "cost_quality_flag", "cost_currency", "cost_basis",
+    "recommended_order_quantity", "recommended_purchase_value", "inventory_value",
+    "is_dropship", "lead_time_is_assumed", "moq_is_assumed", "pack_size_is_assumed",
     "stock_in_transit_is_assumed", "perishability_is_assumed", "assumption_notes",
 ]
+
+COST_PRECEDENCE = ["magento_eav", "staging_margin", "product_flat"]
 
 
 # ── config / db ───────────────────────────────────────────────────────────────
@@ -81,7 +120,7 @@ def load_config() -> dict:
         sys.exit(f"Config not found: {CONFIG_PATH}")
     with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
-    for key in ("pilot", "replenishment", "external_signals"):
+    for key in ("pilot", "replenishment", "external_signals", "synthetic", "cost"):
         if key not in cfg:
             sys.exit(f"Config section '{key}' missing in {CONFIG_PATH}")
     return cfg
@@ -98,6 +137,10 @@ def open_db(db_path: Path):
         con.close()
 
 
+def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
 # ── calendar (known in advance → safe as future features) ───────────────────────
 def calendar_features(dates: pd.DatetimeIndex, cfg: dict) -> pd.DataFrame:
     """Holiday/payday/day-of-week features for any date range, computed deterministically
@@ -107,7 +150,7 @@ def calendar_features(dates: pd.DatetimeIndex, cfg: dict) -> pd.DataFrame:
     ends = set(es.get("payday_days_month_end", []))
     country = es.get("country", "PK")
     hol = {}
-    if _holidays is not None:
+    if _holidays is not None and len(dates):
         yrs = range(dates.min().year, dates.max().year + 1)
         hol = dict(_holidays.country_holidays(country, years=yrs))
 
@@ -115,7 +158,7 @@ def calendar_features(dates: pd.DatetimeIndex, cfg: dict) -> pd.DataFrame:
         last = (dt.date(d.year + d.month // 12, d.month % 12 + 1, 1) - dt.timedelta(days=1)).day
         return d.day in starts or d.day in ends or d.day == last
 
-    df = pd.DataFrame({"date": dates})
+    df = pd.DataFrame({"date": pd.DatetimeIndex(dates)})
     dd = df["date"].dt.date
     df["is_public_holiday"] = dd.map(lambda d: d in hol).astype(int)
     df["holiday_name"] = dd.map(lambda d: hol.get(d))
@@ -202,80 +245,15 @@ def load_pilot_skus(con: sqlite3.Connection, cfg: dict, strict: bool) -> tuple[p
     return pilot, warnings
 
 
-# ── stock as-of join ────────────────────────────────────────────────────────────
-def asof_stock(keys: pd.DataFrame, stock: pd.DataFrame, max_staleness: int) -> pd.DataFrame:
-    """As-of join stock snapshots onto (product_id, date) keys with a staleness cap.
-    Returns keys + stock_on_hand, stock_flag, snapshot_age_days (NaN where no snapshot)."""
-    if stock.empty:
-        out = keys.copy()
-        out["stock_on_hand"] = np.nan
-        out["stock_flag"] = None
-        out["snapshot_age_days"] = np.nan
-        return out
-    left = keys.sort_values("date")
-    right = stock.sort_values("snapshot_date")
-    merged = pd.merge_asof(
-        left, right, left_on="date", right_on="snapshot_date",
-        by="product_id", direction="backward",
-        tolerance=pd.Timedelta(days=max_staleness))
-    merged["snapshot_age_days"] = (merged["date"] - merged["snapshot_date"]).dt.days
-    return merged
-
-
-def generate_synthetic_stock(panel: pd.DataFrame, cfg: dict) -> pd.Series:
-    """SIR-APPROVED synthetic daily stock (Naheed keeps no real history).
-
-    A seeded, per-SKU reorder simulation driven by the REAL daily sales:
-    start at an order-up-to level, deplete by actual units sold, and replenish
-    (after the configured lead time, with random lateness) when stock crosses the
-    reorder point. Start-of-day stock is forced to cover that day's real sales, so
-    the series never contradicts observed demand; stockouts therefore land on
-    zero-sale days. Deterministic (same seed -> same output). Returns a
-    stock_on_hand Series aligned to `panel.index`. Values are SYNTHETIC and are
-    flagged as such everywhere downstream.
-    """
-    rep, sc = cfg["replenishment"], cfg["stock"]
-    lead = int(rep["default_supplier_lead_time_days"])
-    cover, safety = int(sc["target_cover_days"]), int(sc["safety_days"])
-    jitter, base_seed = int(sc["reorder_jitter_days"]), int(sc["seed"])
-
-    out = pd.Series(index=panel.index, dtype="float64")
-    for (sku, ch), g in panel.groupby(["sku", "channel"], sort=False):
-        u = pd.to_numeric(g["units_observed"], errors="coerce").fillna(0).to_numpy(dtype=float)
-        n = len(u)
-        seed = (base_seed + zlib.crc32(f"{sku}|{ch}".encode())) & 0xFFFFFFFF
-        rng = np.random.default_rng(seed)
-        avg = max(float(u.mean()), 0.1)
-        rop = avg * lead + avg * safety           # reorder point
-        order_up_to = rop + avg * cover           # target level after ordering
-        buf = n + lead + jitter + 5
-        arrivals = np.zeros(buf)
-        soh = np.zeros(n)
-        stock = order_up_to
-        pending_until = -1
-        for i in range(n):
-            stock += arrivals[i]
-            if pending_until == i:
-                pending_until = -1
-            if stock < u[i]:                      # can't have sold more than was on hand
-                stock = u[i]
-            soh[i] = stock                        # start-of-day available stock
-            stock = max(stock - u[i], 0.0)        # end of day
-            if stock <= rop and pending_until < 0:
-                lag = lead + int(rng.integers(0, jitter + 1))
-                j = i + lag
-                if j < buf:
-                    arrivals[j] += max(order_up_to - stock, avg * cover)
-                    pending_until = j
-        out.loc[g.index] = np.round(soh)
-    return out
-
-
-# ── builders ─────────────────────────────────────────────────────────────────────
+# ── model panel (REAL demand only) ───────────────────────────────────────────────
 def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
-                      start: str | None, end: str | None
+                      start: str | None, as_of: str | None
                       ) -> tuple[pd.DataFrame, dict]:
-    """Daily SKU x channel panel over each SKU's active period (no pre-activation zero-fill)."""
+    """Daily SKU x channel panel of REAL sales over each SKU's active period.
+
+    `as_of` is a HARD boundary: no sales row after as_of affects anything downstream.
+    Contains NO synthetic inventory columns — those live in data/synthetic/.
+    """
     skus = pilot["sku"].astype(str).tolist()
     ph = ",".join("?" * len(skus))
     attrs = pd.read_sql(
@@ -290,13 +268,14 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
     ecom, physical_excluded, unknown = map_channels(raw, cfg)
     if start:
         ecom = ecom[ecom["date"] >= pd.Timestamp(start)]
-    if end:
-        ecom = ecom[ecom["date"] <= pd.Timestamp(end)]
+    # HARD as_of boundary — drop every record after as_of BEFORE any aggregation/features
+    as_of_ts = pd.Timestamp(as_of) if as_of else (ecom["date"].max() if not ecom.empty else pd.NaT)
+    rows_after_as_of = int((ecom["date"] > as_of_ts).sum()) if as_of else 0
+    ecom = ecom[ecom["date"] <= as_of_ts]
     if ecom.empty:
-        sys.exit("No ecommerce sales found for the pilot SKUs in the given window.")
+        sys.exit("No ecommerce sales found for the pilot SKUs in the given window (<= as_of).")
+    window_end = as_of_ts
 
-    window_end = pd.Timestamp(end) if end else ecom["date"].max()
-    # daily aggregation per sku/channel/date
     agg = (ecom.groupby(["sku", "channel", "date"])
                .agg(units_observed=("quantity_sold", "sum"),
                     discount_amount=("discount_amount", "sum"),
@@ -304,10 +283,7 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
                .reset_index())
     agg["units_observed"] = agg["units_observed"].clip(lower=0).round().astype(int)
 
-    # per-SKU/channel active start = first ecommerce sale (listing date unknown -> documented fallback)
     starts = agg.groupby(["sku", "channel"])["date"].min().reset_index(name="active_start")
-
-    # rectangular active grid: each sku/channel from its active_start..window_end
     frames = []
     for (sku, ch), grp in starts.groupby(["sku", "channel"]):
         a0 = grp["active_start"].iloc[0]
@@ -316,82 +292,68 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
     panel = pd.concat(frames, ignore_index=True)
     panel = panel.merge(agg, on=["sku", "channel", "date"], how="left")
 
-    # genuine zeros only within the active window
-    panel["units_observed"] = panel["units_observed"].fillna(0).astype(int)
+    panel["units_observed"] = panel["units_observed"].fillna(0).astype(int)   # genuine zeros in-window
     panel["discount_amount"] = panel["discount_amount"].fillna(0.0)
     panel["net_rev"] = panel["net_rev"].fillna(0.0)
     panel["product_active"] = True
+    panel = panel.sort_values(["sku", "channel", "date"]).reset_index(drop=True)
 
-    # effective price: revenue/units on sale days, else carry last known price forward
-    panel = panel.sort_values(["sku", "channel", "date"])
     with np.errstate(divide="ignore", invalid="ignore"):
         eff = np.where(panel["units_observed"] > 0,
                        panel["net_rev"] / panel["units_observed"].replace(0, np.nan), np.nan)
     panel["effective_unit_price"] = eff
-    panel["effective_unit_price"] = (panel.groupby(["sku", "channel"])["effective_unit_price"]
-                                          .ffill())
+    panel["effective_unit_price"] = panel.groupby(["sku", "channel"])["effective_unit_price"].ffill()
     gross = panel["net_rev"] + panel["discount_amount"]
     panel["discount_pct"] = np.where(gross > 0, panel["discount_amount"] / gross, 0.0)
     panel["on_promo"] = (panel["discount_amount"] > 0).astype(int)
     panel["promo_known_in_advance"] = 0        # historical realised promo, not a planned calendar
 
-    # calendar features
     cal = calendar_features(pd.DatetimeIndex(panel["date"].unique()), cfg)
     panel = panel.merge(cal, on="date", how="left")
-
-    # attributes
     panel = panel.merge(attrs.drop(columns=["price"]), on="sku", how="left")
 
-    # stock: synthetic (seeded reorder sim) OR real (sparse warehouse as-of join)
-    stock_mode = cfg.get("stock", {}).get("mode", "real")
-    if stock_mode == "synthetic":
-        panel["stock_on_hand"] = generate_synthetic_stock(panel, cfg).to_numpy()
-        panel["stock_flag"] = "synthetic"
-        panel["stock_is_synthetic"] = True
-        panel["stock_observation_available"] = True
-        panel["stock_snapshot_stale"] = False
-    else:
-        stock_hist = pd.read_sql(
-            "SELECT product_id, snapshot_date, stock_on_hand, stock_flag "
-            "FROM inventory_snapshot_history", con)
-        stock_hist["snapshot_date"] = pd.to_datetime(stock_hist["snapshot_date"])
-        keys = panel[["product_id", "date"]].copy()
-        st = asof_stock(keys.assign(_i=range(len(keys))), stock_hist,
-                        cfg["pilot"]["max_stock_staleness_days"]).sort_values("_i")
-        panel["stock_on_hand"] = st["stock_on_hand"].to_numpy()
-        panel["stock_flag"] = st["stock_flag"].to_numpy()
-        age = st["snapshot_age_days"].to_numpy()
-        panel["stock_is_synthetic"] = False
-        panel["stock_observation_available"] = ~pd.isna(panel["stock_on_hand"])
-        panel["stock_snapshot_stale"] = panel["stock_observation_available"] & (np.nan_to_num(age, nan=0) > 0)
+    # CAUSAL demand features: grouped shift BEFORE rolling so date t uses only data <= t-1.
+    grp = panel.groupby(["sku", "channel"])["units_observed"]
+    panel["units_lag_1"] = grp.shift(1)
+    panel["units_lag_7"] = grp.shift(7)
+    panel["units_lag_14"] = grp.shift(14)
+    base = grp.shift(1)                                   # exclude the current day from rolling
+    keyed = base.groupby([panel["sku"], panel["channel"]])
+    panel["units_roll_mean_7"] = keyed.transform(lambda s: s.rolling(7, min_periods=1).mean())
+    panel["units_roll_mean_28"] = keyed.transform(lambda s: s.rolling(28, min_periods=1).mean())
+    panel["units_roll_std_7"] = keyed.transform(lambda s: s.rolling(7, min_periods=1).std())
 
-    soh = pd.to_numeric(panel["stock_on_hand"], errors="coerce")
-    panel["is_stockout"] = (panel["stock_observation_available"] & (soh <= 0)).fillna(False)
-    panel["is_available"] = (panel["stock_observation_available"] & (soh > 0)).fillna(False)
-    panel["demand_censored"] = panel["is_stockout"]
-    panel["training_eligible"] = panel["product_active"] & (~panel["demand_censored"])
+    # Explicit REAL-vs-SYNTHETIC markers. Real daily stock history is unavailable, so
+    # historical stockout / censoring are UNKNOWN here — never assume zero sales == stockout.
+    panel["historical_stockout_observed"] = False
+    panel["observed_demand_censored"] = pd.NA          # unknown (no real stock history)
+    panel["stock_is_synthetic"] = False                # no synthetic stock attached to the demand panel
+    panel["stockout_label_is_synthetic"] = False
 
-    # data quality flag (compact, honest)
-    def flag(row) -> str:
+    # forecast eligibility: depends ONLY on real-data validity + sufficient history.
+    didx = panel.groupby(["sku", "channel"]).cumcount()
+    min_hist = 14
+    panel["forecast_training_eligible"] = panel["product_active"] & (didx >= min_hist)
+
+    def flag(row_didx, price_bad) -> str:
         flags = ["activation_inferred_from_first_sale"]
-        if row["stock_is_synthetic"]:
-            flags.append("stock_synthetic")
-        elif not row["stock_observation_available"]:
-            flags.append("stock_unobserved")
-        elif row["stock_snapshot_stale"]:
-            flags.append("stock_stale")
-        if row["units_observed"] > 0 and (pd.isna(row["effective_unit_price"]) or row["effective_unit_price"] <= 0):
+        if row_didx < min_hist:
+            flags.append("insufficient_history")
+        if price_bad:
             flags.append("price_anomaly")
         return ";".join(flags)
-    panel["data_quality_flag"] = panel.apply(flag, axis=1)
+
+    price_bad = (panel["units_observed"] > 0) & (
+        panel["effective_unit_price"].isna() | (panel["effective_unit_price"] <= 0))
+    panel["data_quality_flag"] = [flag(d, pb) for d, pb in zip(didx.to_numpy(), price_bad.to_numpy())]
 
     panel["holiday_name"] = panel["holiday_name"].where(panel["holiday_name"].notna(), None)
-    panel = panel.sort_values(["sku", "channel", "date"]).reset_index(drop=True)
     stats = {"physical_store_rows_excluded": physical_excluded, "unknown_channel_rows": unknown,
-             "window_end": window_end}
+             "window_end": window_end, "as_of": window_end, "rows_after_as_of_dropped": rows_after_as_of}
     return panel[MODEL_PANEL_COLS], stats
 
 
+# ── forecast features (real, known-at-as_of, NO cost, NO synthetic) ───────────────
 def build_forecast_features(panel: pd.DataFrame, con: sqlite3.Connection, pilot: pd.DataFrame,
                             cfg: dict, as_of: pd.Timestamp) -> pd.DataFrame:
     """Exactly N future days per SKU/channel, using only info known on as_of (no leakage)."""
@@ -399,10 +361,13 @@ def build_forecast_features(panel: pd.DataFrame, con: sqlite3.Connection, pilot:
     future = pd.date_range(as_of + pd.Timedelta(days=1), periods=n_days, freq="D")
     keys = panel[["sku", "product_id", "channel", "category", "sub_category", "brand"]].drop_duplicates()
 
-    # latest price known on/before as_of (from history), fallback to catalog price
     hist = panel[panel["date"] <= as_of]
     last_price = (hist.dropna(subset=["effective_unit_price"])
                       .sort_values("date").groupby(["sku", "channel"])["effective_unit_price"].last())
+    # trailing real-demand means KNOWN at as_of (static per SKU/channel; safe future features)
+    tail = hist.sort_values("date").groupby(["sku", "channel"])["units_observed"]
+    trail7 = tail.apply(lambda s: float(s.tail(7).mean()) if len(s) else np.nan)
+    trail28 = tail.apply(lambda s: float(s.tail(28).mean()) if len(s) else np.nan)
     skus = pilot["sku"].astype(str).tolist()
     cat_price = pd.read_sql(
         f"SELECT sku_id AS sku, price FROM sku_master WHERE sku_id IN ({','.join('?'*len(skus))})",
@@ -410,18 +375,18 @@ def build_forecast_features(panel: pd.DataFrame, con: sqlite3.Connection, pilot:
 
     rows = []
     for _, k in keys.iterrows():
-        lp = last_price.get((k["sku"], k["channel"]))
+        key = (k["sku"], k["channel"])
+        lp = last_price.get(key)
         if pd.isna(lp):
             lp = cat_price.get(k["sku"], np.nan)
         for i, d in enumerate(future, start=1):
             rows.append({**k.to_dict(), "date": d, "forecast_horizon_day": i,
-                         "latest_known_price": lp})
+                         "latest_known_price": lp,
+                         "trailing_units_mean_7": trail7.get(key, np.nan),
+                         "trailing_units_mean_28": trail28.get(key, np.nan)})
     ff = pd.DataFrame(rows)
     cal = calendar_features(future, cfg)
     ff = ff.merge(cal, on="date", how="left")
-
-    # planned promotions cannot be reliably derived (no calendar with valid dates) -> unavailable,
-    # NEVER copied from future realised transaction discounts.
     ff["planned_promo"] = 0
     ff["planned_discount_pct"] = np.nan
     ff["feature_availability_flag"] = np.where(
@@ -431,80 +396,192 @@ def build_forecast_features(panel: pd.DataFrame, con: sqlite3.Connection, pilot:
     return ff.sort_values(["sku", "channel", "date"]).reset_index(drop=True)[FORECAST_COLS]
 
 
+# ── unit-cost validation ──────────────────────────────────────────────────────────
+def classify_cost(candidates: list[tuple[str, object]], price, tol: float) -> dict:
+    """Resolve one SKU's cost from precedence-ordered (source, value) candidates.
+
+    A cost is valid iff numeric, finite and > 0. Zero/negative are INVALID (not just present).
+    Returns observed value + source + validity + quality flags. No imputation here — the
+    caller applies category/global median fallback for unit_cost_effective.
+    """
+    flags: list[str] = []
+    numeric = [(s, pd.to_numeric(v, errors="coerce")) for s, v in candidates]
+    numeric = [(s, float(v)) for s, v in numeric if pd.notna(v)]
+    if not numeric:
+        flags.append("MISSING_COST")
+    if any(np.isfinite(v) and v <= 0 for _, v in numeric):
+        flags.append("NON_POSITIVE_COST")
+    if any(not np.isfinite(v) for _, v in numeric):
+        flags.append("NON_FINITE_COST")
+    valids = [(s, v) for s, v in numeric if np.isfinite(v) and v > 0]
+    observed, source = (valids[0][1], valids[0][0]) if valids else (None, "missing")
+    if len(valids) >= 2:
+        lo, hi = min(v for _, v in valids), max(v for _, v in valids)
+        if lo > 0 and (hi - lo) / lo > tol:
+            flags.append("COST_SOURCE_CONFLICT")
+    if observed is not None and pd.notna(price) and observed > float(price):
+        flags.append("COST_ABOVE_PRICE")
+    return {"observed": observed, "source": source, "valid": observed is not None, "flags": flags}
+
+
+def resolve_costs(sm: pd.DataFrame, con: sqlite3.Connection, cfg: dict) -> pd.DataFrame:
+    """Add validated cost columns to the SKU master frame.
+
+    Uses per-source columns (eav_cost/margin_cost/flat_cost) if the warehouse carries them;
+    otherwise treats sku_master.unit_cost as the already-precedence-resolved observed cost
+    (its source recorded in cost_source if present). Applies category then global median
+    fallback for unit_cost_effective, always retaining that the observed value was invalid.
+    """
+    ccfg = cfg["cost"]
+    tol = float(ccfg.get("conflict_tolerance_pct", 0.25))
+    cols = _table_columns(con, "sku_master")
+    per_source = {"eav_cost", "margin_cost", "flat_cost"} <= cols
+    has_source_col = "cost_source" in cols
+
+    recs = []
+    for _, r in sm.iterrows():
+        if per_source:
+            cands = [("magento_eav", r.get("eav_cost")),
+                     ("staging_margin", r.get("margin_cost")),
+                     ("product_flat", r.get("flat_cost"))]
+        else:
+            src = r.get("cost_source") if has_source_col and pd.notna(r.get("cost_source")) \
+                else "warehouse_precedence"
+            cands = [(src, r.get("unit_cost"))]
+        recs.append(classify_cost(cands, r.get("price"), tol))
+
+    sm = sm.copy()
+    sm["unit_cost_observed"] = [x["observed"] for x in recs]
+    sm["cost_source"] = [x["source"] for x in recs]
+    sm["cost_is_valid"] = [x["valid"] for x in recs]
+    sm["_flags"] = [x["flags"] for x in recs]
+
+    # category -> global median fallback (from VALID observed costs only)
+    valid_obs = sm.loc[sm["cost_is_valid"], ["category", "unit_cost_observed"]]
+    cat_median = valid_obs.groupby("category")["unit_cost_observed"].median().to_dict()
+    global_median = float(valid_obs["unit_cost_observed"].median()) if len(valid_obs) else np.nan
+
+    eff, imputed, source, flags = [], [], [], []
+    for i, r in sm.reset_index(drop=True).iterrows():
+        fl = list(recs[i]["flags"])
+        if r["cost_is_valid"]:
+            eff.append(float(r["unit_cost_observed"]))
+            imputed.append(False)
+            source.append(r["cost_source"])
+        else:
+            cm = cat_median.get(r["category"], np.nan)
+            if pd.notna(cm):
+                eff.append(float(cm)); source.append("category_median_fallback"); fl.append("IMPUTED_CATEGORY_MEDIAN")
+            elif pd.notna(global_median):
+                eff.append(float(global_median)); source.append("global_median_fallback"); fl.append("IMPUTED_GLOBAL_MEDIAN")
+            else:
+                eff.append(np.nan); source.append("missing")
+            imputed.append(True)
+        fl.append("PACK_UNIT_BASIS_UNCONFIRMED")     # DB cost unit (SKU/case/pack) not confirmed
+        flags.append(";".join(dict.fromkeys(fl)))     # de-dup, keep order
+    sm["unit_cost_effective"] = eff
+    sm["cost_is_imputed"] = imputed
+    sm["cost_source"] = source
+    sm["cost_quality_flag"] = flags
+    sm["cost_currency"] = ccfg.get("currency", "PKR")
+    sm["cost_basis"] = ccfg.get("basis", "sellable_sku_unit_unconfirmed")
+    return sm.drop(columns=["_flags"])
+
+
+# ── inventory context (as-of; validated cost; synthetic stock snapshot) ────────────
 def build_inventory_context(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
-                            as_of: pd.Timestamp, panel: pd.DataFrame) -> pd.DataFrame:
-    """One row per SKU x location at as_of. Every replenishment assumption is flagged.
-    Stock-on-hand comes from the synthetic series (if enabled) or the warehouse snapshot."""
+                            as_of: pd.Timestamp, scenarios: pd.DataFrame) -> pd.DataFrame:
+    """One row per SKU x location at as_of. Stock-on-hand is the SYNTHETIC primary-scenario
+    end-of-day snapshot (flagged). Cost is validated (observed vs effective). Replenishment
+    inputs are flagged assumptions."""
     rep = cfg["replenishment"]
+    syn = cfg["synthetic"]
+    primary = syn["primary_scenario"]
+    prm = next(s for s in syn["scenarios"] if s["id"] == primary)
     skus = pilot["sku"].astype(str).tolist()
     ph = ",".join("?" * len(skus))
-    sm = pd.read_sql(
-        f"SELECT sku_id AS sku, product_id, is_perishable, shelf_life_days, unit_cost, "
-        f"       price, pack_size, is_dropship FROM sku_master WHERE sku_id IN ({ph})",
-        con, params=skus)
+    base_cols = "sku_id AS sku, product_id, category, is_perishable, shelf_life_days, unit_cost, price, pack_size, is_dropship"
+    extra = [c for c in ("eav_cost", "margin_cost", "flat_cost", "cost_source")
+             if c in _table_columns(con, "sku_master")]
+    sel = base_cols + ("".join(f", {c}" for c in extra))
+    sm = pd.read_sql(f"SELECT {sel} FROM sku_master WHERE sku_id IN ({ph})", con, params=skus)
+    sm = resolve_costs(sm, con, cfg)
 
-    synthetic = cfg.get("stock", {}).get("mode", "real") == "synthetic"
-    synth_soh: dict = {}
-    latest = pd.DataFrame()
-    if synthetic:
-        h = panel[panel["date"] <= as_of]
-        synth_soh = h.sort_values("date").groupby("sku")["stock_on_hand"].last().to_dict()
-    else:
-        stock_hist = pd.read_sql(
-            "SELECT product_id, snapshot_date, stock_on_hand, stock_flag, location_id "
-            "FROM inventory_snapshot_history", con)
-        stock_hist["snapshot_date"] = pd.to_datetime(stock_hist["snapshot_date"])
-        stock_hist = stock_hist[stock_hist["snapshot_date"] <= as_of]
-        latest = (stock_hist.sort_values("snapshot_date").groupby("product_id").tail(1)
-                  if not stock_hist.empty else stock_hist)
+    # synthetic snapshot from the PRIMARY scenario, last simulated day <= as_of
+    snap = {}
+    if not scenarios.empty:
+        prim = scenarios[(scenarios["scenario_id"] == primary) & (scenarios["date"] <= as_of)]
+        snap = {sku: g.sort_values("date").iloc[-1] for sku, g in prim.groupby("sku")}
 
-    lead = int(rep["default_supplier_lead_time_days"])
-    moq = int(rep["default_moq"])
+    lead = int(prm["lead_time_days"])
+    moq = int(prm["moq"])
+    pack = int(prm["pack_size"])
+    review = int(prm["review_period_days"])
     assume_transit0 = bool(cfg["pilot"]["assume_stock_in_transit_zero"])
-    note = (f"Supplier lead time uses the configured {lead}-day default because supplier-level "
-            f"lead-time data is unavailable. MOQ uses the configured default of {moq} because "
-            f"supplier MOQ data is unavailable. Stock-in-transit "
-            + ("assumed 0 (no source in warehouse). " if assume_transit0 else "left unknown. ")
-            + "Perishability unknown (shelf-life data absent) — not confirmed durable."
-            + (" stock_on_hand is SYNTHETIC (seeded reorder simulation, not real Naheed data)."
-               if synthetic else ""))
+    note = (f"stock_on_hand is SYNTHETIC (end-of-day snapshot from the '{primary}' simulation "
+            f"scenario — NOT real Naheed stock). Supplier lead time ({lead}d), MOQ ({moq}), "
+            f"pack size ({pack}) and review period ({review}d) are pilot assumptions (no supplier "
+            f"data). Stock-in-transit " + ("assumed 0. " if assume_transit0 else "unknown. ")
+            + "Perishability unknown where shelf-life absent. Unit cost validated; effective "
+            "cost may be an imputed fallback (see cost_quality_flag).")
 
     rows = []
     for _, r in sm.iterrows():
-        if synthetic:
-            val = synth_soh.get(r["sku"], np.nan)
-            soh = float(val) if pd.notna(val) else np.nan
-            sflag, loc = "synthetic", "ALL"
+        s = snap.get(r["sku"])
+        if s is not None:
+            soh = float(s["ending_stock"]); inv_pos = float(s["inventory_position"])
+            on_order = float(s["on_order_quantity"]); rop = float(s["reorder_point"])
+            safety = float(s["safety_stock"]); doc = float(s["days_of_cover"]) if pd.notna(s["days_of_cover"]) else np.nan
+            is_so = bool(s["is_stockout"]); exp_daily = float(s["expected_daily_demand"])
         else:
-            m = latest[latest["product_id"] == r["product_id"]] if not latest.empty else latest
-            soh = float(m["stock_on_hand"].iloc[0]) if len(m) else np.nan
-            sflag = m["stock_flag"].iloc[0] if len(m) else None
-            loc = m["location_id"].iloc[0] if len(m) else "ALL"
-        ps = r["pack_size"]
-        ps_ok = pd.notna(ps) and int(ps) >= 1
-        pack = int(ps) if ps_ok else 1
-        pack_assumed = not (ps_ok and int(ps) > 1)     # only >1 counts as real box-pack data
+            soh = inv_pos = on_order = rop = safety = np.nan
+            doc = np.nan; is_so = False; exp_daily = np.nan
+
+        # causal reorder recommendation at as_of (same math as the simulation)
+        if pd.notna(inv_pos) and pd.notna(exp_daily):
+            target = rop + exp_daily * review
+            raw = max(0.0, target - inv_pos)
+            if inv_pos <= rop and raw > 0:
+                rec_qty = float(max(moq, math.ceil(raw / pack) * pack))
+            else:
+                rec_qty = 0.0
+        else:
+            rec_qty = np.nan
+        eff = r["unit_cost_effective"]
+        rec_val = rec_qty * eff if (pd.notna(rec_qty) and pd.notna(eff)) else np.nan
+        inv_val = soh * eff if (pd.notna(soh) and pd.notna(eff)) else np.nan
+
         rows.append({
             "as_of_date": as_of.date().isoformat(), "sku": r["sku"], "product_id": r["product_id"],
-            "location_id": loc or "ALL", "stock_on_hand": soh,
+            "location_id": "ALL",
+            "stock_on_hand": soh, "stock_is_synthetic": True, "scenario_id": primary,
+            "simulation_version": syn["simulation_version"], "stock_snapshot_timing": "end_of_day",
+            "inventory_position": inv_pos, "on_order_quantity": on_order,
+            "reorder_point": round(rop, 2) if pd.notna(rop) else np.nan,
+            "safety_stock": round(safety, 2) if pd.notna(safety) else np.nan,
+            "days_of_cover": doc, "is_stockout": is_so,
             "stock_in_transit": 0.0 if assume_transit0 else np.nan,
             "supplier_lead_time_days": lead, "moq": moq, "pack_size": pack,
             "is_perishable": bool(r["is_perishable"]) if pd.notna(r["is_perishable"]) else None,
             "shelf_life_days": r["shelf_life_days"] if pd.notna(r["shelf_life_days"]) else None,
-            "unit_cost": r["unit_cost"] if pd.notna(r["unit_cost"]) else None,
-            "price": r["price"], "is_dropship": bool(r["is_dropship"]) if pd.notna(r["is_dropship"]) else None,
-            "stock_flag": sflag,
-            "lead_time_is_assumed": True, "moq_is_assumed": True,
-            "pack_size_is_assumed": pack_assumed,
-            "stock_in_transit_is_assumed": True,
-            "perishability_is_assumed": True, "assumption_notes": note,
+            "price": r["price"],
+            "unit_cost_observed": r["unit_cost_observed"], "unit_cost_effective": eff,
+            "cost_source": r["cost_source"], "cost_is_valid": bool(r["cost_is_valid"]),
+            "cost_is_imputed": bool(r["cost_is_imputed"]), "cost_quality_flag": r["cost_quality_flag"],
+            "cost_currency": r["cost_currency"], "cost_basis": r["cost_basis"],
+            "recommended_order_quantity": rec_qty, "recommended_purchase_value": rec_val,
+            "inventory_value": inv_val,
+            "is_dropship": bool(r["is_dropship"]) if pd.notna(r["is_dropship"]) else None,
+            "lead_time_is_assumed": True, "moq_is_assumed": True, "pack_size_is_assumed": True,
+            "stock_in_transit_is_assumed": True, "perishability_is_assumed": True,
+            "assumption_notes": note,
         })
     return pd.DataFrame(rows)[INVENTORY_COLS]
 
 
 # ── validation ────────────────────────────────────────────────────────────────────
 def validate_outputs(panel: pd.DataFrame, ff: pd.DataFrame, inv: pd.DataFrame,
-                     cfg: dict) -> list[str]:
+                     scenarios: pd.DataFrame, cfg: dict) -> list[str]:
     problems: list[str] = []
     if list(panel.columns) != MODEL_PANEL_COLS:
         problems.append("model_panel columns mismatch")
@@ -512,6 +589,10 @@ def validate_outputs(panel: pd.DataFrame, ff: pd.DataFrame, inv: pd.DataFrame,
         problems.append("forecast_features columns mismatch")
     if list(inv.columns) != INVENTORY_COLS:
         problems.append("inventory_context columns mismatch")
+    # real panel must not carry any synthetic inventory feature
+    leaked = [c for c in DEMAND_FEATURE_FORBIDDEN if c in panel.columns]
+    if leaked:
+        problems.append(f"LEAKAGE: synthetic/cost fields present in model_panel: {leaked}")
     if panel.duplicated(["sku", "channel", "date"]).any():
         problems.append("duplicate sku+channel+date in model_panel")
     if ff.duplicated(["sku", "channel", "date"]).any():
@@ -520,6 +601,10 @@ def validate_outputs(panel: pd.DataFrame, ff: pd.DataFrame, inv: pd.DataFrame,
         problems.append("duplicate sku+location in inventory_context")
     if (panel["units_observed"] < 0).any():
         problems.append("negative units_observed")
+    if "units_observed" in ff.columns:
+        problems.append("LEAKAGE: forecast_features must not contain units_observed")
+    if any(c in ff.columns for c in ("unit_cost", "unit_cost_effective", "unit_cost_observed")):
+        problems.append("LEAKAGE: forecast_features must not contain unit cost")
     n_days = int(cfg["pilot"]["forecast_feature_days"])
     per = ff.groupby(["sku", "channel"])["date"].nunique()
     if not (per == n_days).all():
@@ -527,88 +612,118 @@ def validate_outputs(panel: pd.DataFrame, ff: pd.DataFrame, inv: pd.DataFrame,
     allowed = set(cfg["pilot"]["ecommerce_channel_map"].values())
     if not set(panel["channel"]).issubset(allowed):
         problems.append(f"unexpected channels in model_panel: {set(panel['channel']) - allowed}")
-    if "units_observed" in ff.columns:
-        problems.append("LEAKAGE: forecast_features must not contain units_observed")
     if (inv["pack_size"] < 1).any():
         problems.append("pack_size must be a positive integer")
+    eff = pd.to_numeric(inv["unit_cost_effective"], errors="coerce")
+    if ((eff <= 0) & eff.notna()).any():
+        problems.append("unit_cost_effective must be positive when present")
+    # synthetic invariants
+    if not scenarios.empty:
+        if (scenarios["ending_stock"] < 0).any():
+            problems.append("synthetic ending_stock went negative")
+        if (scenarios["synthetic_sales"] > scenarios["opening_stock"].clip(lower=0)).any():
+            problems.append("synthetic_sales exceeded available stock")
+        if not scenarios["is_synthetic"].all():
+            problems.append("stockout_scenarios rows missing is_synthetic=True")
     return problems
 
 
 # ── manifest ──────────────────────────────────────────────────────────────────────
-def build_manifest(panel, ff, inv, pilot, cfg, args, stats, as_of, warnings, problems) -> dict:
+def build_manifest(panel, ff, inv, scenarios, events, pilot, cfg, args, stats,
+                   as_of, warnings, problems) -> dict:
     def rate(mask) -> float:
         return round(float(mask.mean()), 4) if len(mask) else 0.0
+
+    by_scn = {}
+    if not scenarios.empty:
+        for scn, g in scenarios.groupby("scenario_id"):
+            by_scn[scn] = {
+                "rows": int(len(g)),
+                "stockout_rate": rate(g["is_stockout"]),
+                "stockout_within_2d_rate": rate(g.get("stockout_within_2d", pd.Series(dtype=bool))),
+                "stockout_within_7d_rate": rate(g.get("stockout_within_7d", pd.Series(dtype=bool))),
+                "lost_sales_days": int((g["lost_sales"] > 0).sum()),
+                "lost_sales_units": int(g["lost_sales"].sum()),
+            }
+
+    eff = pd.to_numeric(inv["unit_cost_effective"], errors="coerce")
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": args.generated_at,
         "as_of_date": as_of.date().isoformat(),
-        "source_database_profile": "sqlite:inventory.db",
+        "sku_selection_cutoff": args.selection_cutoff,
+        "rows_after_as_of_dropped": stats["rows_after_as_of_dropped"],
         "source_warehouse_path": str(Path(args.db_path)),
         "data_frequency": "daily",
-        "stock_source": ("synthetic (seeded reorder simulation — NOT real Naheed data)"
-                         if cfg.get("stock", {}).get("mode") == "synthetic"
-                         else "warehouse snapshots (as-of join)"),
+        "forecast_sales_source": "REAL Naheed e-commerce sales (units_observed, untouched)",
+        "inventory_stockout_source": "SYNTHETIC causal simulation (NOT real historical stock)",
+        "forecast_eligibility_independent_of_synthetic_stock": True,
         "forecast_horizons": cfg["pilot"]["forecast_horizons"],
         "history_start": panel["date"].min().date().isoformat(),
         "history_end": panel["date"].max().date().isoformat(),
-        "selection_cutoff": args.selection_cutoff,
         "sku_count": int(panel["sku"].nunique()),
         "ecommerce_channels": sorted(panel["channel"].unique().tolist()),
-        "model_panel_row_count": int(len(panel)),
-        "forecast_feature_row_count": int(len(ff)),
-        "inventory_context_row_count": int(len(inv)),
         "selected_skus": pilot["sku"].astype(str).tolist(),
         "category_distribution": panel.drop_duplicates("sku")["category"].value_counts().to_dict(),
-        "channel_distribution": panel["channel"].value_counts().to_dict(),
         "physical_store_rows_excluded": stats["physical_store_rows_excluded"],
         "unknown_channel_rows": stats["unknown_channel_rows"],
+        # real demand panel
+        "real_sales_row_count": int(len(panel)),
+        "forecast_eligible_row_count": int(panel["forecast_training_eligible"].sum()),
         "zero_sales_rate": rate(panel["units_observed"] == 0),
-        "stockout_rate": rate(panel["is_stockout"]),
-        "censored_demand_rate": rate(panel["demand_censored"]),
-        "stock_observation_coverage": rate(panel["stock_observation_available"]),
         "promotion_coverage": rate(panel["on_promo"] == 1),
-        "perishability_coverage": rate(inv["is_perishable"].fillna(False).astype(bool)),
-        "assumed_lead_time_count": int(inv["lead_time_is_assumed"].sum()),
-        "assumed_moq_count": int(inv["moq_is_assumed"].sum()),
-        "assumed_pack_size_count": int(inv["pack_size_is_assumed"].sum()),
-        "missing_value_counts": {
-            "model_panel_stock_on_hand": int(panel["stock_on_hand"].isna().sum()),
-            "inventory_unit_cost": int(inv["unit_cost"].isna().sum()),
-            "inventory_shelf_life_days": int(inv["shelf_life_days"].isna().sum()),
+        # synthetic simulation
+        "synthetic_scenario_row_count": int(len(scenarios)),
+        "n_scenarios": int(scenarios["scenario_id"].nunique()) if not scenarios.empty else 0,
+        "replenishment_event_count": int(len(events)),
+        "stockout_by_scenario": by_scn,
+        "simulation_version": cfg["synthetic"]["simulation_version"],
+        "simulation_seed": cfg["synthetic"]["seed"],
+        # cost coverage / quality
+        "cost_coverage_by_source": inv["cost_source"].value_counts().to_dict(),
+        "cost_valid_count": int(inv["cost_is_valid"].sum()),
+        "cost_invalid_or_missing_count": int((~inv["cost_is_valid"]).sum()),
+        "cost_imputed_count": int(inv["cost_is_imputed"].sum()),
+        "cost_non_positive_count": int(inv["cost_quality_flag"].str.contains("NON_POSITIVE_COST").sum()),
+        "cost_missing_count": int(inv["cost_quality_flag"].str.contains("MISSING_COST").sum()),
+        "cost_above_price_count": int(inv["cost_quality_flag"].str.contains("COST_ABOVE_PRICE").sum()),
+        "cost_source_conflict_count": int(inv["cost_quality_flag"].str.contains("COST_SOURCE_CONFLICT").sum()),
+        "cost_currency": cfg["cost"].get("currency"),
+        "cost_basis": cfg["cost"].get("basis"),
+        "row_counts": {
+            "model_panel": int(len(panel)), "forecast_features": int(len(ff)),
+            "inventory_context": int(len(inv)), "stockout_scenarios": int(len(scenarios)),
+            "replenishment_events": int(len(events)),
         },
-        "duplicate_key_counts": {
-            "model_panel": int(panel.duplicated(["sku", "channel", "date"]).sum()),
-            "forecast_features": int(ff.duplicated(["sku", "channel", "date"]).sum()),
-            "inventory_context": int(inv.duplicated(["sku", "location_id"]).sum()),
-        },
-        "configuration_used": {
-            "replenishment": cfg["replenishment"], "pilot": cfg["pilot"]},
-        "assumptions": ([
-            "Daily stock_on_hand is SYNTHETIC — a seeded reorder simulation driven by real "
-            "sales (Naheed keeps no daily stock history). Flagged stock_is_synthetic=True."
-        ] if cfg.get("stock", {}).get("mode") == "synthetic" else []) + [
-            "Supplier lead time is a configured assumption (no supplier data).",
-            "MOQ is a configured assumption (no supplier data).",
-            "Stock-in-transit assumed 0 (no source in warehouse).",
-            "Pack size defaults to 1 (nhd_box_products empty) unless real box data exists.",
-            "Perishability unknown (shelf-life absent) — not classified as durable.",
+        "demand_feature_whitelist": DEMAND_FEATURE_WHITELIST,
+        "assumptions": [
+            "Daily stock, stockouts, lost sales and replenishment are a SYNTHETIC causal "
+            "simulation (Naheed keeps no daily stock history). Not real, flagged everywhere.",
+            "Demand forecasting uses REAL units_observed only; synthetic stock never affects "
+            "forecast training/evaluation eligibility.",
+            "Supplier lead time, MOQ, pack size and review period are pilot assumptions.",
+            "Unit cost is validated (>0, finite); invalid costs fall back to category/global "
+            "median and are flagged; cost unit/pack basis requires Naheed confirmation.",
             "Product activation inferred from first ecommerce sale (listing dates unknown).",
-            "planned_promo unavailable: no promo calendar with valid start/end dates.",
+            "planned_promo unavailable: no promo calendar with valid dates.",
             "foodpanda has no rows in this warehouse; only naheed_web is modelled.",
         ],
         "warnings": warnings,
         "validation_status": "passed" if not problems else "failed",
+        "problems": problems,
     }
 
 
 # ── io ─────────────────────────────────────────────────────────────────────────────
 def atomic_write(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     df.to_parquet(tmp, index=False)
     os.replace(tmp, path)
 
 
 def write_json(obj: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(obj, indent=2, default=str), encoding="utf-8")
     os.replace(tmp, path)
@@ -619,10 +734,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Build the daily ecommerce-only pilot dataset.")
     ap.add_argument("--db-path", default=str(DEFAULT_DB))
     ap.add_argument("--output-dir", default=str(DEFAULT_OUT))
+    ap.add_argument("--synthetic-dir", default=str(DEFAULT_SYNTH))
     ap.add_argument("--start-date", default=None)
-    ap.add_argument("--end-date", default=None)
-    ap.add_argument("--as-of-date", default=None, help="last known day; features cover the next 14 days")
-    ap.add_argument("--selection-cutoff", default=None, help="YYYY-MM-DD; only used with --reselect-pilot-skus")
+    ap.add_argument("--as-of-date", default=None, help="HARD boundary; records after this are dropped")
+    ap.add_argument("--selection-cutoff", default=None, help="YYYY-MM-DD; recorded; used with --reselect-pilot-skus")
     ap.add_argument("--reselect-pilot-skus", action="store_true")
     ap.add_argument("--strict", action="store_true")
     return ap.parse_args(list(argv) if argv is not None else None)
@@ -633,7 +748,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args.generated_at = dt.datetime.now().isoformat(timespec="seconds")
     cfg = load_config()
     out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    synth_dir = Path(args.synthetic_dir)
 
     with open_db(Path(args.db_path)) as con:
         if args.reselect_pilot_skus:
@@ -642,17 +757,31 @@ def main(argv: Iterable[str] | None = None) -> int:
             cand = reselect_candidates(con, cfg, args.selection_cutoff)
             cand.to_csv(CANDIDATE_LIST, index=False, encoding="utf-8-sig")
             print(f"Wrote {len(cand)} candidate SKUs -> {CANDIDATE_LIST.name} "
-                  f"(review, then copy to {PILOT_LIST.name}; the approved list was NOT overwritten).")
+                  f"(review, then copy to {PILOT_LIST.name}; approved list NOT overwritten).")
             return 0
 
         pilot, warnings = load_pilot_skus(con, cfg, args.strict)
-        panel, stats = build_model_panel(con, pilot, cfg, args.start_date, args.end_date)
-        as_of = pd.Timestamp(args.as_of_date) if args.as_of_date else stats["window_end"]
-        ff = build_forecast_features(panel, con, pilot, cfg, as_of)
-        inv = build_inventory_context(con, pilot, cfg, as_of, panel)
+        panel, stats = build_model_panel(con, pilot, cfg, args.start_date, args.as_of_date)
+        as_of = stats["as_of"]
 
-    problems = validate_outputs(panel, ff, inv, cfg)
-    manifest = build_manifest(panel, ff, inv, pilot, cfg, args, stats, as_of, warnings, problems)
+        # REAL daily series for the synthetic simulation (never feeds same-day inventory)
+        real_daily = (panel.groupby(["sku", "date"], as_index=False)["units_observed"]
+                           .sum().rename(columns={"units_observed": "units"}))
+        sku_meta = panel[["sku", "product_id", "category", "channel"]].drop_duplicates("sku")
+        cal_full = calendar_features(
+            pd.date_range(panel["date"].min(), as_of, freq="D"), cfg)
+        calibration_end = panel["date"].min() + pd.Timedelta(days=int(cfg["synthetic"]["calibration_days"]))
+        scenarios, events, sim_params = synthetic_inventory.run(
+            real_daily, sku_meta, cal_full, calibration_end, as_of, cfg)
+        sim_params["as_of_date"] = as_of.date().isoformat()
+        sim_params["sku_selection_cutoff"] = args.selection_cutoff
+
+        ff = build_forecast_features(panel, con, pilot, cfg, as_of)
+        inv = build_inventory_context(con, pilot, cfg, as_of, scenarios)
+
+    problems = validate_outputs(panel, ff, inv, scenarios, cfg)
+    manifest = build_manifest(panel, ff, inv, scenarios, events, pilot, cfg, args, stats,
+                              as_of, warnings, problems)
 
     if problems and args.strict:
         print("VALIDATION FAILED:", *problems, sep="\n  ")
@@ -663,15 +792,23 @@ def main(argv: Iterable[str] | None = None) -> int:
     atomic_write(ff, out_dir / "forecast_features.parquet")
     atomic_write(inv, out_dir / "inventory_context.parquet")
     write_json(manifest, out_dir / "pilot_manifest.json")
+    atomic_write(scenarios, synth_dir / "stockout_scenarios.parquet")
+    atomic_write(events if not events.empty else pd.DataFrame(columns=["sku"]),
+                 synth_dir / "replenishment_events.parquet")
+    write_json(sim_params, synth_dir / "simulation_parameters.json")
 
-    print("================ pilot data built (daily, ecommerce-only) ================")
+    print("============= pilot data built (real demand + synthetic inventory) =============")
     print(f"as_of_date          : {as_of.date()}   history {manifest['history_start']}..{manifest['history_end']}")
     print(f"SKUs / channels     : {manifest['sku_count']} / {manifest['ecommerce_channels']}")
-    print(f"model_panel rows    : {manifest['model_panel_row_count']}")
-    print(f"forecast rows       : {manifest['forecast_feature_row_count']} (14 days x SKU x channel)")
-    print(f"inventory rows      : {manifest['inventory_context_row_count']}")
-    print(f"physical excluded   : {manifest['physical_store_rows_excluded']}   unknown channels: {manifest['unknown_channel_rows']}")
-    print(f"zero-sales rate     : {manifest['zero_sales_rate']:.0%}   stock coverage: {manifest['stock_observation_coverage']:.0%}   censored: {manifest['censored_demand_rate']:.0%}")
+    print(f"model_panel rows    : {manifest['real_sales_row_count']} (forecast-eligible {manifest['forecast_eligible_row_count']})")
+    print(f"forecast rows       : {manifest['row_counts']['forecast_features']} (14 days x SKU x channel)")
+    print(f"inventory rows      : {manifest['row_counts']['inventory_context']}")
+    print(f"synthetic scenarios : {manifest['synthetic_scenario_row_count']} rows across {manifest['n_scenarios']} scenarios; {manifest['replenishment_event_count']} orders")
+    print(f"rows dropped > as_of: {manifest['rows_after_as_of_dropped']}")
+    print(f"cost: valid {manifest['cost_valid_count']} / imputed {manifest['cost_imputed_count']} / missing {manifest['cost_missing_count']} / nonpos {manifest['cost_non_positive_count']}")
+    print("stockout rate by scenario:")
+    for scn, d in manifest["stockout_by_scenario"].items():
+        print(f"  {scn:<18} stockout {d['stockout_rate']:.0%}  2d {d['stockout_within_2d_rate']:.0%}  7d {d['stockout_within_7d_rate']:.0%}  lost-days {d['lost_sales_days']}")
     print(f"validation          : {manifest['validation_status']}")
     if warnings:
         print("warnings:", *warnings, sep="\n  ")

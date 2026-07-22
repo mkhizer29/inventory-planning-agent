@@ -1,25 +1,24 @@
 {
-  "schema_version": "2.0-daily-ecommerce",
-  "generated_at": "2026-07-21T07:20:58",
+  "schema_version": "3.0-real-synthetic-split",
+  "generated_at": "2026-07-21T09:41:58",
   "as_of_date": "2026-06-30",
-  "source_database_profile": "sqlite:inventory.db",
+  "sku_selection_cutoff": null,
+  "rows_after_as_of_dropped": 2942,
   "source_warehouse_path": "C:\\Users\\Bilal\\Documents\\Naheed Ai Internship\\Inventory-Planning-Agent\\inventory_etl\\output\\inventory.db",
   "data_frequency": "daily",
-  "stock_source": "synthetic (seeded reorder simulation \u2014 NOT real Naheed data)",
+  "forecast_sales_source": "REAL Naheed e-commerce sales (units_observed, untouched)",
+  "inventory_stockout_source": "SYNTHETIC causal simulation (NOT real historical stock)",
+  "forecast_eligibility_independent_of_synthetic_stock": true,
   "forecast_horizons": [
     7,
     14
   ],
   "history_start": "2026-01-16",
   "history_end": "2026-06-30",
-  "selection_cutoff": null,
   "sku_count": 30,
   "ecommerce_channels": [
     "naheed_web"
   ],
-  "model_panel_row_count": 4956,
-  "forecast_feature_row_count": 420,
-  "inventory_context_row_count": 30,
   "selected_skus": [
     "IC-1055803",
     "IC-1018771",
@@ -56,79 +55,122 @@
     "Health & Beauty": 15,
     "Groceries & Pets": 15
   },
-  "channel_distribution": {
-    "naheed_web": 4956
-  },
   "physical_store_rows_excluded": 498,
   "unknown_channel_rows": {},
+  "real_sales_row_count": 4956,
+  "forecast_eligible_row_count": 4536,
   "zero_sales_rate": 0.2173,
-  "stockout_rate": 0.0071,
-  "censored_demand_rate": 0.0071,
-  "stock_observation_coverage": 1.0,
   "promotion_coverage": 0.0789,
-  "perishability_coverage": 0.0,
-  "assumed_lead_time_count": 30,
-  "assumed_moq_count": 30,
-  "assumed_pack_size_count": 30,
-  "missing_value_counts": {
-    "model_panel_stock_on_hand": 0,
-    "inventory_unit_cost": 0,
-    "inventory_shelf_life_days": 30
-  },
-  "duplicate_key_counts": {
-    "model_panel": 0,
-    "forecast_features": 0,
-    "inventory_context": 0
-  },
-  "configuration_used": {
-    "replenishment": {
-      "default_supplier_lead_time_days": 7,
-      "default_moq": 1,
-      "lead_time_by_picking_mode": {
-        "Drop Shipping": 10,
-        "Drop by Vendor": 10,
-        "Collect from Vendor": 5,
-        "Naheed Super Market": 3
-      },
-      "dropship_modes": [
-        "Drop Shipping",
-        "Drop by Vendor"
-      ]
+  "synthetic_scenario_row_count": 22050,
+  "n_scenarios": 7,
+  "replenishment_event_count": 2720,
+  "stockout_by_scenario": {
+    "baseline": {
+      "rows": 3150,
+      "stockout_rate": 0.0203,
+      "stockout_within_2d_rate": 0.0298,
+      "stockout_within_7d_rate": 0.0749,
+      "lost_sales_days": 51,
+      "lost_sales_units": 1806
     },
-    "pilot": {
-      "frequency": "daily",
-      "forecast_horizons": [
-        7,
-        14
-      ],
-      "forecast_feature_days": 14,
-      "top_n_per_category": 15,
-      "n_categories": 2,
-      "min_history_days": 28,
-      "ecommerce_channel_map": {
-        "online_delivery": "naheed_web",
-        "naheed_web": "naheed_web",
-        "foodpanda": "foodpanda"
-      },
-      "physical_channels": [
-        "store",
-        "storepickup"
-      ],
-      "max_stock_staleness_days": 3,
-      "assume_stock_in_transit_zero": true
+    "demand_spike": {
+      "rows": 3150,
+      "stockout_rate": 0.1902,
+      "stockout_within_2d_rate": 0.2679,
+      "stockout_within_7d_rate": 0.5708,
+      "lost_sales_days": 537,
+      "lost_sales_units": 16274
+    },
+    "high_moq": {
+      "rows": 3150,
+      "stockout_rate": 0.0165,
+      "stockout_within_2d_rate": 0.0232,
+      "stockout_within_7d_rate": 0.0521,
+      "lost_sales_days": 40,
+      "lost_sales_units": 1532
+    },
+    "long_lead_time": {
+      "rows": 3150,
+      "stockout_rate": 0.0803,
+      "stockout_within_2d_rate": 0.0937,
+      "stockout_within_7d_rate": 0.159,
+      "lost_sales_days": 224,
+      "lost_sales_units": 5131
+    },
+    "low_opening_stock": {
+      "rows": 3150,
+      "stockout_rate": 0.0362,
+      "stockout_within_2d_rate": 0.0483,
+      "stockout_within_7d_rate": 0.0784,
+      "lost_sales_days": 102,
+      "lost_sales_units": 1954
+    },
+    "promotion_peak": {
+      "rows": 3150,
+      "stockout_rate": 0.3476,
+      "stockout_within_2d_rate": 0.4492,
+      "stockout_within_7d_rate": 0.7613,
+      "lost_sales_days": 1015,
+      "lost_sales_units": 42038
+    },
+    "supplier_delay": {
+      "rows": 3150,
+      "stockout_rate": 0.1352,
+      "stockout_within_2d_rate": 0.1784,
+      "stockout_within_7d_rate": 0.3797,
+      "lost_sales_days": 387,
+      "lost_sales_units": 7414
     }
   },
+  "simulation_version": "1.0",
+  "simulation_seed": 20260721,
+  "cost_coverage_by_source": {
+    "warehouse_precedence": 29,
+    "category_median_fallback": 1
+  },
+  "cost_valid_count": 29,
+  "cost_invalid_or_missing_count": 1,
+  "cost_imputed_count": 1,
+  "cost_non_positive_count": 1,
+  "cost_missing_count": 0,
+  "cost_above_price_count": 0,
+  "cost_source_conflict_count": 0,
+  "cost_currency": "PKR",
+  "cost_basis": "sellable_sku_unit_unconfirmed",
+  "row_counts": {
+    "model_panel": 4956,
+    "forecast_features": 420,
+    "inventory_context": 30,
+    "stockout_scenarios": 22050,
+    "replenishment_events": 2720
+  },
+  "demand_feature_whitelist": [
+    "units_lag_1",
+    "units_lag_7",
+    "units_lag_14",
+    "units_roll_mean_7",
+    "units_roll_mean_28",
+    "units_roll_std_7",
+    "effective_unit_price",
+    "discount_pct",
+    "on_promo",
+    "is_public_holiday",
+    "is_payday_window",
+    "day_of_week",
+    "is_weekend",
+    "week_of_year",
+    "month"
+  ],
   "assumptions": [
-    "Daily stock_on_hand is SYNTHETIC \u2014 a seeded reorder simulation driven by real sales (Naheed keeps no daily stock history). Flagged stock_is_synthetic=True.",
-    "Supplier lead time is a configured assumption (no supplier data).",
-    "MOQ is a configured assumption (no supplier data).",
-    "Stock-in-transit assumed 0 (no source in warehouse).",
-    "Pack size defaults to 1 (nhd_box_products empty) unless real box data exists.",
-    "Perishability unknown (shelf-life absent) \u2014 not classified as durable.",
+    "Daily stock, stockouts, lost sales and replenishment are a SYNTHETIC causal simulation (Naheed keeps no daily stock history). Not real, flagged everywhere.",
+    "Demand forecasting uses REAL units_observed only; synthetic stock never affects forecast training/evaluation eligibility.",
+    "Supplier lead time, MOQ, pack size and review period are pilot assumptions.",
+    "Unit cost is validated (>0, finite); invalid costs fall back to category/global median and are flagged; cost unit/pack basis requires Naheed confirmation.",
     "Product activation inferred from first ecommerce sale (listing dates unknown).",
-    "planned_promo unavailable: no promo calendar with valid start/end dates.",
+    "planned_promo unavailable: no promo calendar with valid dates.",
     "foodpanda has no rows in this warehouse; only naheed_web is modelled."
   ],
   "warnings": [],
-  "validation_status": "passed"
+  "validation_status": "passed",
+  "problems": []
 }

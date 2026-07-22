@@ -17,22 +17,35 @@ def build_sku_master(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
     prod = raw["products"].copy()
     ops = raw.get("product_ops", pd.DataFrame())
 
-    # --- cost: prefer the Magento `cost` attribute (populated in pg_new_1),
-    #     then staging_margin (deduped), then catalog_product_flat_1 ---
+    # --- cost: precedence magento_eav -> staging_margin -> product_flat.
+    #     Keep each SOURCE column and record cost_source so the pilot can validate
+    #     provenance and detect cross-source conflicts (a cost is valid only if >0). ---
     prod = prod.rename(columns={"cost": "eav_cost"})
     margin_cost = cleanse.resolve_cost(raw.get("cost_rows", pd.DataFrame()),
                                        strategy=cfg["cost"]["strategy"])
     prod = prod.merge(margin_cost, on="product_id", how="left")   # adds unit_cost, cost_row_count
+    prod = prod.rename(columns={"unit_cost": "margin_cost"})
     flat_cost = raw.get("flat_cost", pd.DataFrame())
     if not flat_cost.empty:
         prod = prod.merge(flat_cost.rename(columns={"cost": "flat_cost"}),
                           on="product_id", how="left")
     else:
         prod["flat_cost"] = pd.NA
-    prod["unit_cost"] = (pd.to_numeric(prod["eav_cost"], errors="coerce")
-                         .fillna(pd.to_numeric(prod.get("unit_cost"), errors="coerce"))
-                         .fillna(pd.to_numeric(prod["flat_cost"], errors="coerce")))
-    prod.drop(columns=["eav_cost", "flat_cost", "cost_row_count"], inplace=True, errors="ignore")
+
+    def _valid(col: str) -> pd.Series:
+        s = pd.to_numeric(prod.get(col), errors="coerce")
+        return s.notna() & np.isfinite(s) & (s > 0)
+
+    eav_v, margin_v, flat_v = _valid("eav_cost"), _valid("margin_cost"), _valid("flat_cost")
+    eav = pd.to_numeric(prod["eav_cost"], errors="coerce")
+    margin = pd.to_numeric(prod["margin_cost"], errors="coerce")
+    flat = pd.to_numeric(prod["flat_cost"], errors="coerce")
+    prod["unit_cost"] = np.where(eav_v, eav, np.where(margin_v, margin, np.where(flat_v, flat, np.nan)))
+    prod["cost_source"] = np.where(eav_v, "magento_eav",
+                            np.where(margin_v, "staging_margin",
+                              np.where(flat_v, "product_flat", "missing")))
+    # per-source columns are retained (eav_cost/margin_cost/flat_cost) for pilot conflict checks
+    prod.drop(columns=["cost_row_count"], inplace=True, errors="ignore")
 
     # --- ops enrichment (brand/category/picking_mode) ---
     if not ops.empty:
@@ -79,9 +92,13 @@ def build_sku_master(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
     prod["supplier_id"] = np.nan  # not reliably in DB
 
+    for c in ("eav_cost", "margin_cost", "flat_cost"):
+        if c not in prod.columns:
+            prod[c] = pd.NA
     out = prod.rename(columns={"sku": "sku_id", "name": "sku_name"})[[
         "sku_id", "product_id", "sku_name", "category", "sub_category", "brand",
-        "is_perishable", "shelf_life_days", "unit_cost", "price", "special_price",
+        "is_perishable", "shelf_life_days", "unit_cost", "cost_source",
+        "eav_cost", "margin_cost", "flat_cost", "price", "special_price",
         "moq", "pack_size", "supplier_id", "supplier_lead_time_days",
         "picking_mode", "is_dropship", "status", "visibility", "weight", "barcode",
         "created_at", "updated_at",

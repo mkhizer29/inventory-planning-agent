@@ -47,21 +47,35 @@ The shared inputs are **committed to the repo** as the locked pilot contract, so
 cloning you already have them (in `data/processed/`):
 
 ```
-model_panel.parquet        daily history — one row per sku × channel × date (target: units_observed)
-forecast_features.parquet  the next 14 future days per SKU (leakage-safe: no actuals/discounts)
-inventory_context.parquet  as-of stock + replenishment context (assumptions flagged)
-pilot_manifest.json         validation stats, coverage, and the explicit assumptions block
+data/processed/  (REAL demand — for forecasting)
+  model_panel.parquet        REAL daily sales history — one row per sku × channel × date (target: units_observed)
+  forecast_features.parquet  next 14 future days per SKU (leakage-safe: no actuals/discounts, no cost)
+  inventory_context.parquet  as-of stock + VALIDATED unit cost + replenishment context (assumptions flagged)
+  pilot_manifest.json        validation stats, coverage, cost quality, and the explicit assumptions block
+
+data/synthetic/  (SYNTHETIC inventory — for the stockout-risk pilot only)
+  stockout_scenarios.parquet    causal seeded inventory/stockout trajectories across 7 scenarios
+  replenishment_events.parquet  simulated purchase orders (lead time / MOQ / pack are assumptions)
+  simulation_parameters.json    what is real vs synthetic, the method, seed and assumptions
 ```
 
 - **Frequency is daily; horizons are 7 and 14 days.** Channel is ecommerce-only:
   **`naheed_web`** (physical `store` excluded; `foodpanda` has no data yet).
+- **Demand forecasting uses REAL sales only.** `units_observed` is real Naheed demand;
+  `model_panel.parquet` has **no stock/stockout columns** and **no cost** — use the demand-feature
+  whitelist (lags/rollings/price/discount/promo/calendar). Score rows on `forecast_training_eligible`.
+- **Inventory and stockouts are SYNTHETIC** (a causal simulation; Naheed keeps no daily stock history).
+  They live in `data/synthetic/`, are flagged `is_synthetic`, and **never** affect demand training/eval.
+  Report demand as *"real historical sales backtesting"* and stockouts as *"synthetic simulation-based"*.
 - **You do NOT need database access or the ETL to model.** Load + score via `src/evaluation.py`:
   `load_model_panel()`, then `evaluate(preds, horizon=7 or 14)` where `preds` has
-  **`sku, channel, date, y_pred`** (never pass `y_true`).
+  **`sku, channel, date, y_pred`** (never pass `y_true`). `evaluate()` asserts at runtime that
+  synthetic labels cannot change your scored rows.
 
 > Locked contract — everyone models the same 30 SKUs, days and chronological split.
 > Don't regenerate or edit these on your model branch. Read `pilot_manifest.json` to see
-> which values are real vs assumed (lead time, MOQ, stock-in-transit, perishability are assumptions).
+> which values are real vs assumed (lead time, MOQ, pack size, stock-in-transit, perishability
+> are assumptions; unit-cost currency/basis await Naheed confirmation).
 
 **Only the pipeline owner regenerates them** (when source data changes):
 ```bash

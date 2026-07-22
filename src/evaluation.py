@@ -1,12 +1,19 @@
 """evaluation.py — the SHARED scorecard for the daily, ecommerce-only pilot.
 
-All three models import this so every result is measured identically. It:
-  * loads data/processed/model_panel.parquet and forecast_features.parquet (repo-root paths),
-  * builds a CHRONOLOGICAL backtest holdout for a 7- or 14-day horizon,
-  * keeps the test truth INSIDE the evaluator (models never pass y_true),
-  * validates submitted predictions (keys: sku, channel, date, y_pred; optional bounds),
-  * reports MAE, RMSE, MASE, WAPE, bias — overall, per-SKU and per-channel — plus
-    prediction-interval coverage when lower/upper bounds are supplied.
+Two clearly separated evaluations (never mixed):
+
+  1. DEMAND FORECAST — "Real historical sales backtesting".
+     Scored on REAL `units_observed` with CHRONOLOGICAL train/test windows and
+     `forecast_training_eligible` (real-data quality + sufficient history) ONLY.
+     It does NOT drop rows using any synthetic inventory / stockout label. A runtime
+     assertion proves that flipping every synthetic-labelled column leaves the scored
+     row set byte-identical (see `assert_synthetic_independence`).
+
+  2. STOCKOUT RISK — "Synthetic simulation-based evaluation".
+     Scored on data/synthetic/stockout_scenarios.parquet (labels are SYNTHETIC),
+     with chronological splits per scenario. Never described as real historical stockouts.
+
+All three demand models import `evaluate`; they never pass y_true (truth stays inside).
 
 Do not edit this to fit a model. Import it.
 """
@@ -19,8 +26,16 @@ import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROC = REPO_ROOT / "data" / "processed"
-HORIZONS = (7, 14)                       # the pilot's forecast horizons (days)
+SYNTH = REPO_ROOT / "data" / "synthetic"
+HORIZONS = (7, 14)
 REQUIRED_PRED_COLS = ("sku", "channel", "date", "y_pred")
+
+# columns that, IF ever present in the panel, must never influence demand scoring
+SYNTHETIC_LABEL_COLS = (
+    "stock_is_synthetic", "stockout_label_is_synthetic", "historical_stockout_observed",
+    "is_stockout", "is_available", "demand_censored", "observed_demand_censored",
+    "stock_on_hand", "ending_stock", "lost_sales",
+)
 
 
 # ── loaders (repo-root relative) ────────────────────────────────────────────────
@@ -34,6 +49,12 @@ def load_forecast_features() -> pd.DataFrame:
     df = pd.read_parquet(PROC / "forecast_features.parquet")
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["sku", "channel", "date"]).reset_index(drop=True)
+
+
+def load_stockout_scenarios() -> pd.DataFrame:
+    df = pd.read_parquet(SYNTH / "stockout_scenarios.parquet")
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values(["sku", "scenario_id", "date"]).reset_index(drop=True)
 
 
 # ── point metrics ────────────────────────────────────────────────────────────────
@@ -66,16 +87,15 @@ def mase(y_true, y_pred, y_train) -> float:
     return mae(y_true, y_pred) / denom
 
 
-# ── chronological backtest ─────────────────────────────────────────────────────────
+# ── chronological backtest (demand) ─────────────────────────────────────────────
 def backtest_split(panel: pd.DataFrame, horizon: int) -> tuple[pd.Timestamp, pd.DataFrame, pd.DataFrame]:
-    """Single chronological holdout: last `horizon` days = test, everything before = train."""
+    """Single chronological holdout: last `horizon` days = test, everything before = train.
+    Time-ordered by construction — never a random split."""
     if horizon not in HORIZONS:
         raise ValueError(f"horizon must be one of {HORIZONS}, got {horizon}")
     max_date = panel["date"].max()
     cutoff = max_date - pd.Timedelta(days=horizon)
-    train = panel[panel["date"] <= cutoff]
-    test = panel[panel["date"] > cutoff]
-    return cutoff, train, test
+    return cutoff, panel[panel["date"] <= cutoff], panel[panel["date"] > cutoff]
 
 
 def rolling_origin_cutoffs(panel: pd.DataFrame, horizon: int, n_folds: int = 3) -> list[pd.Timestamp]:
@@ -85,9 +105,39 @@ def rolling_origin_cutoffs(panel: pd.DataFrame, horizon: int, n_folds: int = 3) 
 
 
 def _truth_for(test: pd.DataFrame) -> pd.DataFrame:
-    """Test truth held inside the evaluator. Censored (stockout) days are dropped from scoring."""
-    t = test[~test["demand_censored"].astype(bool)].copy()
+    """Test truth held inside the evaluator. Rows are selected on REAL data quality only
+    (`forecast_training_eligible`) — NEVER on synthetic stock/stockout labels."""
+    eligible = test["forecast_training_eligible"].astype(bool) if "forecast_training_eligible" in test else pd.Series(True, index=test.index)
+    t = test[eligible].copy()
     return t[["sku", "channel", "date", "units_observed"]].rename(columns={"units_observed": "y_true"})
+
+
+def assert_synthetic_independence(panel: pd.DataFrame, horizon: int = 14) -> None:
+    """Prove that changing synthetic stockout labels cannot change the demand-eval rows.
+
+    Flips/corrupts every synthetic-labelled column present, rebuilds the test truth, and
+    asserts the scored (sku, channel, date) key set and y_true are byte-identical.
+    """
+    _, _, test = backtest_split(panel, horizon)
+    base = _truth_for(test).sort_values(["sku", "channel", "date"]).reset_index(drop=True)
+
+    mutated = panel.copy()
+    for c in SYNTHETIC_LABEL_COLS:
+        if c in mutated.columns:
+            col = mutated[c]
+            if col.dtype == bool:
+                mutated[c] = ~col
+            elif np.issubdtype(col.dtype, np.number):
+                mutated[c] = col.fillna(0) + 999
+            else:
+                mutated[c] = "MUTATED"
+    _, _, test2 = backtest_split(mutated, horizon)
+    after = _truth_for(test2).sort_values(["sku", "channel", "date"]).reset_index(drop=True)
+
+    if not base.equals(after):
+        raise AssertionError(
+            "Demand evaluation is NOT independent of synthetic labels — row set changed "
+            "when synthetic columns were mutated. This is leakage and must be fixed.")
 
 
 def _validate_predictions(preds: pd.DataFrame, truth: pd.DataFrame) -> None:
@@ -123,12 +173,13 @@ def _grouped(df: pd.DataFrame, by: str | None) -> dict:
 
 
 def evaluate(preds: pd.DataFrame, horizon: int = 14, panel: pd.DataFrame | None = None) -> dict:
-    """Score a model's predictions against the internal test truth for `horizon`.
+    """Score demand predictions against internal REAL test truth for `horizon`.
 
-    `preds` must have [sku, channel, date, y_pred]; optional [lower_bound, upper_bound].
-    Raises ValueError on any invalid/incomplete submission.
+    "Real historical sales backtesting". `preds` needs [sku, channel, date, y_pred];
+    optional [lower_bound, upper_bound]. Raises ValueError on any invalid submission.
     """
     panel = load_model_panel() if panel is None else panel
+    assert_synthetic_independence(panel, horizon)     # runtime leakage guard
     cutoff, train, test = backtest_split(panel, horizon)
     truth = _truth_for(test)
     _validate_predictions(preds, truth)
@@ -137,7 +188,6 @@ def evaluate(preds: pd.DataFrame, horizon: int = 14, panel: pd.DataFrame | None 
     p["date"] = pd.to_datetime(p["date"])
     df = truth.merge(p, on=["sku", "channel", "date"], how="left")
 
-    # MASE needs each series' training history
     per_sku = {}
     for (sku, ch), g in df.groupby(["sku", "channel"]):
         tr = train[(train.sku == sku) & (train.channel == ch)]["units_observed"]
@@ -147,6 +197,7 @@ def evaluate(preds: pd.DataFrame, horizon: int = 14, panel: pd.DataFrame | None 
     mase_vals = [v["mase"] for v in per_sku.values() if not np.isnan(v["mase"])]
 
     result = {
+        "evaluation_type": "real_historical_sales_backtesting",
         "horizon": horizon,
         "cutoff": cutoff.date().isoformat(),
         "n_test_rows": int(len(df)),
@@ -159,3 +210,26 @@ def evaluate(preds: pd.DataFrame, horizon: int = 14, panel: pd.DataFrame | None 
         inside = (pm["y_true"] >= pm["lower_bound"]) & (pm["y_true"] <= pm["upper_bound"])
         result["interval_coverage"] = round(float(inside.mean()), 4)
     return result
+
+
+# ── synthetic stockout evaluation (kept SEPARATE from demand) ─────────────────────
+def stockout_backtest_split(scenarios: pd.DataFrame, horizon: int = 7
+                            ) -> tuple[pd.Timestamp, pd.DataFrame, pd.DataFrame]:
+    """Chronological split of the SYNTHETIC scenarios (last `horizon` days = test).
+    Never a random split (that would leak near-identical trajectory points across sides)."""
+    max_date = scenarios["date"].max()
+    cutoff = max_date - pd.Timedelta(days=horizon)
+    return cutoff, scenarios[scenarios["date"] <= cutoff], scenarios[scenarios["date"] > cutoff]
+
+
+def stockout_truth(scenarios: pd.DataFrame | None = None, horizon: int = 7,
+                   target: str = "stockout_within_7d") -> pd.DataFrame:
+    """Test truth for the SYNTHETIC stockout task. Simulation-based, NOT real stockouts.
+    Only rows flagged stockout_training_eligible are scored."""
+    sc = load_stockout_scenarios() if scenarios is None else scenarios
+    _, _, test = stockout_backtest_split(sc, horizon)
+    if "stockout_training_eligible" in test:
+        test = test[test["stockout_training_eligible"].astype(bool)]
+    out = test[["sku", "scenario_id", "date", target]].rename(columns={target: "y_true"})
+    out.attrs["evaluation_type"] = "synthetic_simulation_based_evaluation"
+    return out
