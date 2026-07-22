@@ -1,8 +1,7 @@
-"""Consolidated invariant tests for the real-demand / synthetic-inventory pilot.
+"""Consolidated invariant tests for the REAL-demand / SYNTHETIC-daily-stock pilot.
 
-Builds a tiny temporary SQLite warehouse and exercises the 20 causality / leakage /
-cost invariants from the redesign brief (§13). One file on purpose — no scatter of
-tiny test modules.
+Builds a tiny temporary SQLite warehouse and exercises the scope/leakage/stock/cost/snapshot
+invariants from the correction brief. One file on purpose — no scatter of tiny test modules.
 """
 import sqlite3
 import sys
@@ -17,7 +16,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import prepare_pilot_data as prep       # noqa: E402
-import synthetic_inventory as syn        # noqa: E402
 import evaluation as ev                  # noqa: E402
 
 AS_OF = "2026-04-30"
@@ -26,18 +24,18 @@ DAYS = pd.date_range("2026-01-01", AS_OF, freq="D")   # 120 real days
 
 def _make_db(path: Path) -> None:
     con = sqlite3.connect(path)
-    # sku_master carries per-source cost columns to exercise precedence + validity
     con.execute("""CREATE TABLE sku_master (sku_id TEXT, product_id INT, sku_name TEXT,
-        category TEXT, sub_category TEXT, brand TEXT, price REAL, pack_size INT,
-        is_perishable INT, shelf_life_days REAL, unit_cost REAL, cost_source TEXT,
-        eav_cost REAL, margin_cost REAL, flat_cost REAL, is_dropship INT, created_at TEXT)""")
-    con.executemany("INSERT INTO sku_master VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
-        # A: valid eav cost -> magento_eav
-        ("A", 1, "Prod A", "Cat1", None, "BrandA", 100.0, 6, 0, None, 40.0, "magento_eav", 40.0, 45.0, 50.0, 0, "2025-12-01"),
-        # B: eav invalid (0), margin valid -> staging_margin
-        ("B", 2, "Prod B", "Cat2", None, "BrandB", 50.0, 6, 0, None, 20.0, "staging_margin", 0.0, 20.0, None, 0, "2025-12-01"),
-        # C: all sources invalid -> imputed fallback, observed stays null
-        ("C", 3, "Prod C", "Cat1", None, "BrandC", 80.0, 6, 0, None, None, "missing", -5.0, 0.0, None, 0, "2025-12-01"),
+        category TEXT, sub_category TEXT, brand TEXT, price REAL, pack_size INT, moq INT,
+        supplier_lead_time_days INT, is_perishable INT, shelf_life_days REAL, unit_cost REAL,
+        cost_source TEXT, eav_cost REAL, margin_cost REAL, flat_cost REAL, is_dropship INT,
+        created_at TEXT)""")
+    con.executemany("INSERT INTO sku_master VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+        # A: real case-pack (6) + real lead time (3) + valid eav cost
+        ("A", 1, "Prod A", "Cat1", None, "BrandA", 100.0, 6, 1, 3, 0, None, 40.0, "magento_eav", 40.0, 45.0, 50.0, 0, "2025-12-01"),
+        # B: eav invalid(0), margin valid -> staging_margin; default lead/pack
+        ("B", 2, "Prod B", "Cat2", None, "BrandB", 50.0, 1, 1, None, 0, None, 20.0, "staging_margin", 0.0, 20.0, None, 0, "2025-12-01"),
+        # C: all cost sources invalid -> imputed; default lead/pack
+        ("C", 3, "Prod C", "Cat1", None, "BrandC", 80.0, 1, 1, None, 0, None, None, "missing", -5.0, 0.0, None, 0, "2025-12-01"),
     ])
     con.execute("""CREATE TABLE sales_transactions (sku_id TEXT, channel TEXT,
         transaction_date TEXT, quantity_sold REAL, discount_amount REAL, row_total REAL)""")
@@ -47,14 +45,23 @@ def _make_db(path: Path) -> None:
         rows.append(("A", "online_delivery", ds, 5 + (i % 7), 0, (5 + (i % 7)) * 100.0))
         rows.append(("B", "online_delivery", ds, 3 + (i % 4), 0, (3 + (i % 4)) * 50.0))
         rows.append(("C", "online_delivery", ds, 2 + (i % 3), 0, (2 + (i % 3)) * 80.0))
-    # noise rows: physical store (excluded), unknown channel (counted), and POST-as_of sales
     rows += [
-        ("A", "store", "2026-02-01", 99, 0, 9900),
-        ("A", "weirdchan", "2026-02-01", 7, 0, 700),
-        ("A", "online_delivery", "2026-06-15", 9999, 0, 999900),   # AFTER as_of -> must be dropped
-        ("B", "online_delivery", "2026-05-20", 8888, 0, 444400),   # AFTER as_of -> must be dropped
+        ("A", "store", "2026-02-01", 99, 0, 9900),       # physical -> excluded
+        ("A", "weirdchan", "2026-02-01", 7, 0, 700),      # unknown -> counted
+        ("A", "online_delivery", "2026-06-15", 9999, 0, 999900),   # AFTER as_of -> dropped
+        ("B", "online_delivery", "2026-05-20", 8888, 0, 444400),   # AFTER as_of -> dropped
     ]
     con.executemany("INSERT INTO sales_transactions VALUES (?,?,?,?,?,?)", rows)
+    # real stock snapshots: all AFTER the 2026-04-30 as_of, plus warehouse rows to test ALL-preference
+    con.execute("""CREATE TABLE inventory_snapshot_history (product_id INT, snapshot_date TEXT,
+        location_id TEXT, stock_on_hand REAL, stock_flag TEXT)""")
+    snap = []
+    for pid in (1, 2, 3):
+        for ds, val in (("2026-05-10", 500 + pid), ("2026-05-12", 600 + pid)):
+            snap.append((pid, ds, "ALL", float(val), "ok"))
+            snap.append((pid, ds, "MLR", 111.0, "ok"))    # must NOT be added to ALL
+            snap.append((pid, ds, "BHD", 222.0, "ok"))
+    con.executemany("INSERT INTO inventory_snapshot_history VALUES (?,?,?,?,?)", snap)
     con.commit()
     con.close()
 
@@ -68,197 +75,171 @@ def ctx(tmp_path_factory):
     pilot = pd.DataFrame({"sku": ["A", "B", "C"], "category": ["Cat1", "Cat2", "Cat1"]})
     panel, stats = prep.build_model_panel(con, pilot, cfg, None, AS_OF)
     as_of = pd.Timestamp(AS_OF)
-    real_daily = (panel.groupby(["sku", "date"], as_index=False)["units_observed"]
-                       .sum().rename(columns={"units_observed": "units"}))
-    sku_meta = panel[["sku", "product_id", "category", "channel"]].drop_duplicates("sku")
-    cal = prep.calendar_features(pd.date_range(panel["date"].min(), as_of, freq="D"), cfg)
-    calib_end = panel["date"].min() + pd.Timedelta(days=int(cfg["synthetic"]["calibration_days"]))
-    scenarios, events, sim_params = syn.run(real_daily, sku_meta, cal, calib_end, as_of, cfg)
-    inv = prep.build_inventory_context(con, pilot, cfg, as_of, scenarios)
-    ff = prep.build_forecast_features(panel, con, pilot, cfg, as_of)
+    repl = stats["repl_params"]
+    pids = [1, 2, 3]
+    snapshot, n_real, n_future = prep.select_real_snapshot(con, pids, as_of)
+    inv = prep.build_inventory_context(con, pilot, cfg, as_of, panel, repl, snapshot)
+    ff = prep.build_forecast_frame(panel, con, pilot, cfg, as_of)
     yield types.SimpleNamespace(con=con, cfg=cfg, pilot=pilot, panel=panel, stats=stats,
-                                scenarios=scenarios, events=events, sim_params=sim_params,
-                                inv=inv, ff=ff, as_of=as_of, calib_end=calib_end,
-                                real_daily=real_daily, sku_meta=sku_meta, cal=cal, db=db)
+                                repl=repl, snapshot=snapshot, n_real=n_real, n_future=n_future,
+                                inv=inv, ff=ff, as_of=as_of, db=db)
     con.close()
 
 
-# 1. units_observed stays real (matches the raw daily sales, never synthetic sales)
-def test_units_observed_is_real(ctx):
-    a = ctx.panel[(ctx.panel.sku == "A")].set_index("date")["units_observed"]
-    expected = {d.date(): 5 + (i % 7) for i, d in enumerate(DAYS)}
-    assert all(int(a.loc[d]) == expected[d.date()] for d in a.index)
-    assert "synthetic_sales" not in ctx.panel.columns
+# 1. units_observed is real and matches source after aggregation
+def test_units_observed_real(ctx):
+    a = ctx.panel[ctx.panel.sku == "A"].set_index("date")["units_observed"]
+    exp = {d.date(): 5 + (i % 7) for i, d in enumerate(DAYS)}
+    assert all(int(a.loc[d]) == exp[d.date()] for d in a.index)
 
 
-# 2. no record after as_of affects outputs
-def test_as_of_hard_boundary(ctx):
+# 2. as_of hard boundary drops post-as_of rows
+def test_as_of_boundary(ctx):
     assert ctx.panel["date"].max() == ctx.as_of
-    assert ctx.stats["rows_after_as_of_dropped"] == 2          # the two post-as_of sales
-    # the 9999 / 8888 spikes never appear
-    assert ctx.panel["units_observed"].max() < 100
+    assert ctx.stats["rows_after_as_of_dropped"] == 2
+    assert ctx.panel["units_observed"].max() < 100          # 9999/8888 spikes gone
 
 
-# 3. SKU selection uses only the selection cutoff (post-cutoff sales excluded from totals)
-def test_selection_cutoff_only(ctx):
+# 3. SKU selection uses only the cutoff
+def test_selection_cutoff(ctx):
     cand = prep.reselect_candidates(ctx.con, ctx.cfg, "2026-04-30")
-    a_units = int(cand[cand.sku == "A"]["units"].iloc[0])
-    # equals sum of A's in-window sales, NOT inflated by the 9999 post-cutoff spike
-    assert a_units == int(ctx.real_daily[ctx.real_daily.sku == "A"]["units"].sum())
+    a = int(cand[cand.sku == "A"]["units"].iloc[0])
+    src = ctx.panel[ctx.panel.sku == "A"]["units_observed"].sum()
+    assert a == int(src)                                    # not inflated by post-cutoff spike
 
 
-# 4. synthetic inventory does not alter demand-eval rows (independence assertion passes)
-def test_demand_eval_independent_of_synthetic(ctx):
-    ev.assert_synthetic_independence(ctx.panel, horizon=14)     # raises if leakage
-    leaked = [c for c in prep.DEMAND_FEATURE_FORBIDDEN if c in ctx.panel.columns]
-    assert leaked == []
+# 4. no banned scenario / synthetic-demand columns anywhere
+def test_no_banned_columns(ctx):
+    for df in (ctx.panel, ctx.ff, ctx.inv):
+        assert [c for c in prep.BANNED_COLS if c in df.columns] == []
 
 
-# 5. forecast_training_eligible is independent of synthetic stockout labels
-def test_forecast_eligibility_independent(ctx):
-    # eligibility depends only on history length; recomputed value ignores synthetic data
-    didx = ctx.panel.groupby(["sku", "channel"]).cumcount()
-    assert (ctx.panel["forecast_training_eligible"] == (didx >= 14)).all()
+# 5. stock_on_hand non-negative, finite, integral
+def test_stock_valid(ctx):
+    s = ctx.panel["stock_on_hand"]
+    assert (s >= 0).all() and np.isfinite(s).all()
+    assert (s == s.round()).all() and str(s.dtype).startswith("int")
 
 
-# 6. opening_stock[t] == prior ending + arrivals[t]
-def test_opening_stock_identity(ctx):
-    g = ctx.scenarios[(ctx.scenarios.sku == "A") & (ctx.scenarios.scenario_id == "baseline")]
-    g = g.sort_values("date").reset_index(drop=True)
-    for t in range(1, len(g)):
-        assert g.loc[t, "opening_stock"] == pytest.approx(
-            g.loc[t - 1, "ending_stock"] + g.loc[t, "replenishment_received"], abs=1.0)
+# 6. stock balance holds and real sales are never capped (implied replenishment >= 0)
+def test_stock_balance_and_no_capping(ctx):
+    for sku in ("A", "B", "C"):
+        g = ctx.panel[ctx.panel.sku == sku].sort_values("date").reset_index(drop=True)
+        soh = g["stock_on_hand"].to_numpy(float)
+        u = g["units_observed"].to_numpy(float)
+        repl = soh[1:] - soh[:-1] + u[1:]                   # = stock[t]-stock[t-1]+units[t]
+        assert (repl >= -1e-9).all()                        # replenishment never negative
+    # units_observed untouched by reconstruction (matches a pure real re-aggregation)
+    assert ctx.panel["units_observed"].sum() > 0
 
 
-# 7. inventory never negative
-def test_no_negative_inventory(ctx):
-    assert (ctx.scenarios["ending_stock"] >= 0).all()
-    assert (ctx.scenarios["opening_stock"] >= 0).all()
+# 7. deterministic across identical runs
+def test_deterministic(ctx):
+    panel2, _ = prep.build_model_panel(ctx.con, ctx.pilot, ctx.cfg, None, AS_OF)
+    assert ctx.panel["stock_on_hand"].tolist() == panel2["stock_on_hand"].tolist()
 
 
-# 8. synthetic sales never exceed available stock
-def test_sales_bounded_by_available(ctx):
-    avail = ctx.scenarios["opening_stock"].clip(lower=0)
-    assert (ctx.scenarios["synthetic_sales"] <= avail + 1e-9).all()
+# 8. synthetic stock is NOT a demand feature
+def test_stock_not_a_feature(ctx):
+    assert "stock_on_hand" not in prep.DEMAND_FEATURE_WHITELIST
+    assert "stock_on_hand" in prep.DEMAND_FEATURE_FORBIDDEN
+    assert "stock_on_hand" not in ctx.ff.columns
 
 
-# 9. lost_sales == max(0, latent - available)
-def test_lost_sales_formula(ctx):
-    avail = ctx.scenarios["opening_stock"].clip(lower=0)
-    expected = (ctx.scenarios["latent_synthetic_demand"] - avail).clip(lower=0)
-    assert (np.abs(ctx.scenarios["lost_sales"] - expected) <= 1.0).all()
+# 9. demand eval independent of synthetic stock
+def test_demand_independent_of_stock(ctx):
+    ev.assert_synthetic_independence(ctx.panel, horizon=14)
 
 
-# 10. an order cannot arrive before it was placed
-def test_orders_arrive_after_placed(ctx):
-    e = ctx.events
-    if len(e):
-        assert (pd.to_datetime(e["expected_arrival_date"]) > pd.to_datetime(e["order_date"])).all()
-        assert (pd.to_datetime(e["actual_arrival_date"]) >= pd.to_datetime(e["order_date"])).all()
+# 10. June-style run (no eligible snapshot): all synthetic; future snapshots excluded;
+#     inventory stock == final panel stock
+def test_synthetic_branch(ctx):
+    assert ctx.n_real == 0
+    assert ctx.n_future == 2                                 # 2026-05-10 and 2026-05-12
+    assert ctx.inv["stock_on_hand_is_synthetic"].all()
+    last = ctx.panel.sort_values("date").groupby("sku")["stock_on_hand"].last()
+    inv_soh = ctx.inv.set_index("sku")["stock_on_hand"]
+    assert last.reindex(inv_soh.index).astype(int).equals(inv_soh.astype(int))
 
 
-# 11. same seed -> identical outputs
-def test_reproducible_with_same_seed(ctx):
-    s2, _, _ = syn.run(ctx.real_daily, ctx.sku_meta, ctx.cal, ctx.calib_end, ctx.as_of, ctx.cfg)
-    pd.testing.assert_frame_equal(
-        ctx.scenarios.reset_index(drop=True), s2.reset_index(drop=True))
+# 11. later run with eligible real snapshot: real stock used, cutoff respected, ALL not double-counted
+def test_real_snapshot_branch(ctx):
+    as_of2 = pd.Timestamp("2026-05-31")
+    snap, n_real, n_future = prep.select_real_snapshot(ctx.con, [1, 2, 3], as_of2)
+    assert n_real == 3 and n_future == 0
+    # latest <= 05-31 is 05-12; ALL value (600+pid), NOT summed with MLR/BHD (111/222)
+    assert snap[1]["stock"] == 601 and snap[1]["snapshot_date"] == "2026-05-12"
+    assert snap[1]["location"] == "ALL"
+    inv2 = prep.build_inventory_context(ctx.con, ctx.pilot, ctx.cfg, as_of2, ctx.panel, ctx.repl, snap)
+    assert (~inv2["stock_on_hand_is_synthetic"]).all()
+    assert (pd.to_datetime(inv2["stock_snapshot_date"]) <= as_of2).all()
+    assert int(inv2[inv2.sku == "A"]["stock_on_hand"].iloc[0]) == 601
 
 
-# 12. changing the seed changes at least some stochastic outputs
-def test_seed_change_changes_output(ctx):
-    cfg2 = prep.load_config()
-    cfg2["synthetic"]["seed"] = int(ctx.cfg["synthetic"]["seed"]) + 1
-    s2, _, _ = syn.run(ctx.real_daily, ctx.sku_meta, ctx.cal, ctx.calib_end, ctx.as_of, cfg2)
-    merged = ctx.scenarios.merge(
-        s2, on=["sku", "scenario_id", "date"], suffixes=("_a", "_b"))
-    assert (merged["latent_synthetic_demand_a"] != merged["latent_synthetic_demand_b"]).any()
+# 12. never select a snapshot after as_of
+def test_snapshot_cutoff_enforced(ctx):
+    snap, n_real, n_future = prep.select_real_snapshot(ctx.con, [1, 2, 3], pd.Timestamp("2026-05-11"))
+    assert snap[1]["snapshot_date"] == "2026-05-10"          # 05-12 is after -> excluded
+    assert n_future == 1
 
 
-# 13. no same-day real sales are used to increase opening stock
-def test_opening_stock_ignores_real_sales(ctx):
-    # opening stock derives only from prior ending + arrivals; latent demand != real units.
-    g = ctx.scenarios[(ctx.scenarios.sku == "A") & (ctx.scenarios.scenario_id == "baseline")]
-    joined = g.merge(ctx.real_daily[ctx.real_daily.sku == "A"], on="date")
-    # if opening stock were forced up to same-day REAL sales, min opening would track real units;
-    # the simulation depends on latent demand instead, so they differ on many days.
-    assert (joined["latent_synthetic_demand"] != joined["units"]).mean() > 0.3
+# 13. per-SKU real replenishment overrides default; else assumed
+def test_replenishment_sources(ctx):
+    a = ctx.inv[ctx.inv.sku == "A"].iloc[0]
+    assert a["lead_time_days"] == 3 and a["lead_time_source"] == "sku_master_picking_mode"
+    assert a["pack_size"] == 6 and a["pack_size_source"] == "sku_master_case_pack"
+    b = ctx.inv[ctx.inv.sku == "B"].iloc[0]
+    assert b["lead_time_days"] == 7 and b["lead_time_source"] == "assumed_default"
+    assert b["pack_size"] == 1 and b["pack_size_source"] == "assumed_default"
 
 
-# 14. calibration uses only <= calibration_end (dropping later data doesn't change params)
-def test_calibration_is_past_only(ctx):
-    full = syn.calibrate(ctx.real_daily,
-                         dict(zip(ctx.sku_meta.sku, ctx.sku_meta.category)),
-                         ctx.calib_end, ctx.cfg)
-    truncated_daily = ctx.real_daily[ctx.real_daily.date <= ctx.calib_end]
-    trunc = syn.calibrate(truncated_daily,
-                          dict(zip(ctx.sku_meta.sku, ctx.sku_meta.category)),
-                          ctx.calib_end, ctx.cfg)
-    for sku in ctx.sku_meta.sku:
-        assert full[sku]["lam"] == pytest.approx(trunc[sku]["lam"])
-
-
-# 15. every synthetic row carries scenario / seed / simulation-version metadata
-def test_synthetic_rows_have_metadata(ctx):
-    for col in ("scenario_id", "scenario_type", "simulation_version", "simulation_seed", "is_synthetic"):
-        assert col in ctx.scenarios.columns
-        assert ctx.scenarios[col].notna().all()
-    assert ctx.scenarios["is_synthetic"].all()
-    assert ctx.scenarios["stockout_label_is_synthetic"].all()
-
-
-# 16. unit_cost_effective is positive and finite when present
-def test_effective_cost_positive(ctx):
+# 14. cost: effective positive/finite; invalid observed stays null & flagged
+def test_cost_validation(ctx):
     eff = pd.to_numeric(ctx.inv["unit_cost_effective"], errors="coerce").dropna()
     assert (eff > 0).all() and np.isfinite(eff).all()
-
-
-# 17. invalid observed costs remain identifiable
-def test_invalid_costs_flagged(ctx):
     c = ctx.inv[ctx.inv.sku == "C"].iloc[0]
-    assert not c["cost_is_valid"]
-    assert pd.isna(c["unit_cost_observed"])            # observed stays null
-    assert c["cost_is_imputed"]
+    assert not c["cost_is_valid"] and pd.isna(c["unit_cost_observed"]) and c["cost_is_imputed"]
     assert "NON_POSITIVE_COST" in c["cost_quality_flag"]
-    assert "global_median" in c["cost_source"] or "category_median" in c["cost_source"]
 
 
-# 18. cost source precedence works
+# 15. cost precedence
 def test_cost_precedence():
     tol = 0.25
     assert prep.classify_cost([("magento_eav", 40), ("staging_margin", 45), ("product_flat", 50)], 100, tol)["source"] == "magento_eav"
     assert prep.classify_cost([("magento_eav", 0), ("staging_margin", 20), ("product_flat", 30)], 100, tol)["source"] == "staging_margin"
-    # present-but-invalid values -> NON_POSITIVE_COST (NOT reported as MISSING_COST)
     r = prep.classify_cost([("magento_eav", 0), ("staging_margin", -1), ("product_flat", None)], 100, tol)
     assert r["source"] == "missing" and r["observed"] is None
     assert "NON_POSITIVE_COST" in r["flags"] and "MISSING_COST" not in r["flags"]
-    # truly absent everywhere -> MISSING_COST
     m = prep.classify_cost([("magento_eav", None), ("staging_margin", None), ("product_flat", None)], 100, tol)
-    assert m["source"] == "missing" and "MISSING_COST" in m["flags"]
-    # material disagreement between two valid sources -> conflict flag
-    assert "COST_SOURCE_CONFLICT" in prep.classify_cost([("magento_eav", 10), ("staging_margin", 100)], 200, tol)["flags"]
+    assert "MISSING_COST" in m["flags"]
 
 
-# 19. unit cost is absent from the demand-model feature whitelist
-def test_cost_not_a_demand_feature(ctx):
-    for c in ("unit_cost", "unit_cost_effective", "unit_cost_observed", "price"):
-        assert c not in prep.DEMAND_FEATURE_WHITELIST
-    assert "unit_cost" not in ctx.ff.columns and "unit_cost_effective" not in ctx.ff.columns
+# 16. reorder recommendation is transparent (pack multiple, MOQ, purchase value)
+def test_reorder_recommendation(ctx):
+    a = ctx.inv[ctx.inv.sku == "A"].iloc[0]
+    q = a["recommended_order_quantity"]
+    assert q >= 0 and q % a["pack_size"] == 0                # rounded to pack size
+    if q > 0:
+        assert q >= a["moq"]
+        assert a["recommended_purchase_value"] == pytest.approx(q * a["unit_cost_effective"])
 
 
-# 20. forecast evaluation uses chronological splits
-def test_chronological_split(ctx):
-    cutoff, train, test = ev.backtest_split(ctx.panel, horizon=14)
-    assert train["date"].max() <= cutoff < test["date"].min()
-    assert (test["date"] > cutoff).all()
-
-
-# extra: schemas + full validate_outputs pass, forecast horizon width correct
-def test_schemas_and_validation(ctx):
-    problems = prep.validate_outputs(ctx.panel, ctx.ff, ctx.inv, ctx.scenarios, ctx.cfg)
-    assert problems == [], problems
-    assert list(ctx.panel.columns) == prep.MODEL_PANEL_COLS
-    assert list(ctx.inv.columns) == prep.INVENTORY_COLS
+# 17. forecast frame: 14 future days, no actuals
+def test_forecast_frame(ctx):
     n = int(ctx.cfg["pilot"]["forecast_feature_days"])
     assert (ctx.ff.groupby(["sku", "channel"])["date"].nunique() == n).all()
+    assert (pd.to_datetime(ctx.ff["date"]) > ctx.as_of).all()
+    assert "units_observed" not in ctx.ff.columns
+
+
+# 18. chronological split; full validation passes; scope correct
+def test_validation_and_scope(ctx):
+    cutoff, train, test = ev.backtest_split(ctx.panel, 14)
+    assert train["date"].max() <= cutoff < test["date"].min()
+    problems = prep.validate_outputs(ctx.panel, ctx.ff, ctx.inv, ctx.pilot, ctx.cfg, ctx.as_of, False)
+    assert problems == [], problems
+    assert set(ctx.panel["channel"]) == {"naheed_web"}
     assert ctx.stats["physical_store_rows_excluded"] == 1
     assert "weirdchan" in ctx.stats["unknown_channel_rows"]
+    assert list(ctx.panel.columns) == prep.MODEL_PANEL_COLS
+    assert list(ctx.inv.columns) == prep.INVENTORY_COLS

@@ -23,16 +23,17 @@ The pilot moved from **weekly** to **daily**, and to **ecommerce-only**. The wee
 sections below are background; the **binding contract is here**:
 
 - **Inputs** (already generated in `data/processed/`, built by `src/prepare_pilot_data.py`):
-  - `model_panel.parquet` — daily history, one row per `sku × channel × date`; target = **`units_observed`**.
-  - `forecast_features.parquet` — the next **14 future days** per SKU (leakage-safe: no actuals, no realized future discounts).
+  - `model_panel.parquet` — REAL daily demand (one row per `sku × naheed_web × date`; target = **`units_observed`**) plus a reconstructed **synthetic `stock_on_hand`** (inventory context only, never a demand feature).
+  - `forecast_frame.parquet` — the next **14 future days** per SKU (leakage-safe: no actuals, no cost). *(Renamed from `forecast_features.parquet`.)*
 
-> **🔄 v3 update — REAL demand vs SYNTHETIC inventory (supersedes the above where they conflict):**
-> - **Demand forecasting uses REAL sales.** `units_observed` is real Naheed e-commerce demand, never altered — train/backtest on it.
-> - **`model_panel.parquet` is real-only:** no stock/stockout columns. Use only the demand-feature whitelist (`units_lag_1/7/14`, `units_roll_mean_7/28`, `units_roll_std_7`, price/discount/promo, calendar). **Never** use inventory fields or `unit_cost` as a forecast feature.
-> - **Row eligibility = `forecast_training_eligible`** (real-data quality + ≥14 days history). It is **independent of any synthetic stock/stockout label** — `evaluate()` asserts at runtime that flipping synthetic labels cannot change your scored rows.
-> - **Inventory, stockouts, lost sales, replenishment are SYNTHETIC** (causal seeded simulation in `data/synthetic/`; Naheed keeps no daily stock history). They power the stockout-risk pilot only and **never** touch demand training/eval. Do not call them real historical stockouts.
-> - **Report separately:** demand = *"real historical sales backtesting"*; stockout = *"synthetic simulation-based"*.
-> - Lead time / MOQ / pack size / review period are **pilot assumptions** (flagged). Unit cost is validated in `inventory_context.parquet`; currency PKR and cost unit/pack **basis await Naheed confirmation**. Real inventory snapshots can replace the synthetic ones later with **no schema change** (`config synthetic.inventory_context_source: real`).
+> **🔄 v4 update — REAL demand, SYNTHETIC daily stock only (supersedes anything above that conflicts):**
+> - **Demand forecasting uses REAL sales.** `units_observed` is real Naheed naheed_web demand — never altered, capped, or replaced. There is **no synthetic demand, no synthetic sales, no scenarios, no lost sales**.
+> - **Only missing daily `stock_on_hand` is synthetic** — one deterministic per-SKU balance `stock[t] = stock[t-1] + assumed_replenishment[t] − units_observed[t]`, flagged `stock_on_hand_is_synthetic=True`. It is **downstream inventory context, not a demand feature**.
+> - **Feature whitelist:** `units_lag_1/7/14`, `units_roll_mean_7/28`, `units_roll_std_7`, price/discount/promo, calendar. **Never** use `stock_on_hand` or `unit_cost` as a demand feature.
+> - **Row eligibility = `forecast_training_eligible`** (real-data quality + ≥14 days history) — independent of synthetic stock; `evaluate()` asserts this at runtime.
+> - Lead time / MOQ / pack size are **pilot assumptions** (real per-SKU values override defaults). Unit cost is validated in `inventory_context.parquet`; currency PKR and cost unit/pack **basis await Naheed confirmation**.
+> - **Three separate stages** (see TEAMMATE_SETUP → "Model architecture"): **A** real demand forecast → **B** forecast-driven stockout risk → **C** reorder recommendation. B and C use synthetic stock, so they are **pilot estimates, not validated against real Naheed stockouts**.
+> - **Removed:** the old `data/synthetic/` scenario outputs (stockout_scenarios / replenishment_events / simulation_parameters) — do not read them.
 - **Channel**: ecommerce only → **`naheed_web`** (physical `store` excluded; `foodpanda` has no data yet, column kept).
 - **Horizons**: forecast **7 and 14 daily** steps. Splits are **chronological** — `TEST_WEEKS` is gone.
 - **Scoring** (you own `src/evaluation.py`, now v2): `from evaluation import evaluate` → `evaluate(preds, horizon=7)` / `evaluate(preds, horizon=14)`.

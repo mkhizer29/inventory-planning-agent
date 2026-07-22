@@ -115,32 +115,21 @@ pilot:
   # zero assumption (clearly flagged); if false, leave it null/unknown.
   assume_stock_in_transit_zero: true
 
-# ---- Synthetic inventory & stockout SIMULATION (pilot only) -------------------------
-# Naheed keeps NO real daily stock history and NO historical stockout labels, so
-# inventory/stockouts are a CAUSAL, seeded simulation that runs on a SEPARATE latent
-# demand series (real units_observed are never touched). Everything here is flagged
-# synthetic and lives in data/synthetic/. Replace with real snapshots later by setting
-# inventory_context_source: real (schema stays the same).
-synthetic:
-  simulation_version: "1.0"
-  seed: 20260721
-  calibration_days: 60          # length of the pre-simulation window used to estimate demand params
-  min_calibration_days: 14      # below this -> category, then global fallback (recorded)
-  negbin_dispersion: 0.6        # default overdispersion when variance <= mean (Poisson-like)
-  holiday_demand_mult: 1.15     # known-in-advance calendar uplift (applied to latent demand)
-  payday_demand_mult: 1.10
-  weekday_effects: true         # multiply latent demand by calibrated weekday shape
-  warmup_days: 7                # first N simulated days per scenario are training-ineligible (init artefacts)
-  service_level_z: 1.65         # ~95% service level for safety stock
-  stockout_target_horizons: [2, 7]
-  primary_scenario: baseline    # scenario used for the inventory_context "current" snapshot
-  inventory_context_source: synthetic   # 'synthetic' | 'real' (swap for real snapshots later)
-  # Exogenous scenarios — outcomes differ ONLY through these parameters (labels are never forced).
-  scenarios:
-    - {id: baseline,           type: baseline,           demand_multiplier: 1.0, initial_coverage_days: 14, lead_time_days: 7,  supplier_delay_days: 0, review_period_days: 7, moq: 12,  pack_size: 6}
-    - {id: low_opening_stock,  type: low_opening_stock,  demand_multiplier: 1.0, initial_coverage_days: 4,  lead_time_days: 7,  supplier_delay_days: 0, review_period_days: 7, moq: 12,  pack_size: 6}
-    - {id: demand_spike,       type: demand_spike,       demand_multiplier: 1.8, initial_coverage_days: 14, lead_time_days: 7,  supplier_delay_days: 0, review_period_days: 7, moq: 12,  pack_size: 6}
-    - {id: supplier_delay,     type: supplier_delay,     demand_multiplier: 1.0, initial_coverage_days: 14, lead_time_days: 7,  supplier_delay_days: 5, review_period_days: 7, moq: 12,  pack_size: 6}
-    - {id: long_lead_time,     type: long_lead_time,     demand_multiplier: 1.0, initial_coverage_days: 14, lead_time_days: 21, supplier_delay_days: 0, review_period_days: 7, moq: 12,  pack_size: 6}
-    - {id: high_moq,           type: high_moq,           demand_multiplier: 1.0, initial_coverage_days: 14, lead_time_days: 7,  supplier_delay_days: 0, review_period_days: 7, moq: 120, pack_size: 24}
-    - {id: promotion_peak,     type: promotion_peak,     demand_multiplier: 2.2, initial_coverage_days: 10, lead_time_days: 7,  supplier_delay_days: 2, review_period_days: 7, moq: 12,  pack_size: 6}
+# ---- Synthetic daily stock reconstruction (pilot only) ------------------------------
+# Naheed keeps NO reliable moving daily stock history, so where real daily stock_on_hand
+# is unavailable it is reconstructed with ONE simple, deterministic per-SKU balance:
+#   stock_on_hand[t] = stock_on_hand[t-1] + assumed_replenishment[t] - REAL units_observed[t]
+# Real sales are NEVER modified or capped. There is NO synthetic demand, NO scenarios and
+# NO exported purchase orders. Assumed replenishment is internal only, to keep the balance
+# plausible (SKUs shouldn't sit permanently at zero). Real supplier lead time / MOQ / pack
+# override the defaults per SKU when available (see sku_master). The what-if simulator with
+# multiple scenarios is a LATER phase and is intentionally not part of prepare_pilot_data.py.
+synthetic_stock:
+  method: deterministic_reconstruction
+  version: "2.0"
+  initial_cover_days: 14        # assumed opening stock = round(avg daily sales * this)
+  target_cover_days: 14         # order-up-to level, in days of cover
+  safety_days: 3                # simple safety buffer, in days of cover (no supplier data)
+  default_lead_time_days: 7     # used when a SKU has no real lead time
+  default_moq: 1                # minimum order quantity when a SKU has no real MOQ
+  default_pack_size: 1          # rounding multiple when a SKU has no real pack size
