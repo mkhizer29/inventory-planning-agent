@@ -1,6 +1,6 @@
 {
   "schema_version": "4.0-real-demand-synthetic-stock",
-  "generated_at": "2026-07-22T00:48:39",
+  "generated_at": "2026-07-22T23:43:13",
   "as_of_date": "2026-06-30",
   "historical_window": [
     "2026-01-16",
@@ -109,7 +109,10 @@
     "day_of_week",
     "is_weekend",
     "week_of_year",
-    "month"
+    "month",
+    "is_ramadan",
+    "ramadan_day",
+    "ramadan_week"
   ],
   "demand_feature_excluded": [
     "stock_on_hand",
@@ -117,6 +120,29 @@
     "unit_cost_observed",
     "unit_cost_effective"
   ],
+  "ramadan_periods_configured": [
+    {
+      "year": 2026,
+      "location": "Karachi",
+      "start_date": "2026-02-19",
+      "end_date": "2026-03-20"
+    }
+  ],
+  "extra_public_holidays_configured": [
+    {
+      "date": "2026-03-21",
+      "name": "Eid al-Fitr"
+    },
+    {
+      "date": "2026-03-22",
+      "name": "Eid al-Fitr Holiday"
+    },
+    {
+      "date": "2026-03-23",
+      "name": "Eid al-Fitr Holiday"
+    }
+  ],
+  "ramadan_signal_note": "Ramazan dates are configured known-in-advance Karachi calendar signals (manually configured business inputs, NOT auto-verified by an external calendar service). The current pilot contains only one Ramazan period (2026), so any learned Ramazan effect is exploratory.",
   "output_paths": {
     "model_panel": "data/processed/model_panel.parquet",
     "forecast_frame": "data/processed/forecast_frame.parquet",

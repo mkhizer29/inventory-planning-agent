@@ -84,6 +84,21 @@ external_signals:
   # Pakistan payday window: last 2 and first 3 days of each month.
   payday_days_month_start: [1, 2, 3]
   payday_days_month_end: [30, 31]
+  # Ramazan (Ramadan) periods — known-in-advance calendar signal, configured per year so new
+  # years can be added WITHOUT touching the Python. Dates are inclusive [start_date, end_date].
+  # These are manually configured business/calendar inputs (NOT auto-verified by any service).
+  ramadan_periods:
+    - year: 2026
+      location: Karachi
+      start_date: "2026-02-19"   # 1st Ramadan (first fast)
+      end_date: "2026-03-20"     # 30th Ramadan (last fast); Eid al-Fitr starts 2026-03-21 (outside)
+  # Manually configured public holidays (known-in-advance), MERGED with the PK holiday library;
+  # config entries win on a date conflict. Use for locally-observed dates the library may miss or
+  # date differently (Eid follows the lunar calendar). NOT auto-verified by any external service.
+  extra_public_holidays:
+    - {date: "2026-03-21", name: "Eid al-Fitr"}
+    - {date: "2026-03-22", name: "Eid al-Fitr Holiday"}
+    - {date: "2026-03-23", name: "Eid al-Fitr Holiday"}
   # Weather is a documented follow-up (needs an API key); left disabled here.
   weather_enabled: false
 

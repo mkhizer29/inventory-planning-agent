@@ -30,7 +30,7 @@ sections below are background; the **binding contract is here**:
 > **🔄 v4 update — REAL demand, SYNTHETIC daily stock only (supersedes anything above that conflicts):**
 > - **Demand forecasting uses REAL sales.** `units_observed` is real Naheed naheed_web demand — never altered, capped, or replaced. There is **no synthetic demand, no synthetic sales, no scenarios, no lost sales**.
 > - **Only missing daily `stock_on_hand` is synthetic** — one deterministic per-SKU balance `stock[t] = stock[t-1] + assumed_replenishment[t] − units_observed[t]`, flagged `stock_on_hand_is_synthetic=True`. It is **downstream inventory context, not a demand feature**.
-> - **Feature whitelist:** `units_lag_1/7/14`, `units_roll_mean_7/28`, `units_roll_std_7`, price/discount/promo, calendar. **Never** feed `stock_on_hand` or `unit_cost` to the model — this matters most for LightGBM, which will greedily use any column you hand it.
+> - **Feature whitelist:** `units_lag_1/7/14`, `units_roll_mean_7/28`, `units_roll_std_7`, price/discount/promo, calendar (incl. Ramazan: `is_ramadan`/`ramadan_day`/`ramadan_week`). **Never** feed `stock_on_hand` or `unit_cost` to the model — this matters most for LightGBM, which will greedily use any column you hand it.
 > - **Row eligibility = `forecast_training_eligible`** (real-data quality + ≥14 days history) — independent of synthetic stock; `evaluate()` asserts this at runtime.
 > - Lead time / MOQ / pack size are **pilot assumptions** (real per-SKU values override defaults). Unit cost is validated in `inventory_context.parquet`; currency PKR and cost unit/pack **basis await Naheed confirmation**.
 > - **Three separate stages** (see TEAMMATE_SETUP → "Model architecture"): **A** real demand forecast → **B** forecast-driven stockout risk → **C** reorder recommendation. B and C use synthetic stock, so they are **pilot estimates, not validated against real Naheed stockouts**.
@@ -44,7 +44,11 @@ sections below are background; the **binding contract is here**:
 
 **Your model (global LightGBM, daily).** Leakage-safe daily features:
 `lag_1, lag_2, lag_3, lag_7, lag_14, lag_28, rolling_mean_7, rolling_mean_14, rolling_std_7,
-day_of_week, is_public_holiday, is_payday_window, on_promo (historical), price, category, brand, channel`.
+day_of_week, is_public_holiday, is_payday_window, is_ramadan, ramadan_day, ramadan_week,
+on_promo (historical), price, category, brand, channel`.
+(`is_ramadan` / `ramadan_day` / `ramadan_week` are known-in-advance Karachi calendar signals,
+configured in `config.external_signals.ramadan_periods`; only the 2026 period exists so far, so
+any Ramazan effect is exploratory.)
 Train only on rows with `date <= cutoff`. For **future** rows use only what's in
 `forecast_frame.parquet` — planned/calendar signals — **never** realized future discounts
 (`planned_promo` is currently `unavailable`, so treat promo as off for the future window).

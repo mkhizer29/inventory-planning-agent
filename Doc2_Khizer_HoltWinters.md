@@ -28,7 +28,7 @@ sections below are background; the **binding contract is here**:
 > **🔄 v4 update — REAL demand, SYNTHETIC daily stock only (supersedes anything above that conflicts):**
 > - **Demand forecasting uses REAL sales.** `units_observed` is real Naheed naheed_web demand — never altered, capped, or replaced. There is **no synthetic demand, no synthetic sales, no scenarios, no lost sales**.
 > - **Only missing daily `stock_on_hand` is synthetic** — one deterministic per-SKU balance `stock[t] = stock[t-1] + assumed_replenishment[t] − units_observed[t]`, flagged `stock_on_hand_is_synthetic=True`. It is **downstream inventory context, not a demand feature**.
-> - **Feature whitelist:** `units_lag_1/7/14`, `units_roll_mean_7/28`, `units_roll_std_7`, price/discount/promo, calendar. **Never** use `stock_on_hand` or `unit_cost` as a demand feature.
+> - **Feature whitelist:** `units_lag_1/7/14`, `units_roll_mean_7/28`, `units_roll_std_7`, price/discount/promo, calendar (incl. Ramazan: `is_ramadan`/`ramadan_day`/`ramadan_week`). **Never** use `stock_on_hand` or `unit_cost` as a demand feature.
 > - **Row eligibility = `forecast_training_eligible`** (real-data quality + ≥14 days history) — independent of synthetic stock; `evaluate()` asserts this at runtime.
 > - Lead time / MOQ / pack size are **pilot assumptions** (real per-SKU values override defaults). Unit cost is validated in `inventory_context.parquet`; currency PKR and cost unit/pack **basis await Naheed confirmation**.
 > - **Three separate stages** (see TEAMMATE_SETUP → "Model architecture"): **A** real demand forecast → **B** forecast-driven stockout risk → **C** reorder recommendation. B and C use synthetic stock, so they are **pilot estimates, not validated against real Naheed stockouts**.

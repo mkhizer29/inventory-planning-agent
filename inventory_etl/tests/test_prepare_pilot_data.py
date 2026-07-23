@@ -3,6 +3,7 @@
 Builds a tiny temporary SQLite warehouse and exercises the scope/leakage/stock/cost/snapshot
 invariants from the correction brief. One file on purpose — no scatter of tiny test modules.
 """
+import copy
 import sqlite3
 import sys
 import types
@@ -287,3 +288,86 @@ def test_price_not_inflated_by_cancellation(tmp_path):
     disc = panel[panel.date == "2026-03-12"].iloc[0]        # the discount day
     assert disc["effective_unit_price"] == pytest.approx(450.0)   # list price
     assert disc["net_price_paid"] == pytest.approx(405.0)         # (4500-450)/10
+
+
+# 21. Ramazan calendar features (config-driven, known-in-advance, inclusive boundaries)
+def test_ramadan_calendar_features():
+    cfg = prep.load_config()
+    dates = pd.DatetimeIndex(["2026-02-18", "2026-02-19", "2026-02-25", "2026-02-26",
+                              "2026-03-18", "2026-03-19", "2026-03-20", "2026-03-21"])
+    cal = prep.calendar_features(dates, cfg).set_index("date")
+    # config end_date = 2026-03-20 (30th fast) so 03-19 (day 29) and 03-20 (day 30) are IN Ramazan;
+    # 03-21 (Eid al-Fitr) is out.
+    expected = {
+        "2026-02-18": (0, 0, 0),
+        "2026-02-19": (1, 1, 1),
+        "2026-02-25": (1, 7, 1),
+        "2026-02-26": (1, 8, 2),
+        "2026-03-18": (1, 28, 4),
+        "2026-03-19": (1, 29, 5),
+        "2026-03-20": (1, 30, 5),
+        "2026-03-21": (0, 0, 0),
+    }
+    for d, (ir, rd, rw) in expected.items():
+        row = cal.loc[pd.Timestamp(d)]
+        assert (int(row["is_ramadan"]), int(row["ramadan_day"]), int(row["ramadan_week"])) == (ir, rd, rw), d
+    for c in ("is_ramadan", "ramadan_day", "ramadan_week"):
+        assert cal[c].notna().all() and cal[c].dtype.kind in "iu"     # integer, no nulls
+    out = cal[cal["is_ramadan"] == 0]
+    assert (out["ramadan_day"] == 0).all() and (out["ramadan_week"] == 0).all()
+
+
+# 22. Ramazan fields are in every schema + whitelist; stock/cost never whitelisted
+def test_ramadan_in_schemas(ctx):
+    for f in ("is_ramadan", "ramadan_day", "ramadan_week"):
+        assert f in prep.MODEL_PANEL_COLS
+        assert f in prep.FORECAST_FRAME_COLS
+        assert f in prep.DEMAND_FEATURE_WHITELIST
+        assert f in ctx.panel.columns and f in ctx.ff.columns
+        for df in (ctx.panel, ctx.ff):
+            assert df[f].notna().all() and df[f].dtype.kind in "iu"
+    assert set(ctx.panel["is_ramadan"].unique()) == {0, 1}    # panel spans Ramazan 2026
+    for bad in ("stock_on_hand", "unit_cost", "unit_cost_effective", "unit_cost_observed"):
+        assert bad not in prep.DEMAND_FEATURE_WHITELIST
+
+
+# 23. an invalid configured period (end_date < start_date) raises a clear error
+def test_invalid_ramadan_period_raises():
+    cfg = copy.deepcopy(prep.load_config())
+    cfg["external_signals"]["ramadan_periods"] = [
+        {"year": 2027, "location": "Karachi", "start_date": "2027-03-01", "end_date": "2027-02-01"}]
+    with pytest.raises(ValueError):
+        prep.calendar_features(pd.date_range("2027-01-01", "2027-04-01", freq="D"), cfg)
+
+
+# 24. existing calendar features remain intact alongside the new Ramazan ones
+def test_existing_calendar_unchanged():
+    cfg = prep.load_config()
+    cal = prep.calendar_features(pd.DatetimeIndex(["2026-02-19"]), cfg).iloc[0]
+    for c in ("is_public_holiday", "holiday_name", "is_payday_window", "day_of_week",
+              "is_weekend", "week_of_year", "month"):
+        assert c in cal.index
+    assert int(cal["day_of_week"]) == 3       # 2026-02-19 is a Thursday (Mon=0)
+    assert int(cal["is_weekend"]) == 0
+    assert int(cal["month"]) == 2
+
+
+# 25. Eid al-Fitr holidays (21-23 Mar 2026) come from configured extra_public_holidays
+def test_eid_public_holidays():
+    cfg = prep.load_config()
+    dates = pd.DatetimeIndex(["2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23"])
+    cal = prep.calendar_features(dates, cfg).set_index("date")
+    for d in ("2026-03-21", "2026-03-22", "2026-03-23"):
+        row = cal.loc[pd.Timestamp(d)]
+        assert int(row["is_public_holiday"]) == 1
+        assert "Eid" in str(row["holiday_name"])
+        assert int(row["is_ramadan"]) == 0        # Eid is after Ramazan (day 30 was 03-20)
+    assert int(cal.loc[pd.Timestamp("2026-03-20")]["is_ramadan"]) == 1   # last fast still Ramazan
+
+
+# 26. an invalid extra_public_holidays entry raises a clear error
+def test_invalid_extra_holiday_raises():
+    cfg = copy.deepcopy(prep.load_config())
+    cfg["external_signals"]["extra_public_holidays"] = [{"name": "no date key"}]
+    with pytest.raises(ValueError):
+        prep.calendar_features(pd.date_range("2026-03-01", "2026-03-31", freq="D"), cfg)

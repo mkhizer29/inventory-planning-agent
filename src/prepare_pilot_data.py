@@ -61,6 +61,7 @@ MODEL_PANEL_COLS = [
     "units_observed", "effective_unit_price", "net_price_paid", "discount_amount", "discount_pct",
     "on_promo", "promo_known_in_advance", "is_public_holiday", "holiday_name",
     "is_payday_window", "day_of_week", "is_weekend", "week_of_year", "month",
+    "is_ramadan", "ramadan_day", "ramadan_week",
     "units_lag_1", "units_lag_7", "units_lag_14",
     "units_roll_mean_7", "units_roll_mean_28", "units_roll_std_7",
     "stock_on_hand", "stock_on_hand_is_synthetic", "stock_source", "stock_generation_version",
@@ -73,6 +74,7 @@ DEMAND_FEATURE_WHITELIST = [
     "effective_unit_price", "discount_pct", "on_promo",
     "is_public_holiday", "is_payday_window", "day_of_week", "is_weekend",
     "week_of_year", "month",
+    "is_ramadan", "ramadan_day", "ramadan_week",
 ]
 # Columns that must NEVER be a demand feature (and the synthetic-demand fields that must not exist).
 DEMAND_FEATURE_FORBIDDEN = [
@@ -88,7 +90,8 @@ FORECAST_FRAME_COLS = [
     "sub_category", "brand", "latest_known_price", "trailing_units_mean_7",
     "trailing_units_mean_28", "planned_promo", "planned_discount_pct",
     "is_public_holiday", "holiday_name", "is_payday_window", "day_of_week",
-    "is_weekend", "week_of_year", "month", "feature_availability_flag",
+    "is_weekend", "week_of_year", "month", "is_ramadan", "ramadan_day", "ramadan_week",
+    "feature_availability_flag",
 ]
 INVENTORY_COLS = [
     "as_of_date", "sku", "product_id", "location_id",
@@ -142,7 +145,8 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
 
 # ── calendar (known in advance → safe as future features) ───────────────────────
 def calendar_features(dates: pd.DatetimeIndex, cfg: dict) -> pd.DataFrame:
-    """Holiday/payday/day-of-week features for any date range, computed deterministically."""
+    """Holiday/payday/day-of-week + Ramazan features for any date range, computed
+    deterministically. All values are known in advance, so they are safe future features."""
     es = cfg["external_signals"]
     starts = set(es.get("payday_days_month_start", []))
     ends = set(es.get("payday_days_month_end", []))
@@ -151,6 +155,14 @@ def calendar_features(dates: pd.DatetimeIndex, cfg: dict) -> pd.DataFrame:
     if _holidays is not None and len(dates):
         yrs = range(dates.min().year, dates.max().year + 1)
         hol = dict(_holidays.country_holidays(country, years=yrs))
+    # Manually configured public holidays (config wins on a date conflict) — for locally-observed
+    # dates the library may miss or date differently, e.g. Eid al-Fitr (lunar calendar).
+    for h in (es.get("extra_public_holidays") or []):
+        try:
+            hd = pd.Timestamp(h["date"]).date()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid extra_public_holidays entry {h!r}: {exc}")
+        hol[hd] = h.get("name", "Public Holiday")
 
     def is_payday(d: dt.date) -> bool:
         last = (dt.date(d.year + d.month // 12, d.month % 12 + 1, 1) - dt.timedelta(days=1)).day
@@ -165,6 +177,34 @@ def calendar_features(dates: pd.DatetimeIndex, cfg: dict) -> pd.DataFrame:
     df["is_weekend"] = (df["date"].dt.weekday >= 5).astype(int)
     df["week_of_year"] = df["date"].dt.isocalendar().week.astype(int)
     df["month"] = df["date"].dt.month
+
+    # ── Ramazan (configured, known-in-advance; supports multiple years) ──────────────
+    # is_ramadan: 1 on [start_date, end_date] inclusive, else 0.
+    # ramadan_day: 1-based day count since start_date within the period, else 0.
+    # ramadan_week: ((ramadan_day - 1) // 7) + 1 within the period, else 0.
+    df["is_ramadan"] = 0
+    df["ramadan_day"] = 0
+    df["ramadan_week"] = 0
+    for period in (es.get("ramadan_periods") or []):
+        try:
+            p_start = pd.Timestamp(period["start_date"])
+            p_end = pd.Timestamp(period["end_date"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid ramadan_periods entry {period!r}: {exc}")
+        if p_end < p_start:
+            raise ValueError(
+                f"Invalid Ramazan period: end_date {period.get('end_date')!r} is earlier than "
+                f"start_date {period.get('start_date')!r}")
+        mask = (df["date"] >= p_start) & (df["date"] <= p_end)
+        if not mask.any():
+            continue
+        day = ((df["date"] - p_start).dt.days + 1)          # 1-based within the period
+        df.loc[mask, "is_ramadan"] = 1
+        df.loc[mask, "ramadan_day"] = day[mask].astype(int)
+        df.loc[mask, "ramadan_week"] = (((day[mask] - 1) // 7) + 1).astype(int)
+    df["is_ramadan"] = df["is_ramadan"].astype(int)
+    df["ramadan_day"] = df["ramadan_day"].astype(int)
+    df["ramadan_week"] = df["ramadan_week"].astype(int)
     return df
 
 
@@ -801,6 +841,13 @@ def build_manifest(panel, ff, inv, pilot, cfg, args, stats, as_of,
         "cost_above_price_count": int(inv["cost_quality_flag"].str.contains("COST_ABOVE_PRICE").sum()),
         "demand_feature_whitelist": DEMAND_FEATURE_WHITELIST,
         "demand_feature_excluded": DEMAND_FEATURE_FORBIDDEN,
+        "ramadan_periods_configured": cfg["external_signals"].get("ramadan_periods", []),
+        "extra_public_holidays_configured": cfg["external_signals"].get("extra_public_holidays", []),
+        "ramadan_signal_note": (
+            "Ramazan dates are configured known-in-advance Karachi calendar signals "
+            "(manually configured business inputs, NOT auto-verified by an external calendar "
+            "service). The current pilot contains only one Ramazan period (2026), so any learned "
+            "Ramazan effect is exploratory."),
         "output_paths": {
             "model_panel": "data/processed/model_panel.parquet",
             "forecast_frame": "data/processed/forecast_frame.parquet",
