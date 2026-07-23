@@ -58,7 +58,7 @@ CANDIDATE_LIST = REPO_ROOT / "pilot_skus_candidate.csv"
 
 MODEL_PANEL_COLS = [
     "sku", "product_id", "channel", "date", "category", "sub_category", "brand",
-    "units_observed", "effective_unit_price", "discount_amount", "discount_pct",
+    "units_observed", "effective_unit_price", "net_price_paid", "discount_amount", "discount_pct",
     "on_promo", "promo_known_in_advance", "is_public_holiday", "holiday_name",
     "is_payday_window", "day_of_week", "is_weekend", "week_of_year", "month",
     "units_lag_1", "units_lag_7", "units_lag_14",
@@ -335,7 +335,7 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
         f"FROM sku_master WHERE sku_id IN ({ph})", con, params=skus)
 
     raw = pd.read_sql(
-        f"SELECT sku_id AS sku, channel, transaction_date, quantity_sold, "
+        f"SELECT sku_id AS sku, channel, transaction_date, quantity_sold, qty_ordered, "
         f"       discount_amount, row_total FROM sales_transactions WHERE sku_id IN ({ph})",
         con, params=skus)
     raw["date"] = pd.to_datetime(raw["transaction_date"])
@@ -351,6 +351,7 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
 
     agg = (ecom.groupby(["sku", "channel", "date"])
                .agg(units_observed=("quantity_sold", "sum"),
+                    ordered_qty=("qty_ordered", "sum"),
                     discount_amount=("discount_amount", "sum"),
                     net_rev=("row_total", "sum"))
                .reset_index())
@@ -364,16 +365,25 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
     panel = pd.concat(frames, ignore_index=True).merge(agg, on=["sku", "channel", "date"], how="left")
 
     panel["units_observed"] = panel["units_observed"].fillna(0).astype(int)   # genuine in-window zeros
+    panel["ordered_qty"] = panel["ordered_qty"].fillna(0.0)
     panel["discount_amount"] = panel["discount_amount"].fillna(0.0)
     panel["net_rev"] = panel["net_rev"].fillna(0.0)
     panel["product_active"] = True
     panel = panel.sort_values(["sku", "channel", "date"]).reset_index(drop=True)
 
+    # Per-unit price on the ORDERED-quantity basis. row_total is the gross line total
+    # (unit_price * qty_ordered, before discount), so divide by qty_ordered — NOT by
+    # units_observed (which nets out cancellations/refunds and previously inflated the price
+    # up to ~50x when an order was mostly cancelled). effective_unit_price = list/selling price;
+    # net_price_paid = after-discount price actually paid. Both carried forward on no-sale days.
+    ordered = panel["ordered_qty"].replace(0, np.nan)
     with np.errstate(divide="ignore", invalid="ignore"):
-        eff = np.where(panel["units_observed"] > 0,
-                       panel["net_rev"] / panel["units_observed"].replace(0, np.nan), np.nan)
-    panel["effective_unit_price"] = eff
+        list_price = panel["net_rev"] / ordered
+        net_paid = (panel["net_rev"] - panel["discount_amount"]) / ordered
+    panel["effective_unit_price"] = list_price
     panel["effective_unit_price"] = panel.groupby(["sku", "channel"])["effective_unit_price"].ffill()
+    panel["net_price_paid"] = net_paid
+    panel["net_price_paid"] = panel.groupby(["sku", "channel"])["net_price_paid"].ffill()
     gross = panel["net_rev"] + panel["discount_amount"]
     panel["discount_pct"] = np.where(gross > 0, panel["discount_amount"] / gross, 0.0)
     panel["on_promo"] = (panel["discount_amount"] > 0).astype(int)

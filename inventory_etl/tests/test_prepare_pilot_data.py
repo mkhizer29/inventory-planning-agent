@@ -37,21 +37,22 @@ def _make_db(path: Path) -> None:
         # C: all cost sources invalid -> imputed; default lead/pack
         ("C", 3, "Prod C", "Cat1", None, "BrandC", 80.0, 1, 1, None, 0, None, None, "missing", -5.0, 0.0, None, 0, "2025-12-01"),
     ])
+    # qty_ordered == quantity_sold here (no cancellations); row_total = qty * list_price
     con.execute("""CREATE TABLE sales_transactions (sku_id TEXT, channel TEXT,
-        transaction_date TEXT, quantity_sold REAL, discount_amount REAL, row_total REAL)""")
+        transaction_date TEXT, quantity_sold REAL, qty_ordered REAL, discount_amount REAL, row_total REAL)""")
     rows = []
     for i, d in enumerate(DAYS):
         ds = d.date().isoformat()
-        rows.append(("A", "online_delivery", ds, 5 + (i % 7), 0, (5 + (i % 7)) * 100.0))
-        rows.append(("B", "online_delivery", ds, 3 + (i % 4), 0, (3 + (i % 4)) * 50.0))
-        rows.append(("C", "online_delivery", ds, 2 + (i % 3), 0, (2 + (i % 3)) * 80.0))
+        qa = 5 + (i % 7); rows.append(("A", "online_delivery", ds, qa, qa, 0, qa * 100.0))
+        qb = 3 + (i % 4); rows.append(("B", "online_delivery", ds, qb, qb, 0, qb * 50.0))
+        qc = 2 + (i % 3); rows.append(("C", "online_delivery", ds, qc, qc, 0, qc * 80.0))
     rows += [
-        ("A", "store", "2026-02-01", 99, 0, 9900),       # physical -> excluded
-        ("A", "weirdchan", "2026-02-01", 7, 0, 700),      # unknown -> counted
-        ("A", "online_delivery", "2026-06-15", 9999, 0, 999900),   # AFTER as_of -> dropped
-        ("B", "online_delivery", "2026-05-20", 8888, 0, 444400),   # AFTER as_of -> dropped
+        ("A", "store", "2026-02-01", 99, 99, 0, 9900),        # physical -> excluded
+        ("A", "weirdchan", "2026-02-01", 7, 7, 0, 700),        # unknown -> counted
+        ("A", "online_delivery", "2026-06-15", 9999, 9999, 0, 999900),  # AFTER as_of -> dropped
+        ("B", "online_delivery", "2026-05-20", 8888, 8888, 0, 444400),  # AFTER as_of -> dropped
     ]
-    con.executemany("INSERT INTO sales_transactions VALUES (?,?,?,?,?,?)", rows)
+    con.executemany("INSERT INTO sales_transactions VALUES (?,?,?,?,?,?,?)", rows)
     # real stock snapshots: all AFTER the 2026-04-30 as_of, plus warehouse rows to test ALL-preference
     con.execute("""CREATE TABLE inventory_snapshot_history (product_id INT, snapshot_date TEXT,
         location_id TEXT, stock_on_hand REAL, stock_flag TEXT)""")
@@ -243,3 +244,46 @@ def test_validation_and_scope(ctx):
     assert "weirdchan" in ctx.stats["unknown_channel_rows"]
     assert list(ctx.panel.columns) == prep.MODEL_PANEL_COLS
     assert list(ctx.inv.columns) == prep.INVENTORY_COLS
+
+
+# 19. price columns exist and equal the list price on a clean sale day (no cancellations, no discount)
+def test_price_columns_present(ctx):
+    assert "net_price_paid" in prep.MODEL_PANEL_COLS
+    a = ctx.panel[(ctx.panel.sku == "A") & (ctx.panel.units_observed > 0)].iloc[0]
+    assert a["effective_unit_price"] == pytest.approx(100.0)   # list price, stable
+    assert a["net_price_paid"] == pytest.approx(100.0)          # no discount -> equal
+
+
+# 20. price is computed on the ORDERED basis: a mostly-cancelled order must NOT inflate price,
+#     and a discount must show up in net_price_paid (this is the reported bug fix)
+def test_price_not_inflated_by_cancellation(tmp_path):
+    import sqlite3
+    db = tmp_path / "px.db"
+    con = sqlite3.connect(db)
+    con.execute("""CREATE TABLE sku_master (sku_id TEXT, product_id INT, category TEXT,
+        sub_category TEXT, brand TEXT, price REAL, moq INT, pack_size INT, supplier_lead_time_days INT)""")
+    con.execute("INSERT INTO sku_master VALUES ('Z', 9, 'Cat1', NULL, 'BrandZ', 450.0, 1, 1, 7)")
+    con.execute("""CREATE TABLE sales_transactions (sku_id TEXT, channel TEXT,
+        transaction_date TEXT, quantity_sold REAL, qty_ordered REAL, discount_amount REAL, row_total REAL)""")
+    days = pd.date_range("2026-03-01", periods=20, freq="D")
+    rows = []
+    for i, d in enumerate(days):
+        ds = d.date().isoformat()
+        if i == 10:      # 51 ordered @450, 50 cancelled -> 1 net unit (the inflation scenario)
+            rows.append(("Z", "online_delivery", ds, 1, 51, 0, 51 * 450.0))
+        elif i == 11:    # 10 ordered @450 with a 450 total discount
+            rows.append(("Z", "online_delivery", ds, 10, 10, 450.0, 10 * 450.0))
+        else:
+            rows.append(("Z", "online_delivery", ds, 4, 4, 0, 4 * 450.0))
+    con.executemany("INSERT INTO sales_transactions VALUES (?,?,?,?,?,?,?)", rows)
+    con.commit()
+    cfg = prep.load_config()
+    pilot = pd.DataFrame({"sku": ["Z"], "category": ["Cat1"]})
+    panel, _ = prep.build_model_panel(con, pilot, cfg, None, "2026-03-20")
+    con.close()
+    canc = panel[panel.date == "2026-03-11"].iloc[0]        # the cancellation day
+    assert canc["units_observed"] == 1                       # real net demand preserved
+    assert canc["effective_unit_price"] == pytest.approx(450.0)   # NOT 22950
+    disc = panel[panel.date == "2026-03-12"].iloc[0]        # the discount day
+    assert disc["effective_unit_price"] == pytest.approx(450.0)   # list price
+    assert disc["net_price_paid"] == pytest.approx(405.0)         # (4500-450)/10
