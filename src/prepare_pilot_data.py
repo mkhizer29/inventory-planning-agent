@@ -57,7 +57,7 @@ PILOT_LIST = REPO_ROOT / "pilot_skus.csv"
 CANDIDATE_LIST = REPO_ROOT / "pilot_skus_candidate.csv"
 
 MODEL_PANEL_COLS = [
-    "sku", "product_id", "channel", "date", "category", "sub_category", "brand",
+    "sku", "product_id", "sku_name", "channel", "date", "category", "sub_category", "brand",
     "units_observed", "effective_unit_price", "net_price_paid", "discount_amount", "discount_pct",
     "on_promo", "promo_known_in_advance", "is_public_holiday", "holiday_name",
     "is_payday_window", "day_of_week", "is_weekend", "week_of_year", "month",
@@ -371,7 +371,7 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
     skus = pilot["sku"].astype(str).tolist()
     ph = ",".join("?" * len(skus))
     attrs = pd.read_sql(
-        f"SELECT sku_id AS sku, product_id, category, sub_category, brand, price "
+        f"SELECT sku_id AS sku, product_id, sku_name, category, sub_category, brand, price "
         f"FROM sku_master WHERE sku_id IN ({ph})", con, params=skus)
 
     raw = pd.read_sql(

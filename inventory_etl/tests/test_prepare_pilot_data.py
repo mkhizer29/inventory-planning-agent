@@ -261,9 +261,10 @@ def test_price_not_inflated_by_cancellation(tmp_path):
     import sqlite3
     db = tmp_path / "px.db"
     con = sqlite3.connect(db)
-    con.execute("""CREATE TABLE sku_master (sku_id TEXT, product_id INT, category TEXT,
-        sub_category TEXT, brand TEXT, price REAL, moq INT, pack_size INT, supplier_lead_time_days INT)""")
-    con.execute("INSERT INTO sku_master VALUES ('Z', 9, 'Cat1', NULL, 'BrandZ', 450.0, 1, 1, 7)")
+    con.execute("""CREATE TABLE sku_master (sku_id TEXT, product_id INT, sku_name TEXT,
+        category TEXT, sub_category TEXT, brand TEXT, price REAL, moq INT, pack_size INT,
+        supplier_lead_time_days INT)""")
+    con.execute("INSERT INTO sku_master VALUES ('Z', 9, 'Prod Z', 'Cat1', NULL, 'BrandZ', 450.0, 1, 1, 7)")
     con.execute("""CREATE TABLE sales_transactions (sku_id TEXT, channel TEXT,
         transaction_date TEXT, quantity_sold REAL, qty_ordered REAL, discount_amount REAL, row_total REAL)""")
     days = pd.date_range("2026-03-01", periods=20, freq="D")
@@ -350,6 +351,14 @@ def test_existing_calendar_unchanged():
     assert int(cal["day_of_week"]) == 3       # 2026-02-19 is a Thursday (Mon=0)
     assert int(cal["is_weekend"]) == 0
     assert int(cal["month"]) == 2
+
+
+# 24b. product name (sku_name) is carried into the model panel
+def test_sku_name_in_panel(ctx):
+    assert "sku_name" in prep.MODEL_PANEL_COLS
+    assert "sku_name" in ctx.panel.columns
+    assert ctx.panel[ctx.panel.sku == "A"]["sku_name"].iloc[0] == "Prod A"
+    assert ctx.panel["sku_name"].notna().all()
 
 
 # 25. Eid al-Fitr holidays (21-23 Mar 2026) come from configured extra_public_holidays
