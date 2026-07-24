@@ -85,7 +85,7 @@ BANNED_COLS = [                       # relics of the removed simulator — must
 ]
 FORECAST_FRAME_COLS = [
     "sku", "product_id", "channel", "date", "forecast_horizon_day", "category",
-    "sub_category", "brand", "latest_known_price", "trailing_units_mean_7",
+    "sub_category", "brand", "sku_name", "latest_known_price", "trailing_units_mean_7",
     "trailing_units_mean_28", "planned_promo", "planned_discount_pct",
     "is_public_holiday", "holiday_name", "is_payday_window", "day_of_week",
     "is_weekend", "week_of_year", "month", "feature_availability_flag",
@@ -432,7 +432,7 @@ def build_forecast_frame(panel: pd.DataFrame, con: sqlite3.Connection, pilot: pd
     """Exactly N future days per SKU/channel awaiting predictions (no leakage, no actuals)."""
     n_days = int(cfg["pilot"]["forecast_feature_days"])
     future = pd.date_range(as_of + pd.Timedelta(days=1), periods=n_days, freq="D")
-    keys = panel[["sku", "product_id", "channel", "category", "sub_category", "brand"]].drop_duplicates()
+    keys = panel[["sku", "product_id", "sku_name", "channel", "category", "sub_category", "brand"]].drop_duplicates()
 
     hist = panel[panel["date"] <= as_of]
     last_price = (hist.dropna(subset=["effective_unit_price"])

@@ -561,6 +561,7 @@ def refit_and_forecast_production(series: dict[str, pd.DataFrame], selection: di
     """Refit each frozen model on ALL real history through as_of and forecast the exact
     forecast_frame keys, with 80/95 intervals."""
     pid = ff.drop_duplicates("sku").set_index("sku")["product_id"] if "product_id" in ff.columns else None
+    nm = ff.drop_duplicates("sku").set_index("sku")["sku_name"] if "sku_name" in ff.columns else None
     rows = []
     for sku in sorted(series):
         s = series[sku]
@@ -574,6 +575,7 @@ def refit_and_forecast_production(series: dict[str, pd.DataFrame], selection: di
             rows.append({
                 "sku": sku,
                 "product_id": (int(pid[sku]) if pid is not None and sku in pid.index else None),
+                "sku_name": (nm[sku] if nm is not None and sku in nm.index else None),
                 "channel": EXPECTED_CHANNEL, "date": k["date"],
                 "forecast_horizon_day": int(k["forecast_horizon_day"]),
                 "y_pred": float(pt[i]),
