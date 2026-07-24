@@ -224,10 +224,15 @@ def build_future_forecast(panel: pd.DataFrame, forecast_fn: ForecastFn, horizon:
         sku_train = panel[(panel["sku"] == sku) & (panel["channel"] == channel)]
         required_dates = pd.DatetimeIndex(sorted(future_group["date"]))
         forecast = forecast_fn(sku_train, required_dates, full_history_cutoff)
+        # descriptive keys for the dashboard (carried from forecast_frame; not model inputs)
+        name = future_group["sku_name"].iloc[0] if "sku_name" in future_group else None
+        pid = future_group["product_id"].iloc[0] if "product_id" in future_group else None
         for date, value in forecast.items():
-            rows.append({"sku": sku, "channel": channel, "date": date, "y_pred": value})
+            rows.append({"sku": sku, "product_id": pid, "sku_name": name,
+                         "channel": channel, "date": date, "y_pred": value})
 
-    future_preds = pd.DataFrame(rows, columns=["sku", "channel", "date", "y_pred"])
+    future_preds = pd.DataFrame(
+        rows, columns=["sku", "product_id", "sku_name", "channel", "date", "y_pred"])
     # Preserve natural fractional forecasts; only enforce non-negativity.
     future_preds["y_pred"] = np.clip(future_preds["y_pred"].astype(float), 0, None)
     return future_preds
