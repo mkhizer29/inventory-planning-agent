@@ -387,35 +387,107 @@ def discover_outputs():
 def build_sku_meta(mp_df):
     if mp_df is None:
         return None
-    return (
-        mp_df.sort_values("date")
-        .groupby("sku", as_index=False)
-        .agg(category=("category", "last"), brand=("brand", "last"), product_id=("product_id", "last"))
-    )
+    agg = dict(category=("category", "last"), brand=("brand", "last"), product_id=("product_id", "last"))
+    if "sku_name" in mp_df.columns:            # real product name when the v4 field is present
+        agg["sku_name"] = ("sku_name", "last")
+    return mp_df.sort_values("date").groupby("sku", as_index=False).agg(**agg)
+
+
+def _clean_text(v):
+    """Return a trimmed string, or '' for null/blank/'None' placeholder values."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    s = str(v).strip()
+    return "" if s == "" or s.lower() == "none" else s
+
+
+def _sku_display(name, brand, sku):
+    """Best display name (no SKU code): 'name — brand', name, brand, then SKU.
+
+    The brand is only appended when it is not already clearly contained in the
+    product name, so e.g. 'Nestle Nesvita ...' is not turned into
+    'Nestle Nesvita ... — Nestle'.
+    """
+    if name:
+        return f"{name} — {brand}" if brand and brand.lower() not in name.lower() else name
+    return brand or str(sku)
+
+
+def _label_meta(mp_df):
+    """Grouped (brand, sku_name) per sku, tolerant of older files without sku_name."""
+    has_name = "sku_name" in mp_df.columns
+    agg = {"brand": ("brand", "last")}
+    if has_name:
+        agg["sku_name"] = ("sku_name", "last")
+    meta = mp_df.sort_values("date").groupby("sku").agg(**agg)
+    return meta, has_name
 
 
 def build_sku_labels(mp_df):
-    """Map each sku -> a human-readable, searchable label 'Brand · Sub-category (SKU)'.
+    """Map each sku -> a searchable display label that ends with the SKU code.
 
-    The pilot data has no product-name column, so we synthesize a friendly label
-    from brand + sub_category and keep the SKU code in parentheses (so the code
-    is still searchable and unambiguous). Falls back to 'Unnamed' when both
-    descriptors are blank.
+    Uses the real product name (`sku_name`) when the v4 model_panel provides it,
+    with this fallback order (SKU code always appended so codes stay searchable):
+      a. "<sku_name> — <brand> (SKU)"  when both exist and brand is not already in the name
+      b. "<sku_name> (SKU)"            when only the name is usable
+      c. "<brand> (SKU)"               when there is no name (older model_panel files)
+      d. "SKU"                         when nothing descriptive is available
+    Never crashes on null/blank sku_name; SKU remains the stable internal value.
     """
     if mp_df is None:
         return {}
-    meta = (
-        mp_df.sort_values("date")
-        .groupby("sku")
-        .agg(brand=("brand", "last"), sub_category=("sub_category", "last"))
-    )
+    meta, has_name = _label_meta(mp_df)
     labels = {}
     for sku, row in meta.iterrows():
-        parts = [str(v).strip() for v in (row["brand"], row["sub_category"])
-                 if pd.notna(v) and str(v).strip()]
-        name = " · ".join(parts) if parts else "Unnamed"
-        labels[sku] = f"{name} ({sku})"
+        name = _clean_text(row["sku_name"]) if has_name else ""
+        core = _sku_display(name, _clean_text(row["brand"]), sku)
+        labels[sku] = f"{core} ({sku})" if core and core != str(sku) else str(sku)
     return labels
+
+
+def build_sku_names(mp_df):
+    """Map each sku -> the raw product name only (no brand suffix, no code), for
+    places that show the SKU/brand separately (profile rows, action-queue table,
+    comparison-label modes). Falls back sku_name -> brand -> SKU, and tolerates
+    older files lacking sku_name."""
+    if mp_df is None:
+        return {}
+    meta, has_name = _label_meta(mp_df)
+    names = {}
+    for sku, row in meta.iterrows():
+        name = _clean_text(row["sku_name"]) if has_name else ""
+        names[sku] = name or _clean_text(row["brand"]) or str(sku)
+    return names
+
+
+CMP_LABEL_MODES = ["Name + SKU", "Product name", "SKU"]
+
+
+def comparison_display_label(sku, mode, selected_skus=None):
+    """Display text for one product under the chosen 'Comparison labels' mode.
+
+    Display-only — SKU is always the stable internal value for filtering, joins,
+    grouping and chart data; this affects only legends, hover labels, chart titles
+    and selected-product headings.
+      - "SKU":          the SKU code only
+      - "Product name":  the real product name (falls back brand -> SKU). If two of
+                         the SELECTED products share the same name, the SKU is
+                         appended to those so the chart stays unambiguous.
+      - "Name + SKU":    "<product name> (SKU)"   (default)
+    Names come from SKU_NAMES (built once from model_panel: sku_name -> brand -> SKU);
+    sku_name is never used as a join/group key.
+    """
+    if mode == "SKU":
+        return str(sku)
+    name = SKU_NAMES.get(sku) or str(sku)   # blank/missing name -> SKU
+    if mode == "Product name":
+        if selected_skus:
+            same = [s for s in selected_skus if SKU_NAMES.get(s, str(s)) == name]
+            if len(same) > 1:                       # duplicate names among the selection
+                return f"{name} ({sku})"
+        return name
+    # default: "Name + SKU"
+    return f"{name} ({sku})" if name and name != str(sku) else str(sku)
 
 
 @st.cache_data(show_spinner=False)
@@ -592,7 +664,8 @@ if mp_raw is not None:
     all_skus = sorted(mp_raw["sku"].unique().tolist())
     all_categories = sorted(mp_raw["category"].dropna().unique().tolist())
     all_brands = sorted(mp_raw["brand"].dropna().unique().tolist())
-    SKU_LABELS = build_sku_labels(mp_raw)
+    SKU_LABELS = build_sku_labels(mp_raw)      # "Product name — Brand (SKU)" for search/legends
+    SKU_NAMES = build_sku_names(mp_raw)         # name-only, for tables/profile that show SKU separately
     min_date, max_date = mp_raw["date"].min().date(), mp_raw["date"].max().date()
 
     st.sidebar.selectbox("Channel", options=["naheed_web"], key="flt_channel")
@@ -600,16 +673,21 @@ if mp_raw is not None:
     cat_choice = st.sidebar.selectbox("Category", options=["All categories"] + all_categories, key="flt_category")
     sel_categories = all_categories if cat_choice == "All categories" else [cat_choice]
 
-    # Options stay SKU codes (stable keys); the label (Brand / SKU) is shown &
-    # searched via format_func, so users find a product by brand name OR SKU code.
-    # NOTE: the pilot data has no real product_name field yet — labels are brand-based.
+    # Options stay SKU codes (stable internal keys); the label — real product name,
+    # brand, and the SKU code — is shown & searched via format_func, so users find a
+    # product by its actual name, its brand, OR its SKU code.
     with st.sidebar.container(key="ipa-sku-search"):
         focus_sku_choice = st.multiselect(
             "Compare products", options=all_skus, default=[all_skus[0]] if all_skus else [],
-            format_func=lambda s: SKU_LABELS.get(s, s), placeholder="Search by brand or SKU...",
+            format_func=lambda s: SKU_LABELS.get(s, s), placeholder="Search by product name, brand or SKU...",
             help="Each selected product is shown as a separate line on the Demand Analytics "
-                 "deep-dive. Labels are Brand / SKU (no product-name field in the pilot data yet).",
+                 "deep-dive. Search by product name, brand, or SKU code.",
             key="flt_focus_sku"
+        )
+        cmp_label_mode = st.selectbox(
+            "Comparison labels", options=CMP_LABEL_MODES, index=0, key="flt_cmp_labels",
+            help="How selected products are labelled in comparison legends, hover text, "
+                 "chart titles and headings. Filtering always uses the SKU internally.",
         )
     focus_skus = focus_sku_choice if focus_sku_choice else [all_skus[0]] if all_skus else []
 
@@ -636,13 +714,15 @@ else:
     all_skus, all_categories, all_brands = [], [], []
     sel_categories, sel_brands, sel_skus = [], [], []
     SKU_LABELS = {}
+    SKU_NAMES = {}
+    cmp_label_mode = CMP_LABEL_MODES[0]
     date_range = None
     focus_skus = []
     horizon = 14
     sel_scenario = SCENARIO_NAMES[0]
 
 FILTER_KEYS = ["flt_skus", "flt_category", "flt_brands", "flt_daterange", "flt_channel",
-               "flt_scenario", "flt_horizon", "flt_focus_sku"]
+               "flt_scenario", "flt_horizon", "flt_focus_sku", "flt_cmp_labels"]
 with st.sidebar.container(key="ipa-clear-filters"):
     if st.button("Clear Filters", icon=":material/filter_alt_off:", width="stretch"):
         for k in FILTER_KEYS:
@@ -752,16 +832,24 @@ def page_executive_overview():
         synthetic_warning()
     d1, d2 = st.columns([3, 2])
     with d1:
-        top10 = mp_f.groupby("sku", as_index=False)["units_observed"].sum().sort_values("units_observed", ascending=False).head(10)
-        top10["product"] = top10["sku"].map(lambda s: SKU_LABELS.get(s, s))
-        fig = px.bar(top10.sort_values("units_observed"), x="units_observed", y="product", orientation="h",
-                     custom_data=["sku"])
-        fig.update_traces(marker_color=COLORS["teal"],
-                          hovertemplate="%{y}<br>Units: %{x:,.0f}<extra></extra>")
+        top10 = (mp_f.groupby("sku", as_index=False)["units_observed"].sum()
+                 .sort_values("units_observed", ascending=False).head(10)
+                 .sort_values("units_observed"))
+        top10["name"] = top10["sku"].map(lambda s: SKU_NAMES.get(s, s))
+        # Categories stay unique SKUs so truncated tick labels can never merge two bars;
+        # the real name shows as the tick text (truncated) and in full on hover.
+        _short = lambda t: t if len(t) <= 34 else t[:32].rstrip() + "…"
+        fig = go.Figure(go.Bar(
+            x=top10["units_observed"], y=top10["sku"], orientation="h",
+            marker_color=COLORS["teal"], customdata=top10["name"],
+            hovertemplate="%{customdata}<br>Units: %{x:,.0f}<extra></extra>",
+        ))
         fig.update_layout(**plotly_layout(legend=False, height=320))
         style_axes(fig)
+        fig.update_yaxes(categoryorder="array", categoryarray=top10["sku"].tolist(),
+                         tickmode="array", tickvals=top10["sku"].tolist(),
+                         ticktext=[_short(n) for n in top10["name"]], title="", automargin=True)
         fig.update_xaxes(title="Total units")
-        fig.update_yaxes(title="")
         render_chart(fig, "Top 10 Products by Units Sold")
     with d2:
         if inv_f is not None and not inv_f.empty:
@@ -842,16 +930,18 @@ def page_demand_analytics():
         cmp_fig = go.Figure()
         for i, fsku in enumerate(present):
             s = mp_f[mp_f["sku"] == fsku].sort_values("date")
+            disp = comparison_display_label(fsku, cmp_label_mode, present)
             cmp_fig.add_trace(go.Scatter(
-                x=s["date"], y=s["units_observed"], name=SKU_LABELS.get(fsku, fsku),
-                mode="lines", line=dict(width=2, color=CATEGORICAL[i % len(CATEGORICAL)])))
+                x=s["date"], y=s["units_observed"], name=disp,
+                mode="lines", line=dict(width=2, color=CATEGORICAL[i % len(CATEGORICAL)]),
+                hovertemplate=f"<b>{disp}</b><br>%{{x|%d %b %Y}}<br>Units: %{{y:,.0f}}<extra></extra>"))
         cmp_fig.update_layout(**plotly_layout(height=360))
         style_axes(cmp_fig)
         render_chart(cmp_fig, "Daily Units — Product Comparison", "One line per selected product")
 
     # --- SKU deep-dive: trend + rolling means + profile panel (per product) ---
     for focus_sku in focus_skus:
-        focus_label = SKU_LABELS.get(focus_sku, focus_sku)
+        focus_label = comparison_display_label(focus_sku, cmp_label_mode, focus_skus)
         section_title(f"Deep-Dive · {focus_label}", "Real demand only — no synthetic inventory on this page.")
         sku_all = mp_f[mp_f["sku"] == focus_sku].sort_values("date")
         if sku_all.empty:
@@ -874,6 +964,7 @@ def page_demand_analytics():
                 recent7 = sku_all.tail(7)["units_observed"].mean()
                 recent28 = sku_all.tail(28)["units_observed"].mean()
                 metric_panel("Product Profile", [
+                    ("Product", SKU_NAMES.get(focus_sku, focus_sku)),
                     ("SKU", focus_sku),
                     ("Category", meta_row["category"] if meta_row is not None else "—"),
                     ("Brand", meta_row["brand"] if meta_row is not None else "—"),
@@ -1004,7 +1095,8 @@ def page_forecast_explorer():
     
         # --- One large historical + forecast chart ---
         if hist_recent.empty and fc_sku.empty:
-            empty_state("No historical or forecast data for this SKU", f"SKU: {focus_sku}", "mail")
+            empty_state("No historical or forecast data for this product",
+                        comparison_display_label(focus_sku, cmp_label_mode, focus_skus), "mail")
         else:
             fig = go.Figure()
             if not hist_recent.empty:
@@ -1018,7 +1110,7 @@ def page_forecast_explorer():
                               annotation_text="Forecast horizon", annotation_position="top left")
             fig.update_layout(**plotly_layout(height=360))
             style_axes(fig)
-            render_chart(fig, f"Historical vs Forecast — {focus_sku}",
+            render_chart(fig, f"Historical vs Forecast — {comparison_display_label(focus_sku, cmp_label_mode, focus_skus)}",
                          f"Last 28 historical days (solid) + next {horizon} forecast days (dashed)")
     
         # --- 4 forecast summary cards ---
@@ -1158,6 +1250,7 @@ def page_inventory_reorder():
     table = table.sort_values(["_rank", "days_of_cover"])
     view = pd.DataFrame({
         "Status": table["status"],
+        "Product": table["sku"].map(lambda s: SKU_NAMES.get(s, s)),
         "SKU": table["sku"],
         "Category": table.get("category", "—"),
         "Sim. Stock": table["stock_on_hand"],
@@ -1365,10 +1458,11 @@ def page_stockout_lab():
                     render_chart(fig, "Scenario Severity")
 
     for focus_sku in focus_skus:
-        section_title(f"Synthetic Inventory Trajectory · {focus_sku}")
+        section_title(f"Synthetic Inventory Trajectory · {comparison_display_label(focus_sku, cmp_label_mode, focus_skus)}")
         traj = d[d["sku"] == focus_sku].sort_values("date") if "date" in d.columns else pd.DataFrame()
         if traj.empty:
-            empty_state("No trajectory data for this SKU/scenario", f"SKU: {focus_sku}", "trending-down")
+            empty_state("No trajectory data for this product/scenario",
+                        comparison_display_label(focus_sku, cmp_label_mode, focus_skus), "trending-down")
         else:
             fig = go.Figure()
             for col, label, color in [
