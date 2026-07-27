@@ -380,3 +380,43 @@ def test_invalid_extra_holiday_raises():
     cfg["external_signals"]["extra_public_holidays"] = [{"name": "no date key"}]
     with pytest.raises(ValueError):
         prep.calendar_features(pd.date_range("2026-03-01", "2026-03-31", freq="D"), cfg)
+
+
+# 27. catalog/special-price sale (unit_price < original_price -> catalog_discount_amount) is
+#     folded into discount_pct / on_promo, alongside cart discount_amount
+def test_catalog_sale_discount(tmp_path):
+    import sqlite3
+    db = tmp_path / "cat.db"
+    con = sqlite3.connect(db)
+    con.execute("""CREATE TABLE sku_master (sku_id TEXT, product_id INT, sku_name TEXT,
+        category TEXT, sub_category TEXT, brand TEXT, price REAL, moq INT, pack_size INT,
+        supplier_lead_time_days INT)""")
+    con.execute("INSERT INTO sku_master VALUES ('Z', 9, 'Prod Z', 'Cat1', NULL, 'BrandZ', 450.0, 1, 1, 7)")
+    con.execute("""CREATE TABLE sales_transactions (sku_id TEXT, channel TEXT,
+        transaction_date TEXT, quantity_sold REAL, qty_ordered REAL, discount_amount REAL,
+        catalog_discount_amount REAL, row_total REAL)""")
+    days = pd.date_range("2026-03-01", periods=20, freq="D")
+    rows = []
+    for i, d in enumerate(days):
+        ds = d.date().isoformat()
+        if i == 10:      # catalog sale: 10 @400 (regular 450) -> markdown (450-400)*10 = 500, no cart discount
+            rows.append(("Z", "online_delivery", ds, 10, 10, 0, 500.0, 4000.0))
+        elif i == 11:    # cart discount only: 10 @450 with 450 coupon, no catalog markdown
+            rows.append(("Z", "online_delivery", ds, 10, 10, 450.0, 0.0, 4500.0))
+        else:            # regular day: no discount of either kind
+            rows.append(("Z", "online_delivery", ds, 4, 4, 0, 0.0, 4 * 450.0))
+    con.executemany("INSERT INTO sales_transactions VALUES (?,?,?,?,?,?,?,?)", rows)
+    con.commit()
+    cfg = prep.load_config()
+    pilot = pd.DataFrame({"sku": ["Z"], "category": ["Cat1"]})
+    panel, _ = prep.build_model_panel(con, pilot, cfg, None, "2026-03-20")
+    con.close()
+    assert "catalog_discount_amount" in prep.MODEL_PANEL_COLS
+    cat = panel[panel.date == "2026-03-11"].iloc[0]          # catalog-sale day
+    assert cat["catalog_discount_amount"] == pytest.approx(500.0)
+    assert cat["on_promo"] == 1                               # flagged even with discount_amount == 0
+    assert cat["discount_pct"] == pytest.approx(500.0 / 4500.0)   # markdown off the regular value
+    cart = panel[panel.date == "2026-03-12"].iloc[0]         # cart-discount day
+    assert cart["on_promo"] == 1 and cart["discount_pct"] == pytest.approx(0.10)
+    reg = panel[panel.date == "2026-03-13"].iloc[0]          # regular day
+    assert reg["on_promo"] == 0 and reg["discount_pct"] == pytest.approx(0.0)

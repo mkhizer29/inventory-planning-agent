@@ -27,6 +27,7 @@ SELECT
     oi.qty_canceled,
     oi.qty_refunded,
     oi.price                                           AS unit_price,
+    oi.original_price,
     oi.discount_amount,
     oi.base_cost,
     oi.row_total,

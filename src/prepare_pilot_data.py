@@ -58,8 +58,9 @@ CANDIDATE_LIST = REPO_ROOT / "pilot_skus_candidate.csv"
 
 MODEL_PANEL_COLS = [
     "sku", "product_id", "sku_name", "channel", "date", "category", "sub_category", "brand",
-    "units_observed", "effective_unit_price", "net_price_paid", "discount_amount", "discount_pct",
-    "on_promo", "promo_known_in_advance", "is_public_holiday", "holiday_name",
+    "units_observed", "effective_unit_price", "net_price_paid", "discount_amount",
+    "catalog_discount_amount", "discount_pct", "on_promo",
+    "promo_known_in_advance", "is_public_holiday", "holiday_name",
     "is_payday_window", "day_of_week", "is_weekend", "week_of_year", "month",
     "is_ramadan", "ramadan_day", "ramadan_week",
     "units_lag_1", "units_lag_7", "units_lag_14",
@@ -374,9 +375,14 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
         f"SELECT sku_id AS sku, product_id, sku_name, category, sub_category, brand, price "
         f"FROM sku_master WHERE sku_id IN ({ph})", con, params=skus)
 
+    # catalog_discount_amount exists once the ETL has been re-run with original_price; fall back
+    # to 0 so this still runs against an older warehouse that predates the catalog-sale change.
+    cat_expr = ("catalog_discount_amount"
+                if "catalog_discount_amount" in _table_columns(con, "sales_transactions")
+                else "0 AS catalog_discount_amount")
     raw = pd.read_sql(
         f"SELECT sku_id AS sku, channel, transaction_date, quantity_sold, qty_ordered, "
-        f"       discount_amount, row_total FROM sales_transactions WHERE sku_id IN ({ph})",
+        f"       discount_amount, {cat_expr}, row_total FROM sales_transactions WHERE sku_id IN ({ph})",
         con, params=skus)
     raw["date"] = pd.to_datetime(raw["transaction_date"])
     ecom, physical_excluded, unknown = map_channels(raw, cfg)
@@ -393,6 +399,7 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
                .agg(units_observed=("quantity_sold", "sum"),
                     ordered_qty=("qty_ordered", "sum"),
                     discount_amount=("discount_amount", "sum"),
+                    catalog_discount_amount=("catalog_discount_amount", "sum"),
                     net_rev=("row_total", "sum"))
                .reset_index())
     agg["units_observed"] = agg["units_observed"].clip(lower=0).round().astype(int)
@@ -407,6 +414,7 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
     panel["units_observed"] = panel["units_observed"].fillna(0).astype(int)   # genuine in-window zeros
     panel["ordered_qty"] = panel["ordered_qty"].fillna(0.0)
     panel["discount_amount"] = panel["discount_amount"].fillna(0.0)
+    panel["catalog_discount_amount"] = panel["catalog_discount_amount"].fillna(0.0)
     panel["net_rev"] = panel["net_rev"].fillna(0.0)
     panel["product_active"] = True
     panel = panel.sort_values(["sku", "channel", "date"]).reset_index(drop=True)
@@ -424,9 +432,13 @@ def build_model_panel(con: sqlite3.Connection, pilot: pd.DataFrame, cfg: dict,
     panel["effective_unit_price"] = panel.groupby(["sku", "channel"])["effective_unit_price"].ffill()
     panel["net_price_paid"] = net_paid
     panel["net_price_paid"] = panel.groupby(["sku", "channel"])["net_price_paid"].ffill()
-    gross = panel["net_rev"] + panel["discount_amount"]
-    panel["discount_pct"] = np.where(gross > 0, panel["discount_amount"] / gross, 0.0)
-    panel["on_promo"] = (panel["discount_amount"] > 0).astype(int)
+    # Total discount given to the customer = cart/coupon (discount_amount) + catalog/special-price
+    # markdown (catalog_discount_amount). Regular value = charged revenue + the catalog markdown
+    # (net_rev already reflects the sale price). on_promo is true if EITHER discount type applies.
+    regular_value = panel["net_rev"] + panel["catalog_discount_amount"]
+    total_discount = panel["discount_amount"] + panel["catalog_discount_amount"]
+    panel["discount_pct"] = np.where(regular_value > 0, total_discount / regular_value, 0.0)
+    panel["on_promo"] = ((panel["discount_amount"] > 0) | (panel["catalog_discount_amount"] > 0)).astype(int)
     panel["promo_known_in_advance"] = 0
 
     cal = calendar_features(pd.DatetimeIndex(panel["date"].unique()), cfg)

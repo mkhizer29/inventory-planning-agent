@@ -122,18 +122,29 @@ def build_sales_transactions(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
     s = raw["sales"].copy()
     s["channel"] = cleanse.derive_channel(s["carrier_code"], cfg["mapping"], cfg["default"])
 
+    if "original_price" not in s.columns:
+        s["original_price"] = 0.0            # older extract without the column -> no catalog markdown
     for col in ["qty_ordered", "qty_invoiced", "qty_shipped", "qty_canceled",
-                "qty_refunded", "unit_price", "discount_amount"]:
+                "qty_refunded", "unit_price", "discount_amount", "original_price"]:
         s[col] = pd.to_numeric(s.get(col), errors="coerce").fillna(0.0)
 
     # net demand (never below zero); keep gross for reference
     s["quantity_sold"] = (s["qty_ordered"] - s["qty_canceled"] - s["qty_refunded"]).clip(lower=0)
+
+    # Catalog / special-price sale: `unit_price` (oi.price) is what was actually charged after
+    # catalog price rules; `original_price` is the regular list price. When unit_price < original_price
+    # the item was on a catalog sale — a markdown Magento does NOT record in discount_amount
+    # (that field is cart/coupon discounts only). Line-total markdown = per-unit gap x qty_ordered.
+    unit_markdown = (s["original_price"] - s["unit_price"]).clip(lower=0)
+    s["catalog_discount_amount"] = (unit_markdown * s["qty_ordered"]).round(4)
+
     s = s.rename(columns={"sku": "sku_id"})
     return s[[
         "transaction_id", "order_id", "product_id", "sku_id", "product_name",
         "channel", "order_status", "order_state", "transaction_date", "transaction_ts",
         "qty_ordered", "qty_invoiced", "qty_shipped", "qty_canceled", "qty_refunded",
-        "quantity_sold", "unit_price", "discount_amount", "row_total", "customer_id_hash",
+        "quantity_sold", "unit_price", "original_price", "discount_amount",
+        "catalog_discount_amount", "row_total", "customer_id_hash",
     ]]
 
 
