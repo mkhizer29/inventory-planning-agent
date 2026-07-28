@@ -1,0 +1,55 @@
+{
+  "model_version": "lgbm_global_v1",
+  "as_of_date": "2026-06-30",
+  "channel": "naheed_web",
+  "horizons": [
+    7,
+    14
+  ],
+  "n_skus": 30,
+  "features": [
+    "units_lag_1",
+    "units_lag_7",
+    "units_lag_14",
+    "units_roll_mean_7",
+    "units_roll_mean_28",
+    "units_roll_std_7",
+    "effective_unit_price",
+    "discount_pct",
+    "on_promo",
+    "is_public_holiday",
+    "is_payday_window",
+    "day_of_week",
+    "is_weekend",
+    "week_of_year",
+    "month",
+    "is_ramadan",
+    "ramadan_day",
+    "ramadan_week",
+    "sku"
+  ],
+  "results": [
+    {
+      "model": "lgbm_global_v1",
+      "horizon": 7,
+      "cutoff": "2026-06-23",
+      "wape": 0.6518862656111499,
+      "mae": 8.564543842005538,
+      "mase": 0.8079205146406465,
+      "rmse": 16.16781940614571,
+      "bias": -1.2127837853639203,
+      "n_test_rows": 210
+    },
+    {
+      "model": "lgbm_global_v1",
+      "horizon": 14,
+      "cutoff": "2026-06-16",
+      "wape": 0.6609025104436376,
+      "mae": 9.619278681766563,
+      "mase": 0.8777105580234752,
+      "rmse": 19.248865550098035,
+      "bias": -4.378908694221895,
+      "n_test_rows": 420
+    }
+  ]
+}
