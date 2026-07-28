@@ -20,16 +20,15 @@ __pycache__/
 # ── forecasting pilot ──────────────────────────────────────────
 # Raw/large pipeline data is regenerated from code, never committed...
 data/*
-# ...EXCEPT the two tiny processed pilot inputs, which are the LOCKED shared
-# contract all three models read (like evaluation.py) — commit these so
-# teammates can start without DB access or re-running the ETL.
-
-#!data/processed/
-#data/processed/*
-#!data/processed/model_panel.parquet
-#!data/processed/forecast_frame.parquet
-#!data/processed/inventory_context.parquet
-#!data/processed/pilot_manifest.json
+# ...EXCEPT the prepare_pilot outputs — the shared contract all models + the
+# dashboard read. Commit these so teammates get them without DB access or the ETL.
+# (TrainingData.rar and any other data/ files stay ignored.)
+!data/processed/
+data/processed/*
+!data/processed/model_panel.parquet
+!data/processed/forecast_frame.parquet
+!data/processed/inventory_context.parquet
+!data/processed/pilot_manifest.json
 
 # database dumps / archives — but keep the ETL's own query files
 *.sql

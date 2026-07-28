@@ -1,9 +1,9 @@
 {
   "schema_version": "4.0-real-demand-synthetic-stock",
-  "generated_at": "2026-07-22T23:43:13",
+  "generated_at": "2026-07-27T02:17:43",
   "as_of_date": "2026-06-30",
   "historical_window": [
-    "2026-01-16",
+    "2026-01-01",
     "2026-06-30"
   ],
   "sku_selection_cutoff": null,
@@ -48,8 +48,8 @@
     "IC-1172128"
   ],
   "sku_count": 30,
-  "rows_after_as_of_dropped": 2942,
-  "future_real_snapshots_excluded": 6,
+  "rows_after_as_of_dropped": 4727,
+  "future_real_snapshots_excluded": 7,
   "real_snapshots_eligible": 0,
   "inventory_context_real_stock_rows": 0,
   "inventory_context_synthetic_stock_rows": 30,
@@ -150,16 +150,16 @@
     "manifest": "data/processed/pilot_manifest.json"
   },
   "row_counts": {
-    "model_panel": 4956,
+    "model_panel": 5417,
     "forecast_frame": 420,
     "inventory_context": 30,
-    "forecast_eligible": 4536
+    "forecast_eligible": 4997
   },
-  "zero_sales_rate": 0.2173,
+  "zero_sales_rate": 0.221,
   "stock_source_counts": {
     "synthetic_reconstruction": 30
   },
-  "physical_store_rows_excluded": 498,
+  "physical_store_rows_excluded": 540,
   "unknown_channel_rows": {},
   "note": "Demand is REAL and untouched. Only missing daily stock_on_hand is synthetic. Stockout risk / reorder recommendations are computed downstream from forecasts + this inventory context; they are pilot estimates, not validated against real Naheed stockouts.",
   "warnings": [],
