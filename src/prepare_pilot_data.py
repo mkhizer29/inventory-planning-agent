@@ -56,6 +56,46 @@ CONFIG_PATH = REPO_ROOT / "inventory_etl" / "config" / "config.yaml"
 PILOT_LIST = REPO_ROOT / "pilot_skus.csv"
 CANDIDATE_LIST = REPO_ROOT / "pilot_skus_candidate.csv"
 
+
+def _display_path(path: "str | os.PathLike") -> str:
+    """Repo-relative POSIX path when inside the repo, else a resolved POSIX path.
+
+    Single place for path normalization used in the manifest. Only ever returns a
+    filesystem path — never a connection string or credential.
+    """
+    p = Path(path).resolve()
+    try:
+        return p.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return p.as_posix()
+
+
+def selection_mode_for(pilot_file: "str | os.PathLike") -> str:
+    """'fixed_pilot' when pilot_file resolves to the repo-root pilot_skus.csv, else 'dynamic'.
+
+    Determined purely by resolved path — never inferred from CSV column names.
+    """
+    try:
+        same = Path(pilot_file).resolve() == PILOT_LIST.resolve()
+    except OSError:
+        same = False
+    return "fixed_pilot" if same else "dynamic"
+
+
+def _requested_count_from(pilot: pd.DataFrame) -> "int | None":
+    """Optional requested-SKU count from CSV metadata only; else None.
+
+    Never assume it equals the selected count — the original request may have asked
+    for more products than were eligible. The Phase 1 selector emits no such column,
+    so this is normally None.
+    """
+    for col in ("requested_top_n", "requested_sku_count"):
+        if col in pilot.columns:
+            vals = pd.to_numeric(pilot[col], errors="coerce").dropna().unique()
+            if len(vals) == 1 and float(vals[0]).is_integer():
+                return int(vals[0])
+    return None
+
 MODEL_PANEL_COLS = [
     "sku", "product_id", "sku_name", "channel", "date", "category", "sub_category", "brand",
     "units_observed", "effective_unit_price", "net_price_paid", "discount_amount",
@@ -253,32 +293,80 @@ def reselect_candidates(con: sqlite3.Connection, cfg: dict, cutoff: str) -> pd.D
     return out[["sku", "category", "brand", "name", "units"]]
 
 
-def load_pilot_skus(con: sqlite3.Connection, cfg: dict, strict: bool) -> tuple[pd.DataFrame, list[str]]:
-    """Load the frozen approved list and validate it against the warehouse."""
-    if not PILOT_LIST.exists():
-        sys.exit(f"Approved pilot list missing: {PILOT_LIST.name}. "
-                 f"Run with --reselect-pilot-skus --selection-cutoff YYYY-MM-DD to propose one.")
-    pilot = pd.read_csv(PILOT_LIST, encoding="utf-8-sig")
+def load_pilot_skus(con: sqlite3.Connection, cfg: dict, strict: bool,
+                    pilot_file: "str | os.PathLike" = PILOT_LIST) -> tuple[pd.DataFrame, list[str]]:
+    """Load and validate the approved/selected SKU list from ``pilot_file``.
+
+    ``pilot_file`` defaults to the repo-root ``pilot_skus.csv`` (fixed pilot); a
+    Phase 1 selector file (``runs/<id>/selected_skus.csv``) may be passed instead.
+    SKU is the ONLY stable key: product attributes, demand, prices, dates and model
+    features are always rebuilt from the warehouse. Extra CSV columns (the selector's
+    ``sku_name/category/brand/rank/historical_units/active_days/history_*``) are
+    accepted but never used as authoritative model input. The input file is only read,
+    never modified.
+    """
+    path = Path(pilot_file)
+    if not path.exists():
+        sys.exit(f"Pilot file not found: {path}. "
+                 f"(Default is {PILOT_LIST.name}; or pass --pilot-file, or run "
+                 f"--reselect-pilot-skus --selection-cutoff YYYY-MM-DD to propose one.)")
+    if not path.is_file():
+        sys.exit(f"--pilot-file must be a regular file, not a directory: {path}")
+    try:
+        pilot = pd.read_csv(path, encoding="utf-8-sig", dtype=str)
+    except UnicodeDecodeError:
+        try:
+            pilot = pd.read_csv(path, encoding="utf-8", dtype=str)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator, not swallowed
+            sys.exit(f"Could not read pilot file {path.name}: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        sys.exit(f"Could not read pilot file {path.name}: {exc}")
+
     if "sku" not in pilot.columns:
-        sys.exit(f"{PILOT_LIST.name} must have a 'sku' column.")
-    skus = pilot["sku"].astype(str).tolist()
+        sys.exit(f"{path.name} must have a 'sku' column.")
+
+    # SKU read as trimmed strings; blank/null rejected clearly.
+    pilot = pilot.copy()
+    pilot["sku"] = pilot["sku"].astype("string").str.strip()
+    if pilot["sku"].isna().any() or (pilot["sku"] == "").any():
+        sys.exit(f"{path.name} contains blank/empty SKU value(s).")
+    pilot["sku"] = pilot["sku"].astype(str)
+
     warnings: list[str] = []
-    if len(set(skus)) != len(skus):
-        warnings.append("pilot_skus.csv contains duplicate SKUs")
-    existing = set(pd.read_sql("SELECT sku_id FROM sku_master", con)["sku_id"])
+
+    # Duplicate SKUs: fail in strict mode, warn otherwise; never duplicate generated rows.
+    dup_mask = pilot["sku"].duplicated()
+    if dup_mask.any():
+        dups = sorted(set(pilot.loc[dup_mask, "sku"]))
+        msg = f"{path.name} contains {len(dups)} duplicate SKU(s): {dups[:5]}"
+        if strict:
+            sys.exit(f"[strict] {msg}")
+        warnings.append(msg)
+        pilot = pilot.drop_duplicates(subset="sku", keep="first").reset_index(drop=True)
+
+    skus = pilot["sku"].tolist()
+
+    # Every selected SKU must exist in sku_master (fail strict; warn + drop otherwise so
+    # the prepared panel stays consistent with the SKU list).
+    existing = set(pd.read_sql("SELECT sku_id FROM sku_master", con)["sku_id"].astype(str))
     missing = [s for s in skus if s not in existing]
     if missing:
-        warnings.append(f"{len(missing)} pilot SKUs not found in sku_master: {missing[:5]}")
+        msg = f"{len(missing)} pilot SKUs not found in sku_master: {missing[:5]}"
+        if strict:
+            sys.exit(f"[strict] {msg}")
+        warnings.append(msg)
+        pilot = pilot[~pilot["sku"].isin(missing)].reset_index(drop=True)
+        skus = pilot["sku"].tolist()
+
+    # Existing ecommerce-history coverage check (warning only, preserved).
     cov = pd.read_sql(
         f"SELECT sku, COUNT(DISTINCT transaction_date) d FROM ({_ecommerce_sales_sql(cfg)}) "
         f"GROUP BY sku", con)
-    cov = dict(zip(cov["sku"], cov["d"]))
+    cov = dict(zip(cov["sku"].astype(str), cov["d"]))
     thin = [s for s in skus if cov.get(s, 0) < cfg["pilot"]["min_history_days"]]
     if thin:
         warnings.append(f"{len(thin)} pilot SKUs have < {cfg['pilot']['min_history_days']} "
                         f"days of ecommerce history: {thin[:5]}")
-    if strict and (missing or len(set(skus)) != len(skus)):
-        sys.exit(f"[strict] pilot list invalid: {warnings}")
     return pilot, warnings
 
 
@@ -797,11 +885,12 @@ def validate_outputs(panel, ff, inv, pilot, cfg, as_of, snapshot_used_real: bool
 
 # ── manifest ──────────────────────────────────────────────────────────────────────
 def build_manifest(panel, ff, inv, pilot, cfg, args, stats, as_of,
-                   n_real_snap, n_future_excluded, warnings, problems) -> dict:
+                   n_real_snap, n_future_excluded, warnings, problems,
+                   run_meta: "dict | None" = None) -> dict:
     def rate(mask):
         return round(float(mask.mean()), 4) if len(mask) else 0.0
     real_stock_rows = int((~inv["stock_on_hand_is_synthetic"]).sum())
-    return {
+    manifest = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": args.generated_at,
         "as_of_date": as_of.date().isoformat(),
@@ -884,6 +973,12 @@ def build_manifest(panel, ff, inv, pilot, cfg, args, stats, as_of,
         "validation_status": "passed" if not problems else "failed",
         "problems": problems,
     }
+    # Run-specific metadata (pilot_file / selection_mode / counts / warehouse / accurate
+    # output_paths). Merged last so it overrides the default output_paths without
+    # removing or renaming any existing manifest field.
+    if run_meta:
+        manifest.update(run_meta)
+    return manifest
 
 
 # ── io ─────────────────────────────────────────────────────────────────────────────
@@ -927,6 +1022,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Build the daily naheed_web pilot dataset.")
     ap.add_argument("--db-path", default=str(DEFAULT_DB))
     ap.add_argument("--output-dir", default=str(DEFAULT_OUT))
+    ap.add_argument("--pilot-file", default=str(PILOT_LIST),
+                    help="Selected-SKU CSV to prepare (default: repo-root pilot_skus.csv). "
+                         "A custom path switches to dynamic mode and isolates outputs to --output-dir.")
     ap.add_argument("--start-date", default=None)
     ap.add_argument("--as-of-date", default=None, help="HARD boundary; records after this are dropped")
     ap.add_argument("--selection-cutoff", default=None, help="recorded; used with --reselect-pilot-skus")
@@ -940,6 +1038,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     args.generated_at = dt.datetime.now().isoformat(timespec="seconds")
     cfg = load_config()
     out_dir = Path(args.output_dir)
+    pilot_file = Path(args.pilot_file)
+    mode = selection_mode_for(pilot_file)          # fixed_pilot | dynamic (by resolved path)
+
+    # A custom pilot file and the legacy reselect workflow are mutually exclusive.
+    if args.reselect_pilot_skus and mode == "dynamic":
+        sys.exit("--reselect-pilot-skus cannot be combined with a custom --pilot-file. "
+                 "Reselect proposes a candidate list; --pilot-file consumes an existing one.")
 
     with open_db(Path(args.db_path)) as con:
         if args.reselect_pilot_skus:
@@ -951,7 +1056,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                   f"(review, then copy to {PILOT_LIST.name}; approved list NOT overwritten).")
             return 0
 
-        pilot, warnings = load_pilot_skus(con, cfg, args.strict)
+        pilot, warnings = load_pilot_skus(con, cfg, args.strict, pilot_file)
         panel, stats = build_model_panel(con, pilot, cfg, args.start_date, args.as_of_date)
         as_of = stats["as_of"]
         repl = stats["repl_params"]
@@ -966,8 +1071,23 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     snapshot_used_real = bool((~inv["stock_on_hand_is_synthetic"]).any())
     problems = validate_outputs(panel, ff, inv, pilot, cfg, as_of, snapshot_used_real)
+    run_meta = {
+        "pilot_file": _display_path(pilot_file),
+        "selection_mode": mode,
+        "selected_sku_count": int(panel["sku"].nunique()),
+        "selected_categories": sorted(panel["category"].dropna().unique().tolist()),
+        "source_warehouse": _display_path(args.db_path),
+        "requested_sku_count": _requested_count_from(pilot),
+        "output_paths": {
+            "model_panel": _display_path(out_dir / "model_panel.parquet"),
+            "forecast_frame": _display_path(out_dir / "forecast_frame.parquet"),
+            "inventory_context": _display_path(out_dir / "inventory_context.parquet"),
+            "manifest": _display_path(out_dir / "pilot_manifest.json"),
+        },
+    }
     manifest = build_manifest(panel, ff, inv, pilot, cfg, args, stats, as_of,
-                              n_real_snap, n_future_excluded, warnings, problems)
+                              n_real_snap, n_future_excluded, warnings, problems,
+                              run_meta=run_meta)
 
     if problems:                                   # fail loudly; do not write partial outputs
         print("VALIDATION FAILED — outputs NOT written:", *problems, sep="\n  ")

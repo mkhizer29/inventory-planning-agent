@@ -4,6 +4,7 @@ Builds a tiny temporary SQLite warehouse and exercises the scope/leakage/stock/c
 invariants from the correction brief. One file on purpose — no scatter of tiny test modules.
 """
 import copy
+import json
 import sqlite3
 import sys
 import types
@@ -420,3 +421,287 @@ def test_catalog_sale_discount(tmp_path):
     assert cart["on_promo"] == 1 and cart["discount_pct"] == pytest.approx(0.10)
     reg = panel[panel.date == "2026-03-13"].iloc[0]          # regular day
     assert reg["on_promo"] == 0 and reg["discount_pct"] == pytest.approx(0.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Phase 2 — run-specific pilot file (--pilot-file) + isolated output dir (--output-dir)
+# ══════════════════════════════════════════════════════════════════════════════════
+FILES4 = ("model_panel.parquet", "forecast_frame.parquet",
+          "inventory_context.parquet", "pilot_manifest.json")
+
+
+def _fresh_db(tmp_path: Path) -> Path:
+    db = tmp_path / "inv.db"
+    if not db.exists():
+        _make_db(db)
+    return db
+
+
+def _write_csv(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _run_prep(tmp_path: Path, pilot_csv: Path, out_name: str = "processed",
+              extra: list[str] | None = None, db: Path | None = None):
+    db = db or _fresh_db(tmp_path)
+    out_dir = tmp_path / out_name
+    argv = ["--db-path", str(db), "--pilot-file", str(pilot_csv),
+            "--output-dir", str(out_dir), "--as-of-date", AS_OF]
+    if extra:
+        argv += extra
+    rc = prep.main(argv)
+    return rc, out_dir, db
+
+
+def _manifest(out_dir: Path) -> dict:
+    return json.loads((out_dir / "pilot_manifest.json").read_text(encoding="utf-8"))
+
+
+def _read_panel(out_dir: Path) -> pd.DataFrame:
+    return pd.read_parquet(out_dir / "model_panel.parquet")
+
+
+def _snapshot_dir(d: Path):
+    if not d.exists():
+        return None
+    return {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in d.iterdir() if p.is_file()}
+
+
+# 1. default pilot path is the repo-root pilot_skus.csv
+def test_default_pilot_path_is_pilot_skus_csv():
+    args = prep.parse_args([])
+    assert Path(args.pilot_file).resolve() == prep.PILOT_LIST.resolve()
+
+
+# 2 + 22. fixed-pilot invocation still works without --pilot-file; selection_mode == fixed_pilot
+def test_fixed_pilot_without_flag_and_mode(tmp_path, monkeypatch):
+    fixed = _write_csv(tmp_path / "fixed_pilot.csv", "sku\nA\nB\nC\n")
+    monkeypatch.setattr(prep, "PILOT_LIST", fixed)          # treat this temp file as THE fixed list
+    db = _fresh_db(tmp_path)
+    out_dir = tmp_path / "processed"
+    rc = prep.main(["--db-path", str(db), "--output-dir", str(out_dir), "--as-of-date", AS_OF])
+    assert rc == 0
+    assert all((out_dir / f).exists() for f in FILES4)
+    assert _manifest(out_dir)["selection_mode"] == "fixed_pilot"
+
+
+# 3. custom pilot file with only a sku column works
+def test_custom_pilot_only_sku_column(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\nB\n")
+    rc, out_dir, _ = _run_prep(tmp_path, pilot)
+    assert rc == 0
+    assert set(_read_panel(out_dir)["sku"].unique()) == {"A", "B"}
+
+
+# 4. full Phase 1 selector schema (all extra columns) works
+def test_custom_pilot_full_selector_schema(tmp_path):
+    header = "rank,sku,sku_name,category,sub_category,brand,historical_units,active_days,history_start,history_end"
+    body = ("1,A,WRONG NAME,WrongCat,WrongSub,WrongBrand,999999,999,2000-01-01,2000-01-02\n"
+            "2,B,Other,WrongCat,,,, ,,\n")
+    pilot = _write_csv(tmp_path / "sel.csv", header + "\n" + body)
+    rc, out_dir, _ = _run_prep(tmp_path, pilot)
+    assert rc == 0
+    assert set(_read_panel(out_dir)["sku"].unique()) == {"A", "B"}
+
+
+# 5. custom file selects only its listed SKUs
+def test_custom_pilot_selects_only_listed(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\n")
+    rc, out_dir, _ = _run_prep(tmp_path, pilot)
+    assert rc == 0
+    assert set(_read_panel(out_dir)["sku"].unique()) == {"A"}
+
+
+# 6. historical_units from the CSV is NOT used as demand
+def test_csv_historical_units_not_used_as_demand(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku,historical_units\nA,999999\n")
+    rc, out_dir, _ = _run_prep(tmp_path, pilot)
+    panel = _read_panel(out_dir)
+    assert panel["units_observed"].max() < 100          # real DB demand, not the 999999 in CSV
+
+
+# 7. sku_name from the CSV is NOT used as a join key / authoritative attribute
+def test_csv_sku_name_not_authoritative(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku,sku_name\nA,TOTALLY WRONG NAME\n")
+    rc, out_dir, _ = _run_prep(tmp_path, pilot)
+    panel = _read_panel(out_dir)
+    assert panel.loc[panel["sku"] == "A", "sku_name"].iloc[0] == "Prod A"   # from sku_master
+
+
+# 8. unknown extra columns are tolerated
+def test_custom_pilot_unknown_columns_tolerated(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku,foo_bar,whatever\nA,1,x\nB,2,y\n")
+    rc, out_dir, _ = _run_prep(tmp_path, pilot)
+    assert rc == 0 and set(_read_panel(out_dir)["sku"].unique()) == {"A", "B"}
+
+
+# 9. missing pilot file fails clearly
+def test_missing_pilot_file_fails(tmp_path):
+    with pytest.raises(SystemExit):
+        _run_prep(tmp_path, tmp_path / "does_not_exist.csv")
+
+
+# 10. a directory passed as --pilot-file fails clearly
+def test_directory_pilot_file_fails(tmp_path):
+    d = tmp_path / "adir"
+    d.mkdir()
+    with pytest.raises(SystemExit):
+        _run_prep(tmp_path, d)
+
+
+# 11. missing sku column fails clearly
+def test_missing_sku_column_fails(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "product\nA\nB\n")
+    with pytest.raises(SystemExit):
+        _run_prep(tmp_path, pilot)
+
+
+# 12. blank SKU fails clearly (second column keeps the whitespace row from being skipped)
+def test_blank_sku_fails(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku,note\nA,x\n   ,y\nB,z\n")
+    with pytest.raises(SystemExit):
+        _run_prep(tmp_path, pilot)
+
+
+# 13. null SKU fails clearly
+def test_null_sku_fails(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku,category\nA,Cat1\n,Cat2\n")
+    with pytest.raises(SystemExit):
+        _run_prep(tmp_path, pilot)
+
+
+# 14. duplicate SKU: warning in non-strict, failure in strict
+def test_duplicate_sku_warn_then_strict_fail(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\nB\nA\n")
+    rc, out_dir, db = _run_prep(tmp_path, pilot)
+    assert rc == 0
+    man = _manifest(out_dir)
+    assert any("duplicate" in w.lower() for w in man["warnings"])
+    assert man["selected_sku_count"] == 2                 # deduped, not duplicated
+    with pytest.raises(SystemExit):
+        _run_prep(tmp_path, pilot, out_name="processed_strict", extra=["--strict"], db=db)
+
+
+# 15. unknown warehouse SKU: warning in non-strict, failure in strict
+def test_unknown_sku_warn_then_strict_fail(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\nB\nZZZ-NOPE\n")
+    rc, out_dir, db = _run_prep(tmp_path, pilot)
+    assert rc == 0
+    assert any("not found in sku_master" in w for w in _manifest(out_dir)["warnings"])
+    assert set(_read_panel(out_dir)["sku"].unique()) == {"A", "B"}   # unknown excluded downstream
+    with pytest.raises(SystemExit):
+        _run_prep(tmp_path, pilot, out_name="processed_strict", extra=["--strict"], db=db)
+
+
+# 16. the real repo pilot_skus.csv is never modified by a custom run
+def test_repo_pilot_skus_untouched(tmp_path):
+    before = prep.PILOT_LIST.read_bytes() if prep.PILOT_LIST.exists() else None
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\n")
+    _run_prep(tmp_path, pilot)
+    after = prep.PILOT_LIST.read_bytes() if prep.PILOT_LIST.exists() else None
+    assert before == after
+
+
+# 17. the input custom pilot file is never modified
+def test_input_pilot_file_untouched(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku,note\nA,keep\nB,keep\n")
+    before = pilot.read_bytes()
+    _run_prep(tmp_path, pilot)
+    assert pilot.read_bytes() == before
+
+
+# 18. custom output dir receives exactly the four generated files
+def test_custom_output_dir_has_four_files(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\nB\n")
+    rc, out_dir, _ = _run_prep(tmp_path, pilot)
+    assert rc == 0
+    produced = {p.name for p in out_dir.iterdir() if p.is_file()}
+    assert produced == set(FILES4)
+
+
+# 19. a custom output dir does not write to data/processed
+def test_custom_run_does_not_touch_data_processed(tmp_path):
+    before = _snapshot_dir(prep.DEFAULT_OUT)
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\nB\n")
+    _run_prep(tmp_path, pilot)
+    assert _snapshot_dir(prep.DEFAULT_OUT) == before
+
+
+# 20 + 21. two runs are isolated; the first is unchanged after the second
+def test_two_runs_isolated(tmp_path):
+    db = _fresh_db(tmp_path)
+    p1 = _write_csv(tmp_path / "s1.csv", "sku\nA\nB\n")
+    p2 = _write_csv(tmp_path / "s2.csv", "sku\nA\nB\nC\n")
+    _run_prep(tmp_path, p1, out_name="run1", db=db)
+    run1_bytes = (tmp_path / "run1" / "model_panel.parquet").read_bytes()
+    _run_prep(tmp_path, p2, out_name="run2", db=db)
+    assert set(_read_panel(tmp_path / "run1")["sku"].unique()) == {"A", "B"}
+    assert set(_read_panel(tmp_path / "run2")["sku"].unique()) == {"A", "B", "C"}
+    assert (tmp_path / "run1" / "model_panel.parquet").read_bytes() == run1_bytes
+
+
+# 23. selection_mode is dynamic for a custom file
+def test_selection_mode_dynamic(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\nB\n")
+    _, out_dir, _ = _run_prep(tmp_path, pilot)
+    assert _manifest(out_dir)["selection_mode"] == "dynamic"
+
+
+# 24 + 25. pilot_file and source_warehouse recorded in the manifest
+def test_manifest_records_paths(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\nB\n")
+    _, out_dir, db = _run_prep(tmp_path, pilot)
+    man = _manifest(out_dir)
+    assert man["pilot_file"].endswith("sel.csv")
+    assert man["source_warehouse"].endswith("inv.db")
+
+
+# 26 + 27 + 28. counts + sorted categories + null requested_sku_count
+def test_manifest_counts_categories_requested(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nB\nA\n")   # order B,A on purpose
+    _, out_dir, _ = _run_prep(tmp_path, pilot)
+    man = _manifest(out_dir)
+    assert man["selected_sku_count"] == 2
+    assert man["selected_categories"] == ["Cat1", "Cat2"]     # A->Cat1, B->Cat2, sorted
+    assert man["requested_sku_count"] is None
+
+
+# 29. schema constants remain unchanged and the produced panel matches them
+def test_schema_constants_and_columns(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\nB\n")
+    _, out_dir, _ = _run_prep(tmp_path, pilot)
+    assert list(_read_panel(out_dir).columns) == prep.MODEL_PANEL_COLS
+    assert "stock_on_hand" in prep.DEMAND_FEATURE_FORBIDDEN
+    assert "stock_on_hand" not in prep.DEMAND_FEATURE_WHITELIST
+
+
+# 30. leakage guard still holds for a dynamic-run panel
+def test_dynamic_run_is_leakage_safe(tmp_path):
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\nB\nC\n")
+    _, out_dir, _ = _run_prep(tmp_path, pilot)
+    panel = _read_panel(out_dir)
+    panel["date"] = pd.to_datetime(panel["date"])
+    ev.assert_synthetic_independence(panel, horizon=14)      # raises on leakage
+    assert panel["date"].max() <= pd.Timestamp(AS_OF)        # no demand after as_of
+
+
+# 31. --reselect-pilot-skus behavior unchanged (writes a candidate list, approved list untouched)
+def test_reselect_still_works(tmp_path, monkeypatch):
+    db = _fresh_db(tmp_path)
+    cand = tmp_path / "candidate.csv"
+    monkeypatch.setattr(prep, "CANDIDATE_LIST", cand)         # keep the repo clean
+    rc = prep.main(["--db-path", str(db), "--reselect-pilot-skus",
+                    "--selection-cutoff", AS_OF])
+    assert rc == 0 and cand.exists()
+    cols = pd.read_csv(cand).columns.tolist()
+    assert cols == ["sku", "category", "brand", "name", "units"]
+
+
+# 32. --reselect-pilot-skus + a custom --pilot-file is rejected
+def test_reselect_plus_custom_pilot_rejected(tmp_path):
+    db = _fresh_db(tmp_path)
+    pilot = _write_csv(tmp_path / "sel.csv", "sku\nA\n")
+    with pytest.raises(SystemExit):
+        prep.main(["--db-path", str(db), "--reselect-pilot-skus",
+                   "--selection-cutoff", AS_OF, "--pilot-file", str(pilot)])
