@@ -38,3 +38,6 @@ data/processed/*
 # model scorecard results (keep the folder via .gitkeep, ignore the CSVs)
 outputs/*.csv
 !outputs/.gitkeep
+
+# Phase 4 orchestrator run directories (isolated per-run artifacts)
+runs/
