@@ -1,0 +1,5 @@
+# Inventory Planning Agent — Demand Forecasting (Layer 3) extra dependencies
+# Install alongside the root requirements.txt (pandas/numpy/PyMySQL/python-dotenv
+# already covered there): pip install -r requirements.txt -r forecasting/requirements.txt
+lightgbm==4.7.0
+scikit-learn==1.6.1
