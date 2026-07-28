@@ -1,0 +1,31 @@
+﻿rank,category,sku_id,name,brand,units,revenue,lines,weeks_sold
+1,Groceries & Pets,IC-1055803,Naheed Sugar Danedar Special 1 K,Naheed,11818,3207385,5722,27
+2,Groceries & Pets,IC-1018771,Nestle Nesvita Low Fat Milk 200m,Nestle,6215,922770,704,27
+3,Groceries & Pets,IC-1053521,Nestle Pure Life Drinking Water ,Nestle,4553,606565,449,26
+4,Groceries & Pets,IC-1147930,Nestle Pure Life Drinking Water ,Nestle,4278,237330,154,25
+5,Groceries & Pets,IC-1032718,"Candyland Chili Mili Jelly, Fun ",Candyland,4191,63410,878,27
+6,Groceries & Pets,IC-1166005,Dayfresh Lactose Free Milk 200ml,Dayfresh,3393,507700,404,27
+7,Groceries & Pets,IC-1138507,"Knorr Noodles Chatt Patta, 66g, ",Knorr,3303,1002415,2837,27
+8,Groceries & Pets,IC-1116441,Day Fresh Full Cream Milk 235ml,Day Fresh,3085,467500,389,27
+9,Groceries & Pets,IC-1053526,Nestle Pure Life Drinking Water ,Nestle,3083,256080,259,25
+10,Groceries & Pets,IC-1057685,Masafi Pure Drinking Water 500ml,Masafi,2762,559870,168,20
+11,Groceries & Pets,IC-1133439,Aquafina Water 6 Litre,Aquafina,2682,938000,973,27
+12,Groceries & Pets,IC-1018988,Olper's Milk 1000ml,Engro Foods,2680,1265020,1108,25
+13,Groceries & Pets,IC-1037570,Rose Petal Pop Up Tissue,Rose Petal,2451,952200,1422,27
+14,Groceries & Pets,IC-1177117,Samyang Carbo Hot Chicken Flavor,Samyang,2436,1622600,2027,26
+15,Groceries & Pets,IC-1005194,"Kolson Potato Sticks, Pepper & S",Kolson,2424,75000,1086,27
+1,Health & Beauty,IC-1044359,"Tinkle Women Eyebrow Razor, 3 Pi",Tinkle,3396,738730,3338,27
+2,Health & Beauty,IC-1088406,Maybelline New York Colossal Kaj,Maybelline New York,1936,1921272,1984,27
+3,Health & Beauty,IC-1134493,Maybelline New York Baby Skin Li,Maybelline New York,1708,4952766,2333,23
+4,Health & Beauty,IC-1166220,Neutrogena Hydro Boost Water Gel,Neutrogena,1418,6002880,1799,27
+5,Health & Beauty,IC-1001018,Maybelline New York Volum' Expre,Maybelline New York,1346,2139194,1086,15
+6,Health & Beauty,IC-1178594,Maybelline Fit Me Matte + Porele,Maybelline New York,1184,2264760,1068,27
+7,Health & Beauty,IC-1166218,Neutrogena Hydro Boost Cleanser ,Neutrogena,1081,4473600,1346,27
+8,Health & Beauty,IC-1178591,Maybelline Fit Me Matte + Porele,Maybelline New York,1009,1810491,828,27
+9,Health & Beauty,IC-1185817,Garnier Skin Active Hydra Bomb U,Garnier,919,775942,610,17
+10,Health & Beauty,IC-1094191,Calypso Passion Bath Flower Loof,Calypso,837,384575,1084,27
+11,Health & Beauty,IC-1020926,Pears Transparent Soap With Natu,Pears,784,548780,593,24
+12,Health & Beauty,IC-1097379,Simple Kind To Skin Refreshing F,Simple,783,1320375,970,24
+13,Health & Beauty,IC-1044104,Butterfly Breathables Ultra Thin,Butterfly,771,482880,614,26
+14,Health & Beauty,IC-1042719,Tibet Snow Cream,Tibet,770,236000,795,27
+15,Health & Beauty,IC-1172128,OGX Thick & Full + Biotin & Coll,OGX,766,2469226,968,27
