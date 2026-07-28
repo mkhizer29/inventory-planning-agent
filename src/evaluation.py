@@ -33,15 +33,28 @@ SYNTHETIC_STOCK_COLS = (
 )
 
 
-# ── loaders (repo-root relative) ────────────────────────────────────────────────
-def load_model_panel() -> pd.DataFrame:
-    df = pd.read_parquet(PROC / "model_panel.parquet")
+# ── loaders (repo-root relative by default; run-aware when a path is supplied) ──────
+def _resolve_input(path, default: Path) -> Path:
+    """None -> the default data/processed file; otherwise use the given path exactly.
+    Validates that the resolved path exists and is a regular file."""
+    p = default if path is None else Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"input file not found: {p}")
+    if not p.is_file():
+        raise ValueError(f"input path is not a regular file: {p}")
+    return p
+
+
+def load_model_panel(path: "str | Path | None" = None) -> pd.DataFrame:
+    """Load model_panel.parquet. None -> data/processed/model_panel.parquet; else use `path`."""
+    df = pd.read_parquet(_resolve_input(path, PROC / "model_panel.parquet"))
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["sku", "channel", "date"]).reset_index(drop=True)
 
 
-def load_forecast_frame() -> pd.DataFrame:
-    df = pd.read_parquet(PROC / "forecast_frame.parquet")
+def load_forecast_frame(path: "str | Path | None" = None) -> pd.DataFrame:
+    """Load forecast_frame.parquet. None -> data/processed/forecast_frame.parquet; else use `path`."""
+    df = pd.read_parquet(_resolve_input(path, PROC / "forecast_frame.parquet"))
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["sku", "channel", "date"]).reset_index(drop=True)
 
@@ -161,13 +174,20 @@ def _grouped(df: pd.DataFrame, by: str | None) -> dict:
     return {k: block(g) for k, g in df.groupby(by)}
 
 
-def evaluate(preds: pd.DataFrame, horizon: int = 14, panel: pd.DataFrame | None = None) -> dict:
+def evaluate(preds: pd.DataFrame, horizon: int = 14, panel: pd.DataFrame | None = None,
+             panel_path: "str | Path | None" = None) -> dict:
     """Score demand predictions against internal REAL test truth for `horizon`.
 
     "Real historical sales backtesting". `preds` needs [sku, channel, date, y_pred];
     optional [lower_bound, upper_bound]. Raises ValueError on any invalid submission.
+
+    Panel source (mutually exclusive): pass `panel` (an in-memory frame), OR
+    `panel_path` (a run-specific model_panel.parquet), OR neither for the legacy
+    data/processed default. Truth is always rebuilt privately from the panel.
     """
-    panel = load_model_panel() if panel is None else panel
+    if panel is not None and panel_path is not None:
+        raise ValueError("pass at most one of `panel` or `panel_path`, not both.")
+    panel = load_model_panel(panel_path) if panel is None else panel
     assert_synthetic_independence(panel, horizon)     # runtime leakage guard
     cutoff, train, test = backtest_split(panel, horizon)
     truth = _truth_for(test)
