@@ -138,6 +138,7 @@ def _run_record(run_dir: Path) -> dict:
         "dataset_fingerprint": manifest.get("dataset_fingerprint"),
         "duration_seconds": manifest.get("duration_seconds"),
         "error_message": status.get("error_message"),
+        "decisioning_status": manifest.get("decisioning_status"),
     }
     rec["is_terminal"] = state in TERMINAL_STATES
     rec["is_completed"] = state in ("completed", "completed_with_warnings")
@@ -201,7 +202,15 @@ def resolve_run_context(run_record: dict) -> dict:
         "future_baseline": outputs / "future_forecast_baseline.parquet",
         "future_holtwinters": outputs / "future_forecast_holtwinters.parquet",
         "future_lightgbm": outputs / "future_forecast_lightgbm.parquet",
+        # Phase B decision artifacts (OPTIONAL — absent on runs created before Phase B)
+        "decisions_dir": run_dir / "decisions",
+        "stockout_risk": run_dir / "decisions" / "stockout_risk.parquet",
+        "stockout_trajectory": run_dir / "decisions" / "stockout_trajectory.parquet",
     }
+    # availability flags let the UI show a graceful "unavailable" notice for older runs
+    ctx["has_stockout_risk"] = ctx["stockout_risk"].exists()
+    ctx["has_stockout_trajectory"] = ctx["stockout_trajectory"].exists()
+    ctx["decisioning_status"] = run_record.get("decisioning_status")
     required = ["model_panel", "forecast_frame", "inventory_context", "pilot_manifest",
                "combined_scorecard", "model_ranking", "selected_forecasts", "run_manifest"]
     for key, p in ctx.items():
@@ -225,6 +234,9 @@ def legacy_context() -> dict:
         "pilot_manifest": proc / "pilot_manifest.json",
         "combined_scorecard": None, "model_ranking": None, "selected_forecasts": None,
         "run_manifest": None,
+        # Phase B is run-scoped; the legacy fixed-pilot context never has decision artifacts
+        "decisions_dir": None, "stockout_risk": None, "stockout_trajectory": None,
+        "has_stockout_risk": False, "has_stockout_trajectory": False, "decisioning_status": None,
     }
 
 
@@ -459,6 +471,103 @@ def format_run_label(record: dict) -> str:
     cat = record.get("category") or "?"
     topn = record.get("top_n")
     return f"{when} · {cat} · Top {topn} · {record.get('status')}"
+
+
+# ── Phase B stockout-risk: pure dashboard helpers (no Streamlit) ─────────────────────────
+# Severity ordering for the priority queue. `unknown` is LAST and is deliberately kept
+# separate from healthy/low — an un-assessable SKU is not "safe".
+# "medium" is the engine's emitted tier; "watch" is the display synonym — both rank together.
+RISK_TIER_SEVERITY = {"critical": 0, "high": 1, "watch": 2, "medium": 2,
+                      "low": 3, "healthy": 3, "unknown": 4}
+# Display tone per tier (maps to the dashboard TONES / semantic colors). unknown -> slate.
+RISK_TIER_TONE = {"critical": "red", "high": "amber", "watch": "blue", "medium": "blue",
+                  "low": "success", "healthy": "success", "unknown": "slate"}
+
+
+def risk_severity_rank(tier) -> int:
+    """Lower = more urgent. Unknown ranks last (4), never as healthy."""
+    return RISK_TIER_SEVERITY.get(str(tier).strip().lower(), 4)
+
+
+def risk_tier_tone(tier) -> str:
+    return RISK_TIER_TONE.get(str(tier).strip().lower(), "slate")
+
+
+def full_product_label(name, sku) -> str:
+    """Complete, never-truncated 'Name (SKU)' label for tooltips / deep-dive headings.
+    Falls back to the SKU alone when no distinct name is available."""
+    nm = None if (name is None or (isinstance(name, float) and pd.isna(name))) else str(name).strip()
+    if nm and nm != str(sku):
+        return f"{nm} ({sku})"
+    return str(sku)
+
+
+def sort_risk_queue(df: pd.DataFrame) -> pd.DataFrame:
+    """Deterministic priority order: severity, then P(stockout) desc, projected date asc
+    (nulls last), revenue-at-risk desc, product name asc. Never mutates the input."""
+    if df is None or df.empty:
+        return df.copy() if df is not None else df
+    d = df.copy()
+    d["_sev"] = d["overall_risk_tier"].map(risk_severity_rank)
+    d["_prob"] = pd.to_numeric(d.get("stockout_probability"), errors="coerce").fillna(-1.0)
+    proj = pd.to_datetime(d.get("projected_stockout_date"), errors="coerce")
+    # method="min" keeps equal dates tied so the later keys (revenue desc, name asc) break
+    # the tie deterministically; na_option="bottom" ranks null projected dates last.
+    d["_projkey"] = proj.rank(method="min", na_option="bottom")            # ascending, nulls last
+    d["_rev"] = pd.to_numeric(d.get("estimated_revenue_at_risk"), errors="coerce").fillna(-1.0)
+    d["_name"] = (d["sku_name"].astype(str) if "sku_name" in d.columns else d["sku"].astype(str))
+    d = d.sort_values(by=["_sev", "_prob", "_projkey", "_rev", "_name"],
+                      ascending=[True, False, True, False, True], kind="mergesort")
+    return d.drop(columns=["_sev", "_prob", "_projkey", "_rev", "_name"]).reset_index(drop=True)
+
+
+def filter_risk_queue(df: pd.DataFrame, *, tier=None, query=None,
+                      projected_only: bool = False, review_only: bool = False) -> pd.DataFrame:
+    """Apply the compact queue filters. `tier` None/'all' keeps all tiers; `query` matches
+    SKU or product name (case-insensitive substring). Never mutates the input."""
+    if df is None or df.empty:
+        return df.copy() if df is not None else df
+    d = df
+    if tier and str(tier).strip().lower() not in ("all", ""):
+        d = d[d["overall_risk_tier"].astype(str).str.lower() == str(tier).strip().lower()]
+    if query and str(query).strip():
+        q = str(query).strip().lower()
+        mask = d["sku"].astype(str).str.lower().str.contains(q, regex=False)
+        if "sku_name" in d.columns:
+            mask = mask | d["sku_name"].astype(str).str.lower().str.contains(q, regex=False, na=False)
+        d = d[mask]
+    if projected_only:
+        d = d[d["projected_stockout_date"].notna()]
+    if review_only:
+        d = d[d["manual_review_required"].astype(bool)]
+    return d.reset_index(drop=True)
+
+
+def risk_revenue_at_risk_total(df: pd.DataFrame) -> tuple[float, int]:
+    """(sum of non-null estimated_revenue_at_risk, count of SKUs with a null value).
+    Null revenue is NEVER treated as zero in the sum."""
+    if df is None or df.empty or "estimated_revenue_at_risk" not in df.columns:
+        return 0.0, 0
+    s = pd.to_numeric(df["estimated_revenue_at_risk"], errors="coerce")
+    return float(s.dropna().sum()), int(s.isna().sum())
+
+
+def trajectory_for_sku(traj: pd.DataFrame, sku: str, horizon: "int | None" = None
+                       ) -> tuple[pd.DataFrame, list[str]]:
+    """Filter a trajectory frame to ONE sku and (optionally) the active horizon, sorted by
+    date. De-duplicates any repeated (sku, date) rows with an explicit warning. Returns
+    (frame, warnings)."""
+    warnings: list[str] = []
+    if traj is None or traj.empty:
+        return (traj.copy() if traj is not None else pd.DataFrame()), warnings
+    d = traj[traj["sku"].astype(str) == str(sku)].copy()
+    d["date"] = pd.to_datetime(d["date"])
+    if horizon is not None and "forecast_horizon_day" in d.columns:
+        d = d[pd.to_numeric(d["forecast_horizon_day"], errors="coerce") <= int(horizon)]
+    if d.duplicated(["sku", "date"]).any():
+        warnings.append(f"duplicate (sku, date) trajectory rows for {sku} were de-duplicated")
+        d = d.drop_duplicates(["sku", "date"], keep="first")
+    return d.sort_values("date").reset_index(drop=True), warnings
 
 
 def tail_log(path: "str | Path", max_lines: int = 200) -> str:

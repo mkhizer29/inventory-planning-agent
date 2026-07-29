@@ -689,3 +689,39 @@ def test_independent_output_validation_catches_bad_future(tmp_path, monkeypatch)
     m = _run(tmp_path, monkeypatch, run_id="badhwfut")
     assert m["status"] == "failed"
     assert any("holtwinters" in e for e in m["errors"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Phase B — forecast-driven stockout risk
+# ══════════════════════════════════════════════════════════════════════════════════
+def test_phase_b_writes_artifacts_and_manifest(good):
+    rd, m = good["run_dir"], good["manifest"]
+    assert (rd / "decisions" / "stockout_risk.parquet").exists()
+    assert (rd / "decisions" / "stockout_trajectory.parquet").exists()
+    assert m["status"] == "completed"
+    assert m["decisioning_status"] == "completed"
+    assert m["stockout_risk_file"] == "decisions/stockout_risk.parquet"
+    assert m["stockout_trajectory_file"] == "decisions/stockout_trajectory.parquet"
+    assert m["stockout_validation_summary"]["risk_rows"] >= 1
+    risk = pd.read_parquet(rd / "decisions" / "stockout_risk.parquet")
+    assert "y_true" not in risk.columns and "units_observed" not in risk.columns
+    sel = pd.read_parquet(rd / "selected_forecasts.parquet")
+    assert len(risk) == sel[["sku", "channel"]].drop_duplicates().shape[0]      # one row per selected key
+    inv_paths = {a["path"] for a in m["artifact_inventory"]}
+    assert {"decisions/stockout_risk.parquet", "decisions/stockout_trajectory.parquet"} <= inv_paths
+
+
+def test_phase_b_failure_fails_whole_run_even_partial(tmp_path, monkeypatch):
+    install_fakes(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("phase b boom")
+
+    monkeypatch.setattr(orch.stockout_risk, "compute_stockout_risk", _boom)
+    # allow_partial_success tolerates a MODEL failure, but NEVER a Phase B failure
+    m = _run(tmp_path, monkeypatch, run_id="pbfail", allow_partial_success=True)
+    assert m["status"] == "failed"
+    assert any("stockout" in e.lower() for e in m["errors"])
+    status = json.loads((tmp_path / "runs" / "pbfail" / "status.json").read_text())
+    assert status["status"] == "failed"
+    assert m.get("decisioning_status") in (None, "failed")

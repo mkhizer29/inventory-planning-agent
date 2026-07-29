@@ -148,3 +148,27 @@ synthetic_stock:
   default_lead_time_days: 7     # used when a SKU has no real lead time
   default_moq: 1                # minimum order quantity when a SKU has no real MOQ
   default_pack_size: 1          # rounding multiple when a SKU has no real pack size
+
+# ---- Phase B decisioning (forecast-driven stockout risk) — PILOT POLICIES ------------
+# These are CONFIGURABLE PILOT POLICIES, not verified supplier facts. They turn the
+# selected demand forecast + current inventory context into an auditable stockout-risk
+# view. Lead time / MOQ / pack size remain assumptions from the ETL (see replenishment/
+# synthetic_stock). Nothing here creates purchase orders or classifies real stockouts.
+decisioning:
+  default_service_level: 0.95        # used when the channel has no configured service level
+  prefer_channel_service_level: true # prefer channels.master.<channel>.service_level_target when present
+  min_residual_observations: 7       # per-SKU residuals below this fall back to pooled same-model residuals
+  # Stockout-probability risk tiers (probability of running out within the lead-time window).
+  probability_thresholds:
+    critical: 0.80                   # P(stockout) >= 0.80
+    high: 0.50                       # >= 0.50
+    medium: 0.20                     # >= 0.20; else Low
+  # Forecast days-of-cover risk tiers (days of stock left at mean forecast demand).
+  cover_thresholds_days:
+    critical: 2                      # < 2 days
+    high: 5                          # < 5 days
+    medium: 10                       # < 10 days; else Low
+  # ASSUMPTION: daily forecast errors are treated as INDEPENDENT, so cumulative variance is
+  # the sum of daily variances (cumulative sigma = root-sum-of-squares of daily sigmas).
+  # Real demand errors are often autocorrelated; this is a documented pilot simplification.
+  independent_daily_errors_rss: true

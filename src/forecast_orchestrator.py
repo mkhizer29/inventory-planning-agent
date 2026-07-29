@@ -47,6 +47,8 @@ import prepare_pilot_data as prep    # noqa: E402
 import baselines                     # noqa: E402
 import holtwinters                   # noqa: E402
 import lgbm_global                   # noqa: E402
+import stockout_risk                 # noqa: E402  (Phase B — forecast-driven stockout risk)
+import decision_contract as dc       # noqa: E402
 
 DEFAULT_DB = REPO_ROOT / "inventory_etl" / "output" / "inventory.db"
 MODEL_ORDER = ("baseline", "holtwinters", "lightgbm")
@@ -74,7 +76,7 @@ MODEL_ARTIFACTS: dict[str, dict[str, str]] = {
 STEP_PROGRESS = {
     "created": 0, "selecting_skus": 10, "preparing_data": 25,
     "running_baseline": 40, "running_holtwinters": 55, "running_lightgbm": 70,
-    "validating_outputs": 85, "ranking_models": 92,
+    "validating_outputs": 85, "ranking_models": 92, "calculating_stockout_risk": 96,
     "completed": 100, "completed_with_warnings": 100, "failed": 100,
 }
 
@@ -485,6 +487,27 @@ def _select_operational_forecast(ranking: pd.DataFrame, req: dict, proc: Path, o
     return meta, fut2
 
 
+# ── Phase B decision-artifact validation ─────────────────────────────────────────────────
+def _validate_decision_artifacts(run_dir: Path, logger: logging.Logger) -> None:
+    """Independently re-load and validate the Phase B artifacts against the decision contract.
+    Raises RuntimeError on any missing/invalid artifact (fatal — a completed run must have them)."""
+    dec = run_dir / "decisions"
+    risk_p, traj_p = dec / "stockout_risk.parquet", dec / "stockout_trajectory.parquet"
+    for p in (risk_p, traj_p):
+        if not p.exists():
+            raise RuntimeError(f"Phase B did not write required decision artifact: {p.name}")
+    run_id = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))["run_id"]
+    sel = pd.read_parquet(run_dir / "selected_forecasts.parquet")
+    risk = pd.read_parquet(risk_p)
+    traj = pd.read_parquet(traj_p)
+    if "y_true" in risk.columns or "units_observed" in risk.columns \
+            or "y_true" in traj.columns or "units_observed" in traj.columns:
+        raise RuntimeError("Phase B decision artifact contains a truth column")
+    dc.validate_stockout_risk(risk, sel[["sku", "channel"]].drop_duplicates(), run_id)
+    dc.validate_stockout_trajectory(traj, sel[["sku", "channel", "date"]].drop_duplicates(), run_id)
+    logger.info("Phase B artifacts validated: %d risk rows, %d trajectory rows", len(risk), len(traj))
+
+
 # ── artifact inventory + manifest ──────────────────────────────────────────────────────
 _MUTABLE = {"pipeline.log", "status.json", "run_manifest.json"}
 
@@ -549,6 +572,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
     failed: list[str] = []
     combined = ranking = None
     op_meta: dict = {}
+    decision_summary = None
     sel_df = None
 
     def _fail(err_type: str, msg: str) -> dict:
@@ -560,7 +584,8 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
         errors.append(f"{err_type}: {msg}")
         return _finalize(run_dir, req, request_json, created_at, "failed", status,
                          sel_df, selection_warning, completed, failed, req["skip_models"],
-                         combined, ranking, op_meta, errors, logger, handler)
+                         combined, ranking, op_meta, errors, logger, handler,
+                         decision_summary=decision_summary)
 
     try:
         # 1) selection
@@ -617,6 +642,19 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
         logger.info("ranking:\n%s", ranking.to_string(index=False))
         op_meta, _sel_fc = _select_operational_forecast(ranking, req, proc, outputs, run_dir, logger)
 
+        # 6) Phase B — forecast-driven stockout risk. ALWAYS fatal on failure (even under
+        # allow_partial_success): a completed run MUST have valid decision artifacts.
+        _set_step(run_dir, status, "calculating_stockout_risk", logger)
+        try:
+            decision_summary = stockout_risk.compute_stockout_risk(
+                run_dir, operational_model=op_meta["operational_model"],
+                operational_horizon=int(op_meta["operational_horizon"]), logger=logger)
+            _validate_decision_artifacts(run_dir, logger)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Phase B failed: %s\n%s", exc, traceback.format_exc())
+            return _fail("stockout_risk_failed",
+                         f"Phase B stockout-risk failed: {type(exc).__name__}: {exc}")
+
         final_status = "completed_with_warnings" if failed else "completed"
         status["status"] = final_status; status["current_step"] = final_status
         status["completed_at"] = _now()
@@ -624,7 +662,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
         return _finalize(run_dir, req, request_json, created_at, final_status, status,
                          sel_df, selection_warning, completed, failed, req["skip_models"],
                          combined, ranking, op_meta, errors, logger, handler,
-                         fingerprint=fingerprint)
+                         fingerprint=fingerprint, decision_summary=decision_summary)
     except RequestError:
         raise
     except Exception as exc:  # noqa: BLE001 — any post-dir error becomes a failed manifest, never a raise
@@ -633,7 +671,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
 
 def _finalize(run_dir, req, request_json, created_at, final_status, status, sel_df,
               selection_warning, completed, failed, skipped, combined, ranking, op_meta,
-              errors, logger, handler, fingerprint=None) -> dict:
+              errors, logger, handler, fingerprint=None, decision_summary=None) -> dict:
     # success/failure timestamp semantics (mirror status.json): completed_at is set only on
     # success and null on failure; failed_at is set only on failure and null on success.
     end_ts = _now()
@@ -667,6 +705,17 @@ def _finalize(run_dir, req, request_json, created_at, final_status, status, sel_
         "winners_by_horizon": op_meta.get("winners_by_horizon"),
         "operational_horizon": op_meta.get("operational_horizon"),
         "operational_model": op_meta.get("operational_model"),
+        # Phase B — forecast-driven stockout risk
+        "decisioning_status": (decision_summary or {}).get("decisioning_status"),
+        "stockout_risk_file": (decision_summary or {}).get("stockout_risk_file"),
+        "stockout_trajectory_file": (decision_summary or {}).get("stockout_trajectory_file"),
+        "stockout_validation_summary": ({
+            "risk_rows": decision_summary.get("risk_rows"),
+            "trajectory_rows": decision_summary.get("trajectory_rows"),
+            "risk_tier_counts": decision_summary.get("risk_tier_counts"),
+            "manual_review_count": decision_summary.get("manual_review_count"),
+            "uncertainty_methods": decision_summary.get("uncertainty_methods"),
+        } if decision_summary else None),
         "model_metrics": _model_metrics(combined),
         "validation_summary": {
             "fingerprints_match": fingerprint is not None,

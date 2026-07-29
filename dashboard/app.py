@@ -649,6 +649,15 @@ else:
 stockout_raw, stockout_status = load_stockout_scenarios()
 replen_raw, replen_status = load_replenishment_events()
 simparams_raw, simparams_status = load_simulation_parameters()
+# Phase B decision artifacts (run-scoped; absent on legacy or pre-Phase-B runs)
+if DATA_MODE == "run" and CTX.get("has_stockout_risk"):
+    risk_raw, risk_status = load_active(CTX["stockout_risk"])
+else:
+    risk_raw, risk_status = None, "unavailable"
+if DATA_MODE == "run" and CTX.get("has_stockout_trajectory"):
+    traj_raw, traj_status = load_active(CTX["stockout_trajectory"])
+else:
+    traj_raw, traj_status = None, "unavailable"
 outputs_forecasts, outputs_evaluations = discover_outputs(
     str(CTX["outputs_dir"]) if DATA_MODE == "run" else None)
 
@@ -728,7 +737,7 @@ NAV_ITEMS = [
     ("Forecast Runs", "rocket_launch"),
     ("Forecast Explorer", "auto_graph"),
     ("Inventory & Reorder", "inventory_2"),
-    ("Stockout Scenario Lab", "science"),
+    ("Stockout Risk", "crisis_alert"),
     ("Data Quality & Assumptions", "fact_check"),
 ]
 PAGES = [name for name, _ in NAV_ITEMS]
@@ -792,13 +801,7 @@ if mp_raw is not None:
                  "using only the selected products (they are combined into one total). Blank = all.",
             key="flt_skus")
         sel_brands = st.multiselect("Brand (blank = all)", options=all_brands, default=[], key="flt_brands")
-        scenario_available = stockout_raw is not None and "scenario" in (stockout_raw.columns if stockout_raw is not None else [])
-        scenario_options = sorted(stockout_raw["scenario"].unique().tolist()) if scenario_available else SCENARIO_NAMES
-        sel_scenario = st.selectbox(
-            "Scenario", options=scenario_options, key="flt_scenario",
-            disabled=not scenario_available,
-            help=None if scenario_available else "No synthetic scenario data generated yet for this pilot.",
-        )
+    sel_scenario = None      # retired: synthetic Scenario Lab replaced by forecast-driven Stockout Risk
 else:
     all_skus, all_categories, all_brands = [], [], []
     sel_categories, sel_brands, sel_skus = [], [], []
@@ -1506,230 +1509,605 @@ def page_inventory_reorder():
 # ==========================================================================
 # PAGE 5 — STOCKOUT SCENARIO LAB
 # ==========================================================================
-def page_stockout_lab():
-    render_page_header("Stockout Scenario Lab", "What-if simulation · fully synthetic scenario results",
-                       badges=ACTIVE_BADGES)
-    synthetic_warning(
-        "This entire page is synthetic and scenario-based. Rates shown are simulation outputs for pilot planning "
-        "— not observed or predicted real-world probabilities."
-    )
+def page_stockout_risk():
+    # ------------------------------------------------------------------
+    # Display-only helpers. This page ONLY reads validated decision
+    # artifacts — it never recomputes risk, tiers, probabilities or money.
+    # ------------------------------------------------------------------
+    TIER_HEX = {"critical": COLORS["red"], "high": COLORS["amber"], "medium": COLORS["blue"],
+                "watch": COLORS["blue"], "low": COLORS["success"], "healthy": COLORS["success"],
+                "unknown": COLORS["slate"]}
 
-    if stockout_raw is None or replen_raw is None:
+    def _tier_hex(t):
+        return TIER_HEX.get(str(t).strip().lower(), COLORS["slate"])
+
+    def _tier_class(t):
+        t = str(t).strip().lower()
+        if t == "medium":
+            return "watch"
+        return t if t in ("critical", "high", "watch", "low", "healthy", "unknown") else "unknown"
+
+    def _tier_chip(t):
+        label = str(t).strip().capitalize() or "Unknown"
+        return f'<span class="ipa-rtier ipa-rtier-{_tier_class(t)}">{label}</span>'
+
+    def _esc(x):
+        return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _safe_key(x):
+        return "".join(c if c.isalnum() else "-" for c in str(x))
+
+    def _help(txt, defn):
+        return f'<span title="{_esc(defn)}">{txt}</span>'
+
+    def _date_str(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return "—"
+        try:
+            d = pd.to_datetime(x)
+            return "—" if pd.isna(d) else d.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            s = str(x).strip()
+            return s if s and s.lower() not in ("nat", "nan", "none") else "—"
+
+    def _flags_to_list(flags):
+        if flags is None:
+            return []
+        if isinstance(flags, (list, tuple, np.ndarray)):
+            return [str(x).strip() for x in list(flags) if str(x).strip()]
+        if isinstance(flags, float) and pd.isna(flags):
+            return []
+        s = str(flags).strip()
+        if not s or s.lower() in ("nan", "none", "[]"):
+            return []
+        try:
+            v = json.loads(s)
+            if isinstance(v, list):
+                return [str(x).strip() for x in v if str(x).strip()]
+        except (ValueError, TypeError):
+            pass
+        for sep in ("|", ";", ","):
+            if sep in s:
+                return [p.strip() for p in s.split(sep) if p.strip()]
+        return [s]
+
+    def _flag_pretty(f):
+        return _esc(str(f).replace("_", " ").strip().capitalize())
+
+    def _meta_val(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        s = str(x).strip()
+        return s if s and s.lower() not in ("nan", "none") else None
+
+    # ------------------------------------------------------------------
+    # Header (dynamic badges + a visible, non-expander assumptions notice)
+    # ------------------------------------------------------------------
+    badges = None
+    if DATA_MODE == "run" and ACTIVE_RUN:
+        n_sel = ACTIVE_RUN.get("selected_sku_count")
+        cat = ACTIVE_RUN.get("category") or "All categories"
+        asof_raw = ACTIVE_RUN.get("as_of_date")
+        asof = rs.format_local_datetime(asof_raw, include_time=False) if asof_raw else "—"
+        opm = ACTIVE_RUN.get("operational_model") or "—"
+        dstat = ACTIVE_RUN.get("decisioning_status") or (
+            "ready" if CTX.get("has_stockout_risk") else "unavailable")
+        badges = [
+            ("box", f"{n_sel if n_sel is not None else '—'} selected SKUs"),
+            ("tag", str(cat)),
+            ("calendar", f"As-of {asof}"),
+            ("layers", f"Model: {opm}"),
+            ("shield-check", f"Decisioning: {dstat}"),
+        ]
+    render_page_header(
+        "Stockout Risk",
+        "Forecast-driven inventory exposure · lead-time demand · projected stockout probability",
+        badges=badges)
+
+    # ------------------------------------------------------------------
+    # Run-scoped guards → polished empty states (legacy + old runs)
+    # ------------------------------------------------------------------
+    if DATA_MODE != "run":
         empty_state(
-            "Stockout scenario simulation not generated yet",
-            "This page needs data/synthetic/stockout_scenarios.parquet, replenishment_events.parquet and "
-            "simulation_parameters.json. None have been generated for this pilot yet — the page will populate "
-            "automatically once they are added.",
-            "flask",
-        )
-        section_title("Planned Scenarios", "Names only; no simulated numbers are shown until data is generated.")
-        cols = st.columns(4)
-        for i, name in enumerate(SCENARIO_NAMES):
-            with cols[i % 4]:
-                html = (
-                    '<div class="ipa-card" style="opacity:0.6; align-items:center; text-align:center; min-height:110px;">'
-                    f'<div style="color:{COLORS["subtext"]};">{icon_svg("flask", 22)}</div>'
-                    f'<div style="font-weight:700; color:{COLORS["navy"]}; margin-top:6px;">{name}</div>'
-                    '<div class="ipa-kpi-sub">Pending data generation</div>'
-                    '</div>'
-                )
-                st.markdown(html, unsafe_allow_html=True)
+            "Stockout risk is forecast-run scoped",
+            "Generate and activate a completed forecast run to view forecast-driven stockout risk. "
+            "The legacy fixed pilot does not carry the validated decision artifacts this page reads.",
+            "package-search")
+        return
+    if not CTX.get("has_stockout_risk") or risk_raw is None:
+        empty_state(
+            "No decision artifacts for this run",
+            "Generate and activate a completed forecast run to view forecast-driven stockout risk. "
+            "This run was produced before Phase B decisioning, so it carries no stockout-risk artifacts to read.",
+            "package-search")
         return
 
-    d = stockout_raw
-    if sel_scenario and "scenario" in d.columns:
-        d = d[d["scenario"] == sel_scenario]
-    if sel_skus and "sku" in d.columns:
-        d = d[d["sku"].isin(sel_skus)]
+    # Read-only copy of the validated artifact, narrowed to the sidebar product filter
+    risk = risk_raw.copy()
+    if sel_skus:
+        risk = risk[risk["sku"].astype(str).isin([str(s) for s in sel_skus])]
+    if risk.empty:
+        empty_state("No SKUs in the current filter",
+                    "Clear the product filter in the sidebar to see the full stockout-risk queue.",
+                    "search")
+        return
 
-    section_title("Scenario Outcomes", f"Selected scenario: {sel_scenario}")
-    kpi_map = {
-        "stockout_rate": "Stockout Rate", "stockout_within_2d": "Stockout Within 2 Days",
-        "stockout_within_7d": "Stockout Within 7 Days", "lost_sales_days": "Lost-Sales Days",
-        "lost_sales_units": "Lost-Sales Units", "replenishment_order_count": "Replenishment Orders",
-    }
-    present = {k: v for k, v in kpi_map.items() if k in d.columns}
-    if present:
-        kpis = []
-        for col, label in present.items():
-            val = d[col].mean() if d[col].dtype.kind in "fc" and d[col].max() <= 1 else d[col].sum()
-            is_rate = "rate" in col or "within" in col
-            kpis.append(dict(label=label, value=format_percentage(val) if is_rate else format_number(val), icon="flask"))
-        render_kpi_row(kpis, n_cols=min(6, len(kpis)))
-    else:
-        empty_state("Expected scenario KPI columns not found", "stockout_scenarios.parquet is present but its schema doesn't match the expected columns.", "flask")
+    op_model = str(risk["operational_model"].iloc[0]) if "operational_model" in risk.columns else "—"
+    try:
+        op_h = int(risk["operational_horizon"].iloc[0])
+    except (ValueError, TypeError, KeyError):
+        op_h = None
 
-    if "scenario" in stockout_raw.columns:
-        rate_col = next((c for c in ["stockout_rate"] if c in stockout_raw.columns), None)
-        if rate_col:
-            agg = stockout_raw.groupby("scenario", as_index=False)[rate_col].mean().sort_values(rate_col, ascending=False)
-            fig = px.bar(agg, x="scenario", y=rate_col)
-            fig.update_traces(marker_color=COLORS["red"])
-            fig.update_layout(**plotly_layout(legend=False, height=320))
-            style_axes(fig)
-            fig.update_xaxes(title="")
-            render_chart(fig, "Stockout-Rate Comparison Across Scenarios")
+    info_banner(
+        "Inventory stock may be synthetically reconstructed. Lead time, service level, MOQ and "
+        "pack-size values may use pilot assumptions. Risk probabilities are planning estimates, "
+        "not guarantees.", kind="synthetic")
 
-        with st.expander("More scenario comparisons", expanded=False):
-            g1, g2 = st.columns(2)
-            with g1:
-                two_d, seven_d = "stockout_within_2d", "stockout_within_7d"
-                if two_d in stockout_raw.columns and seven_d in stockout_raw.columns:
-                    agg = stockout_raw.groupby("scenario", as_index=False)[[two_d, seven_d]].mean()
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(x=agg["scenario"], y=agg[two_d], name="Within 2 days", marker_color=COLORS["amber"]))
-                    fig.add_trace(go.Bar(x=agg["scenario"], y=agg[seven_d], name="Within 7 days", marker_color=COLORS["red"]))
-                    fig.update_layout(**plotly_layout(height=300), barmode="group")
-                    style_axes(fig)
-                    render_chart(fig, "2-Day vs 7-Day Stockout Risk")
-            with g2:
-                if "lost_sales_units" in stockout_raw.columns:
-                    agg = stockout_raw.groupby("scenario", as_index=False)["lost_sales_units"].sum().sort_values("lost_sales_units", ascending=False)
-                    fig = px.bar(agg, x="scenario", y="lost_sales_units")
-                    fig.update_traces(marker_color=COLORS["red"])
-                    fig.update_layout(**plotly_layout(legend=False, height=300))
-                    style_axes(fig)
-                    render_chart(fig, "Lost-Sales Units by Scenario")
-            g3, g4 = st.columns(2)
-            with g3:
-                if replen_raw is not None and "scenario" in replen_raw.columns:
-                    agg = replen_raw.groupby("scenario", as_index=False).size().rename(columns={"size": "orders"})
-                    fig = px.bar(agg, x="scenario", y="orders")
-                    fig.update_traces(marker_color=COLORS["teal"])
-                    fig.update_layout(**plotly_layout(legend=False, height=300))
-                    style_axes(fig)
-                    render_chart(fig, "Replenishment Orders by Scenario")
-            with g4:
-                radar_cols = [c for c in ["stockout_rate", "stockout_within_2d", "stockout_within_7d", "lost_sales_units"] if c in stockout_raw.columns]
-                if radar_cols:
-                    agg = stockout_raw.groupby("scenario")[radar_cols].mean()
-                    norm = (agg - agg.min()) / (agg.max() - agg.min() + 1e-9)
-                    fig = go.Figure()
-                    for scen in norm.index:
-                        fig.add_trace(go.Scatterpolar(r=norm.loc[scen].values, theta=radar_cols, fill="toself", name=scen))
-                    fig.update_layout(**plotly_layout(height=320), polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
-                    render_chart(fig, "Scenario Severity")
+    tiers = risk["overall_risk_tier"].astype(str).str.lower()
 
-    for focus_sku in focus_skus:
-        section_title(f"Synthetic Inventory Trajectory · {comparison_display_label(focus_sku, cmp_label_mode, focus_skus)}")
-        traj = d[d["sku"] == focus_sku].sort_values("date") if "date" in d.columns else pd.DataFrame()
-        if traj.empty:
-            empty_state("No trajectory data for this product/scenario",
-                        comparison_display_label(focus_sku, cmp_label_mode, focus_skus), "trending-down")
+    # ==================================================================
+    # SECTION 1 — Portfolio KPIs (exactly five)
+    # ==================================================================
+    section_title("Portfolio risk at a glance",
+                  "Aggregated from the validated decision artifacts for the current selection.")
+    n_crit_high = int(tiers.isin(["critical", "high"]).sum())
+    n_projected = int(risk["projected_stockout_date"].notna().sum())
+    rev_total, rev_missing = rs.risk_revenue_at_risk_total(risk)
+    cover_series = pd.to_numeric(risk["forecast_days_of_cover"], errors="coerce").dropna()
+    avg_cover = float(cover_series.mean()) if not cover_series.empty else None
+    n_review = int(risk["manual_review_required"].astype(bool).sum())
+
+    kpis = [
+        {"label": "Critical / High Risk SKUs", "value": format_number(n_crit_high),
+         "icon": "alert-triangle", "tone": "red",
+         "sub": _help("Need attention now",
+                      "Count of SKUs whose overall risk tier is Critical or High in this run.")},
+        {"label": "Projected Stockouts", "value": format_number(n_projected),
+         "icon": "trending-down", "tone": "amber",
+         "sub": _help("Have a projected stockout date",
+                      "SKUs with a non-null projected stockout date within the forecast horizon.")},
+        {"label": "Estimated Revenue at Risk", "value": format_currency(rev_total),
+         "icon": "coin", "tone": "navy",
+         "sub": _help((f"{rev_missing} SKU(s) unpriced" if rev_missing else "All priced SKUs included"),
+                      "Sum of estimated revenue at risk across priced SKUs. Unpriced SKUs (null) are "
+                      "excluded from the total, never counted as zero.")},
+        {"label": "Average Days of Cover",
+         "value": (format_number(avg_cover, 1) if avg_cover is not None else "—"),
+         "icon": "clock", "tone": "blue",
+         "sub": _help("Across SKUs with a cover estimate",
+                      "Mean forecast days of cover over SKUs where it is defined; SKUs without an "
+                      "estimate are excluded (never treated as zero).")},
+        {"label": "Manual Review Required", "value": format_number(n_review),
+         "icon": "shield-check", "tone": "slate",
+         "sub": _help("Needs a human decision",
+                      "SKUs the engine flagged for manual review — unknown tier, insufficient forecast "
+                      "horizon, missing price, or other recorded manual-review conditions.")},
+    ]
+    render_kpi_row(kpis, n_cols=5)
+
+    # ==================================================================
+    # SECTION 2 — Risk composition (donut + probability/cover scatter)
+    # ==================================================================
+    section_title("Risk composition", None)
+    tier_order = ["critical", "high", "medium", "watch", "low", "healthy", "unknown"]
+    vc = tiers.value_counts()
+    present = [t for t in tier_order if t in vc.index] + [t for t in vc.index if t not in tier_order]
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        donut = go.Figure(go.Pie(
+            labels=[t.capitalize() for t in present],
+            values=[int(vc[t]) for t in present],
+            hole=0.62, sort=False, direction="clockwise",
+            marker=dict(colors=[_tier_hex(t) for t in present], line=dict(color="white", width=1.5)),
+            textinfo="value",
+            hovertemplate="%{label}: %{value} SKUs (%{percent})<extra></extra>"))
+        donut.update_layout(**plotly_layout(height=330, legend=True))
+        donut.update_layout(annotations=[dict(
+            text=f"{len(risk)}<br>SKUs", x=0.5, y=0.5, showarrow=False,
+            font=dict(size=15, color=COLORS["navy"]))])
+        render_chart(donut, "Risk Tier Distribution",
+                     "Fixed semantic colors — Critical (red) through Unknown (grey); Unknown is never green.")
+    with col_b:
+        rev_all = pd.to_numeric(risk["estimated_revenue_at_risk"], errors="coerce")
+        rev_max = float(rev_all.max()) if rev_all.notna().any() and float(rev_all.max()) > 0 else None
+
+        def _msize(v):
+            # bubble size ∝ revenue at risk when available; a stable default otherwise
+            if rev_max and pd.notna(v) and float(v) > 0:
+                return 11 + 24 * (float(v) / rev_max)
+            return 11
+
+        scatter = go.Figure()
+        for t in present:
+            sub = risk[tiers == t]
+            if sub.empty:
+                continue
+            names = [rs.full_product_label(n, s) for n, s in zip(sub.get("sku_name"), sub["sku"])]
+            cust = list(zip(
+                names,
+                sub["sku"].astype(str),
+                [(_meta_val(c) or "—") for c in sub["channel"]],
+                [str(x).capitalize() for x in sub["overall_risk_tier"]],
+                [format_number(v, 0) for v in sub["stock_on_hand"]],
+                [_date_str(x) for x in sub["projected_stockout_date"]],
+                [format_number(v, 0) for v in sub["expected_shortage_units"]],
+                [format_currency(v) for v in sub["estimated_revenue_at_risk"]]))
+            scatter.add_trace(go.Scatter(
+                x=pd.to_numeric(sub["forecast_days_of_cover"], errors="coerce"),
+                y=pd.to_numeric(sub["stockout_probability"], errors="coerce"),
+                mode="markers", name=t.capitalize(),
+                marker=dict(size=[_msize(v) for v in sub["estimated_revenue_at_risk"]],
+                            color=_tier_hex(t), line=dict(color="white", width=1)),
+                customdata=cust,
+                hovertemplate=("<b>%{customdata[0]}</b><br>SKU %{customdata[1]} · %{customdata[2]}<br>"
+                               "Tier: %{customdata[3]}<br>P(stockout): %{y:.0%}<br>"
+                               "Days of cover: %{x:.1f}<br>Current stock: %{customdata[4]} u<br>"
+                               "Projected stockout: %{customdata[5]}<br>"
+                               "Expected shortage: %{customdata[6]} u<br>"
+                               "Revenue at risk: %{customdata[7]}<extra></extra>")))
+        scatter.update_layout(**plotly_layout(height=330, legend=True))
+        style_axes(scatter)
+        scatter.update_yaxes(range=[-0.03, 1.03], tickformat=".0%", title_text="P(stockout) in lead time")
+        scatter.update_xaxes(title_text="Forecast days of cover")
+        render_chart(scatter, "Stockout Probability vs Days of Cover",
+                     "Top-left corner = most urgent; bubble size ∝ revenue at risk. Hover for full detail.")
+
+    # ==================================================================
+    # SECTION 3 — Priority risk queue (filters + clickable cards)
+    # ==================================================================
+    section_title("Priority risk queue",
+                  "Ranked by urgency: tier, then probability, projected date, revenue and name. "
+                  "Click a card to open its full details below.")
+    fc = st.columns([1.2, 1.8, 1, 1])
+    with fc[0]:
+        tier_opts = ["All tiers"] + [t.capitalize() for t in present]
+        tier_pick = st.selectbox("Risk tier", options=tier_opts, key="risk_tier")
+    with fc[1]:
+        query = st.text_input("Search product or SKU", key="risk_query",
+                              placeholder="product name or SKU code")
+    with fc[2]:
+        proj_only = st.checkbox("Projected only", key="risk_projected_only")
+    with fc[3]:
+        review_only = st.checkbox("Review only", key="risk_review_only")
+
+    tier_arg = None if tier_pick == "All tiers" else tier_pick
+    filtered = rs.filter_risk_queue(risk, tier=tier_arg, query=query,
+                                    projected_only=proj_only, review_only=review_only)
+    ranked = rs.sort_risk_queue(filtered)
+    valid_skus = ranked["sku"].astype(str).tolist() if ranked is not None and not ranked.empty else []
+
+    # Session-state selection with a safe fallback to the top-ranked visible SKU
+    cur = st.session_state.get("risk_selected_sku")
+    if cur not in valid_skus:
+        cur = valid_skus[0] if valid_skus else None
+        st.session_state["risk_selected_sku"] = cur
+
+    if not valid_skus:
+        info_banner("No SKUs match these filters. Adjust the tier, search or toggles above.", kind="info")
+        return
+
+    def _render_risk_card(row, selected):
+        sku = str(row["sku"])
+        safe = _safe_key(sku)
+        keyname = f"riskcard-sel-{safe}" if selected else f"riskcard-{safe}"
+        tier = row.get("overall_risk_tier")
+        name = row.get("sku_name")
+        nm = None if (name is None or (isinstance(name, float) and pd.isna(name))) else str(name).strip()
+        disp = nm if (nm and nm.lower() != "nan") else sku
+        full = rs.full_product_label(name, sku)
+        with st.container(border=True, key=keyname):
+            st.markdown(f'<div class="ipa-riskstripe" style="background:{_tier_hex(tier)};"></div>',
+                        unsafe_allow_html=True)
+            st.markdown(
+                '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">'
+                f'<span class="ipa-riskname" title="{_esc(full)}">{_esc(disp)}</span>'
+                f'{_tier_chip(tier)}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="ipa-risksku" title="{_esc(full)}">SKU {_esc(sku)}</div>',
+                        unsafe_allow_html=True)
+            st.markdown(
+                '<div class="ipa-riskgrid">'
+                f'<span class="m">P(stockout) <b>{format_percentage(row.get("stockout_probability"))}</b></span>'
+                f'<span class="m">Days cover <b>{format_number(row.get("forecast_days_of_cover"), 1)}</b></span>'
+                f'<span class="m">Projected <b>{_date_str(row.get("projected_stockout_date"))}</b></span>'
+                f'<span class="m">Current stock <b>{format_number(row.get("stock_on_hand"), 0)}</b></span>'
+                f'<span class="m">Lead-time demand <b>{format_number(row.get("lead_time_demand_p50"), 0)}</b></span>'
+                f'<span class="m">Rev at risk <b>{format_currency(row.get("estimated_revenue_at_risk"))}</b></span>'
+                '</div>', unsafe_allow_html=True)
+            if bool(row.get("manual_review_required")):
+                st.markdown('<div class="ipa-risksku">⚑ Manual review required</div>',
+                            unsafe_allow_html=True)
+            with st.container(key=f"riskopen-{safe}"):
+                if st.button(("● Selected" if selected else "View details"),
+                             key=f"riskbtn-{safe}", width="stretch",
+                             type="primary" if selected else "secondary"):
+                    st.session_state["risk_selected_sku"] = sku
+                    st.rerun()
+
+    MAX_CARDS = 60
+    show_rows = ranked.head(MAX_CARDS)
+    if len(ranked) > MAX_CARDS:
+        info_banner(f"Showing the top {MAX_CARDS} of {len(ranked)} matching SKUs by urgency.", kind="info")
+    records = show_rows.to_dict("records")
+    for i in range(0, len(records), 2):
+        ccols = st.columns(2)
+        for ccol, rec in zip(ccols, records[i:i + 2]):
+            with ccol:
+                _render_risk_card(rec, selected=(str(rec["sku"]) == str(cur)))
+
+    # ==================================================================
+    # SECTION 4 — Selected SKU deep dive
+    # ==================================================================
+    sel = risk[risk["sku"].astype(str) == str(cur)]
+    if sel.empty:
+        return
+    r = sel.iloc[0]
+    full = rs.full_product_label(r.get("sku_name"), r["sku"])
+
+    cat_val = brand_val = None
+    if mp_raw is not None and "sku" in mp_raw.columns:
+        m = mp_raw[mp_raw["sku"].astype(str) == str(r["sku"])]
+        if not m.empty:
+            cat_val = _meta_val(m["category"].iloc[0]) if "category" in m.columns else None
+            brand_val = _meta_val(m["brand"].iloc[0]) if "brand" in m.columns else None
+    meta_bits = [b for b in (cat_val, brand_val, _meta_val(r.get("channel"))) if b]
+
+    section_title("Selected SKU details", None)
+    st.markdown(f'<div class="ipa-dd-head">{_esc(full)}</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="ipa-dd-sub">'
+        f'{_esc(" · ".join(meta_bits) if meta_bits else "—")} &nbsp;{_tier_chip(r.get("overall_risk_tier"))}'
+        '</div>', unsafe_allow_html=True)
+
+    dd = [
+        {"label": "Overall risk tier",
+         "value": (str(r.get("overall_risk_tier") or "—").capitalize()),
+         "icon": "alert-triangle", "tone": rs.risk_tier_tone(r.get("overall_risk_tier")),
+         "sub": "Worse of the probability & cover tiers"},
+        {"label": "P(stockout) in lead time", "value": format_percentage(r.get("stockout_probability")),
+         "icon": "percent", "tone": "amber",
+         "sub": f"Service level {format_percentage(r.get('service_level'))}"},
+        {"label": "Forecast days of cover", "value": format_number(r.get("forecast_days_of_cover"), 1),
+         "icon": "clock", "tone": "blue",
+         "sub": f"Lead time {format_number(r.get('lead_time_days'), 0)} d"},
+        {"label": "Projected stockout date", "value": _date_str(r.get("projected_stockout_date")),
+         "icon": "calendar", "tone": "amber",
+         "sub": (f"In {format_number(r.get('days_until_projected_stockout'), 0)} days"
+                 if pd.notna(r.get("days_until_projected_stockout"))
+                 else "No stockout projected in horizon")},
+    ]
+    render_kpi_row(dd, n_cols=4)
+
+    stock_disp = format_number(r.get("stock_on_hand"), 0)
+    if bool(r.get("stock_on_hand_is_synthetic")):
+        stock_disp += " (synthetic)"
+    ltd_p50 = pd.to_numeric(pd.Series([r.get("lead_time_demand_p50")]), errors="coerce").iloc[0]
+    lt_days = pd.to_numeric(pd.Series([r.get("lead_time_days")]), errors="coerce").iloc[0]
+    mean_daily = (ltd_p50 / lt_days) if (pd.notna(ltd_p50) and pd.notna(lt_days) and lt_days > 0) else None
+    short_disp = format_number(r.get("expected_shortage_units"), 0)
+    short_disp = f"{short_disp} u" if short_disp != "—" else "—"
+    rows = [
+        ("Current stock on hand", stock_disp),
+        ("Stock source", _meta_val(r.get("stock_source")) or "—"),
+        ("Reported on-order qty", format_number(r.get("reported_on_order_quantity"), 0)),
+        ("Usable on-order qty", format_number(r.get("usable_on_order_quantity"), 0)),
+        ("Inventory position (for risk)", format_number(r.get("inventory_position_for_risk"), 0)),
+        ("Mean daily forecast", format_number(mean_daily, 1)),
+        ("Lead-time days",
+         f"{format_number(r.get('lead_time_days'), 0)} ({_meta_val(r.get('lead_time_source')) or '—'})"),
+        ("Lead-time demand (mean / P80 / P95)",
+         f"{format_number(r.get('lead_time_demand_p50'), 0)} / "
+         f"{format_number(r.get('lead_time_demand_p80'), 0)} / "
+         f"{format_number(r.get('lead_time_demand_p95'), 0)}"),
+        ("Lead-time demand σ", format_number(r.get("lead_time_sigma"), 1)),
+        ("Safety stock", format_number(r.get("safety_stock"), 0)),
+        ("Reorder point", format_number(r.get("reorder_point"), 0)),
+        ("Expected shortage", short_disp),
+        ("Estimated revenue at risk", format_currency(r.get("estimated_revenue_at_risk"))),
+        ("Service-level target", format_percentage(r.get("service_level"))),
+        ("Operational model", _esc(op_model)),
+        ("Uncertainty method", _meta_val(r.get("uncertainty_method")) or "—"),
+        ("Confidence", _meta_val(r.get("confidence_label")) or "—"),
+    ]
+
+    traj_ok = bool(CTX.get("has_stockout_trajectory")) and traj_raw is not None
+    tdf, twarn = (rs.trajectory_for_sku(traj_raw, cur, horizon=op_h)
+                  if traj_ok else (pd.DataFrame(), []))
+    for w in twarn:
+        info_banner(w, kind="info")
+    has_traj = traj_ok and tdf is not None and not tdf.empty
+
+    left, right = st.columns([1, 1.25])
+    with left:
+        metric_panel("Inventory & demand inputs", rows,
+                     sub="“—” means the value is not available — it is never shown as zero.")
+    with right:
+        if has_traj:
+            inv = go.Figure()
+            # cumulative demand P50–P95 uncertainty band (upper first, then fill down to P50)
+            if {"demand_p95", "demand_p50"}.issubset(tdf.columns):
+                inv.add_trace(go.Scatter(
+                    x=tdf["date"], y=tdf["demand_p95"], mode="lines", line=dict(width=0),
+                    hoverinfo="skip", showlegend=False, name="P95"))
+                inv.add_trace(go.Scatter(
+                    x=tdf["date"], y=tdf["demand_p50"], mode="lines", line=dict(width=0),
+                    fill="tonexty", fillcolor="rgba(14,124,123,0.12)", hoverinfo="skip",
+                    name="Demand P50–P95 band"))
+            inv.add_trace(go.Scatter(
+                x=tdf["date"], y=tdf["cumulative_demand_mean"], name="Cumulative demand (P50)",
+                mode="lines", line=dict(color=COLORS["teal"], width=2, dash="dash"),
+                hovertemplate="%{x|%Y-%m-%d}<br>Cumulative demand: %{y:.0f} u<extra></extra>"))
+            inv.add_trace(go.Scatter(
+                x=tdf["date"], y=tdf["projected_p50_inventory"], name="Projected inventory (P50)",
+                mode="lines+markers", line=dict(color=COLORS["navy"], width=2.5),
+                hovertemplate="%{x|%Y-%m-%d}<br>Projected inventory: %{y:.0f} u<extra></extra>"))
+            inv.add_hline(y=0, line_dash="dot", line_color=COLORS["red"], line_width=1.5,
+                          annotation_text="Zero stock", annotation_position="bottom right")
+            rop = r.get("reorder_point")
+            if pd.notna(rop):
+                inv.add_hline(y=float(rop), line_dash="dash", line_color=COLORS["amber"], line_width=1,
+                              annotation_text="Reorder point", annotation_position="top right")
+            # lead-time window shading (the decision-relevant horizon)
+            if pd.notna(lt_days) and float(lt_days) > 0:
+                start = pd.to_datetime(tdf["date"].iloc[0])
+                inv.add_vrect(x0=start, x1=start + pd.Timedelta(days=int(lt_days)),
+                              fillcolor=COLORS["navy"], opacity=0.05, line_width=0,
+                              annotation_text="Lead-time window", annotation_position="top left")
+            # projected stockout date marker
+            psd = r.get("projected_stockout_date")
+            if pd.notna(psd):
+                inv.add_vline(x=pd.to_datetime(psd), line_dash="dash", line_color=COLORS["red"],
+                              line_width=1.2, annotation_text="Projected stockout",
+                              annotation_position="top right")
+            inv.update_layout(**plotly_layout(height=340, legend=True))
+            style_axes(inv)
+            inv.update_yaxes(title_text="Units")
+            render_chart(inv, f"Inventory trajectory — {_esc(full)}",
+                         "Forecast-driven; zero-stock line marks the projected stockout, shaded = lead-time "
+                         "window, band = cumulative demand P50–P95.")
         else:
-            fig = go.Figure()
-            for col, label, color in [
-                ("opening_stock", "Opening stock", COLORS["slate"]), ("ending_stock", "Ending stock", COLORS["navy"]),
-                ("latent_demand", "Latent demand", COLORS["grid"]), ("synthetic_sales", "Synthetic sales", COLORS["teal"]),
-                ("lost_sales", "Lost sales", COLORS["risk"]),
-            ]:
-                if col in traj.columns:
-                    fig.add_trace(go.Scatter(x=traj["date"], y=traj[col], name=label, mode="lines", line=dict(color=color)))
-            if "reorder_point" in traj.columns:
-                fig.add_trace(go.Scatter(x=traj["date"], y=traj["reorder_point"], name="Reorder point",
-                                          mode="lines", line=dict(color=COLORS["amber"], dash="dot")))
-            if replen_raw is not None and "sku" in replen_raw.columns:
-                events = replen_raw[(replen_raw["sku"] == focus_sku)]
-                if "scenario" in events.columns:
-                    events = events[events["scenario"] == sel_scenario]
-                if "date" in events.columns and not events.empty:
-                    fig.add_trace(go.Scatter(x=events["date"], y=[0] * len(events), name="Replenishment event",
-                                              mode="markers", marker=dict(symbol="triangle-up", size=12, color=COLORS["success"])))
-            fig.update_layout(**plotly_layout(height=340))
-            style_axes(fig)
-            render_chart(fig, f"Synthetic Inventory Trajectory — {focus_sku} ({sel_scenario})",
-                         "Opening/ending stock, latent demand, synthetic sales, lost sales & reorder point")
+            with st.container(border=True):
+                empty_state("Daily trajectory unavailable",
+                            "This run did not persist a daily stockout trajectory for this SKU.",
+                            "circle-dashed")
 
-    section_title("Scenario Assumptions", "What changed vs baseline for this scenario.")
-    if simparams_raw and isinstance(simparams_raw, dict):
-        scen_params = simparams_raw.get(sel_scenario) or simparams_raw.get("scenarios", {}).get(sel_scenario)
-        if scen_params:
-            st.json(scen_params)
-        else:
-            empty_state("No parameters found for this scenario", "simulation_parameters.json does not define this scenario.", "settings")
-    else:
-        empty_state("Simulation parameters not generated yet", "data/synthetic/simulation_parameters.json is missing.", "settings")
+    if has_traj:
+        pf = go.Figure()
+        pf.add_trace(go.Scatter(
+            x=tdf["date"], y=tdf["cumulative_stockout_probability"], name="Cumulative P(stockout)",
+            mode="lines", fill="tozeroy", line=dict(color=COLORS["red"], width=2.5),
+            hovertemplate="%{x|%Y-%m-%d}<br>P(stockout): %{y:.0%}<extra></extra>"))
+        for thr, lab in ((0.5, "50%"), (0.8, "80%"), (0.95, "95%")):
+            pf.add_hline(y=thr, line_dash="dot", line_color=COLORS["slate"], line_width=1,
+                         annotation_text=lab, annotation_position="right")
+        pf.update_layout(**plotly_layout(height=300, legend=False))
+        style_axes(pf)
+        pf.update_yaxes(range=[0, 1.03], tickformat=".0%", title_text="P(stockout)")
+        render_chart(pf, "Cumulative stockout probability",
+                     "Probability of running out by each day, with 50 / 80 / 95% reference thresholds.")
 
+        tcols = ["date", "daily_demand_mean", "demand_p50", "demand_p80", "demand_p95",
+                 "projected_p50_inventory", "cumulative_stockout_probability"]
+        tbl = tdf[[c for c in tcols if c in tdf.columns]].copy()
+        tbl["date"] = pd.to_datetime(tbl["date"]).dt.strftime("%Y-%m-%d")
+        for c in ("daily_demand_mean", "demand_p50", "demand_p80", "demand_p95",
+                  "projected_p50_inventory"):
+            if c in tbl.columns:
+                tbl[c] = pd.to_numeric(tbl[c], errors="coerce").round(1)
+        if "cumulative_stockout_probability" in tbl.columns:
+            tbl["cumulative_stockout_probability"] = pd.to_numeric(
+                tbl["cumulative_stockout_probability"], errors="coerce").map(format_percentage)
+        tbl = tbl.rename(columns={
+            "date": "Date", "daily_demand_mean": "Daily Forecast",
+            "demand_p50": "Cumulative Demand P50", "demand_p80": "Cumulative Demand P80",
+            "demand_p95": "Cumulative Demand P95", "projected_p50_inventory": "Projected P50 Inventory",
+            "cumulative_stockout_probability": "Cumulative Stockout Probability"})
+        with st.expander("Daily forecast & inventory table (active horizon)", expanded=False):
+            st.dataframe(tbl, use_container_width=True, hide_index=True)
 
-# ==========================================================================
-# PAGE 6 — DATA QUALITY & ASSUMPTIONS
-# ==========================================================================
-MODEL_PANEL_DICT = {
-    "sku": "Unique SKU identifier used across all pilot datasets.",
-    "product_id": "Internal Naheed product identifier linked to the SKU.",
-    "channel": "Sales channel for the row. Pilot scope is naheed_web only.",
-    "date": "Calendar date of the observation (daily grain).",
-    "category": "Merchandise category (e.g. Health & Beauty, Groceries & Pets).",
-    "sub_category": "Merchandise sub-category. Not populated for this pilot slice.",
-    "brand": "Product brand.",
-    "units_observed": "REAL target variable — units sold that day on naheed_web.",
-    "effective_unit_price": "REAL historical selling price per unit after any discount.",
-    "discount_amount": "REAL discount amount applied per unit.",
-    "discount_pct": "REAL discount as a percentage of list price.",
-    "on_promo": "REAL flag — 1 if the SKU was on an active promotion that day.",
-    "promo_known_in_advance": "REAL flag — 1 if the promotion was scheduled/known ahead of the date.",
-    "is_public_holiday": "REAL calendar flag — 1 if the date is a Pakistan public holiday.",
-    "holiday_name": "Name of the public holiday, when applicable.",
-    "is_payday_window": "REAL calendar flag — 1 if the date falls in a typical monthly payday window.",
-    "day_of_week": "Day of week, 0 = Monday … 6 = Sunday.",
-    "is_weekend": "REAL flag — 1 if Saturday or Sunday.",
-    "week_of_year": "ISO week number.",
-    "month": "Calendar month number.",
-    "units_lag_1": "Units observed 1 day earlier — engineered demand feature.",
-    "units_lag_7": "Units observed 7 days earlier — engineered demand feature.",
-    "units_lag_14": "Units observed 14 days earlier — engineered demand feature.",
-    "units_roll_mean_7": "Trailing 7-day rolling mean of units observed.",
-    "units_roll_mean_28": "Trailing 28-day rolling mean of units observed.",
-    "units_roll_std_7": "Trailing 7-day rolling standard deviation — a proxy for demand volatility.",
-    "stock_on_hand": "SYNTHETIC daily stock reconstruction — not an observed inventory record.",
-    "stock_on_hand_is_synthetic": "Flag confirming the stock_on_hand value is synthetic.",
-    "stock_source": "Source method used to derive stock_on_hand.",
-    "stock_generation_version": "Version tag of the synthetic stock reconstruction logic.",
-    "product_active": "Whether the SKU was considered active/listed on that date.",
-    "forecast_training_eligible": "Whether the row passes minimum-history rules for model training.",
-    "data_quality_flag": "Data-quality notes for the row (e.g. insufficient history at activation).",
-}
-INVENTORY_CONTEXT_DICT = {
-    "as_of_date": "Snapshot date the inventory context was generated for.",
-    "sku": "Unique SKU identifier.",
-    "product_id": "Internal Naheed product identifier.",
-    "location_id": "Stock location scope (ALL = network-wide, not store-level).",
-    "stock_on_hand": "SYNTHETIC baseline stock quantity for the SKU as of the snapshot date.",
-    "stock_on_hand_is_synthetic": "Confirms the stock figure is a synthetic reconstruction.",
-    "stock_source": "Method used to derive the synthetic stock figure.",
-    "stock_snapshot_date": "Date the synthetic snapshot represents.",
-    "stock_generation_method": "Algorithm used for stock reconstruction.",
-    "stock_generation_version": "Version tag of the reconstruction logic.",
-    "on_order_quantity": "Units already on order (currently unavailable/assumed 0 for this pilot).",
-    "on_order_is_available": "Whether real on-order data was available (False = assumed).",
-    "expected_daily_demand": "Forecast-derived expected daily demand used to size reorder policy.",
-    "lead_time_days": "Assumed supplier lead time in days.",
-    "lead_time_source": "Where the lead-time assumption came from.",
-    "moq": "Assumed minimum order quantity.",
-    "moq_source": "Source of the MOQ assumption.",
-    "pack_size": "Assumed order pack/case size.",
-    "pack_size_source": "Source of the pack-size assumption.",
-    "safety_stock": "Buffer stock computed from demand and lead-time assumptions.",
-    "reorder_point": "Stock level that should trigger a new purchase order.",
-    "target_stock": "Target stock level after replenishment.",
-    "days_of_cover": "Estimated days of stock remaining at current demand.",
-    "is_perishable": "Whether the SKU is flagged as perishable.",
-    "shelf_life_days": "Shelf life in days, when applicable.",
-    "price": "Current selling price.",
-    "unit_cost_observed": "Observed unit cost from source systems, when available.",
-    "unit_cost_effective": "Unit cost actually used in value calculations (observed or imputed).",
-    "cost_source": "Precedence source used to resolve unit cost.",
-    "cost_is_valid": "Whether the observed cost passed validity checks.",
-    "cost_is_imputed": "Whether the effective cost was imputed (fallback) rather than observed.",
-    "cost_quality_flag": "Data-quality flags related to unit cost.",
-    "cost_currency": "Currency of all cost/value figures (PKR).",
-    "cost_basis": "Cost basis assumption (unit/pack, unconfirmed for this pilot).",
-    "recommended_order_quantity": "Simulated purchase recommendation under baseline assumptions.",
-    "recommended_purchase_value": "Recommended order quantity × effective unit cost.",
-    "inventory_value": "Synthetic stock on hand × effective unit cost.",
-    "is_dropship": "Whether the SKU is fulfilled via dropship.",
-    "assumption_notes": "Free-text notes on assumptions applied for this SKU.",
-}
+    # ==================================================================
+    # SECTION 5 — Why this SKU is flagged (full reason trace)
+    # ==================================================================
+    section_title("Why this SKU is flagged", None)
+    reason = r.get("reason_trace")
+    reason_txt = "" if (reason is None or (isinstance(reason, float) and pd.isna(reason))) else str(reason)
+    st.markdown(
+        f'<div class="ipa-reason"><div class="h">{icon_svg("file-text", 16)} Decision rationale</div>'
+        f'{_esc(reason_txt) if reason_txt else "No reason trace was recorded for this SKU."}</div>',
+        unsafe_allow_html=True)
+
+    # ==================================================================
+    # SECTION 6 — Assumptions, uncertainty and data limitations
+    # ==================================================================
+    with st.expander("Assumptions, uncertainty and data limitations", expanded=False):
+        flag_items = _flags_to_list(r.get("assumption_flags"))
+        flags_l = [f.lower() for f in flag_items]
+
+        def _num1(x):
+            return pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0]
+
+        def _yn(b):
+            return "Yes" if b else "No"
+
+        lt_src = _meta_val(r.get("lead_time_source"))
+        usable = _num1(r.get("usable_on_order_quantity"))
+        reported = _num1(r.get("reported_on_order_quantity"))
+        conditions = [
+            f"Stock synthetically reconstructed: {_yn(bool(r.get('stock_on_hand_is_synthetic')))}",
+            f"Lead time assumed: {_yn(lt_src is None or lt_src.lower() not in ('actual', 'supplier', 'confirmed'))}"
+            + (f" (source: {lt_src})" if lt_src else ""),
+            f"Service level defaulted: {_yn(any('service' in f for f in flags_l))} "
+            f"(target {format_percentage(r.get('service_level'))})",
+            f"Catalog price missing: {_yn(pd.isna(_num1(r.get('estimated_revenue_at_risk'))) or any('price' in f for f in flags_l))}",
+            f"Forecast horizon shorter than lead time: "
+            f"{_yn(r.get('lead_time_horizon_sufficient') is not None and not bool(r.get('lead_time_horizon_sufficient')))}",
+            f"On-order stock excluded from position: "
+            f"{_yn((not bool(r.get('on_order_available'))) or (pd.notna(usable) and usable == 0 and pd.notna(reported) and reported > 0))}",
+            f"Manual review required: {_yn(bool(r.get('manual_review_required')))}",
+            f"Uncertainty method: {_meta_val(r.get('uncertainty_method')) or '—'}",
+        ]
+        st.markdown("**Conditions detected for this SKU**")
+        st.markdown("\n".join(f"- {c}" for c in conditions))
+        if flag_items:
+            st.markdown("**Assumption flags recorded in the artifact**")
+            st.markdown("\n".join(f"- {_flag_pretty(f)}" for f in flag_items))
+        st.markdown("**Known limitations**")
+        for d in (
+            "Usable on-order quantity may be zero when there are no dated inbound arrivals.",
+            "The stockout probability is a Normal-distribution approximation.",
+            "Independent daily forecast errors are combined via RSS (root-sum-of-squares).",
+            "Lead time, MOQ and pack size may be pilot assumptions, not supplier-confirmed.",
+            "Catalog price may not be the confirmed revenue basis.",
+            "Figures are a forecast-driven estimate, not observed historical stockouts; "
+            "no purchase order or replenishment is created by this dashboard.",
+        ):
+            st.markdown(f"- {d}")
+        with st.expander("Advanced decision fields", expanded=False):
+            adv_fields = ["uncertainty_method", "confidence_label", "service_level",
+                          "lead_time_source", "stock_source", "on_order_available",
+                          "reported_on_order_quantity", "forecast_horizon_available",
+                          "lead_time_horizon_sufficient", "survives_forecast_horizon",
+                          "probability_risk_tier", "cover_risk_tier", "manual_review_required"]
+            adv_rows = []
+            for f in adv_fields:
+                v = r.get(f)
+                disp = "—" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)
+                adv_rows.append({"field": f, "value": disp})
+            st.dataframe(pd.DataFrame(adv_rows), use_container_width=True, hide_index=True)
+
+    # ==================================================================
+    # SECTION 7 — Complete risk dataset
+    # ==================================================================
+    with st.expander("View complete risk dataset", expanded=False):
+        colmap = [
+            ("overall_risk_tier", "Risk"), ("sku_name", "Product"), ("sku", "SKU"),
+            ("channel", "Channel"), ("stockout_probability", "Stockout Probability"),
+            ("forecast_days_of_cover", "Days of Cover"), ("projected_stockout_date", "Projected Stockout"),
+            ("stock_on_hand", "Current Stock"), ("lead_time_demand_p50", "Lead-Time Demand"),
+            ("safety_stock", "Safety Stock"), ("reorder_point", "Reorder Point"),
+            ("expected_shortage_units", "Expected Shortage"),
+            ("estimated_revenue_at_risk", "Revenue at Risk"),
+            ("manual_review_required", "Manual Review"),
+        ]
+        src_cols = [c for c, _ in colmap if c in risk.columns]
+        disp = risk[src_cols].copy()
+        if "stockout_probability" in disp.columns:
+            disp["stockout_probability"] = pd.to_numeric(
+                disp["stockout_probability"], errors="coerce").map(format_percentage)
+        if "projected_stockout_date" in disp.columns:
+            disp["projected_stockout_date"] = disp["projected_stockout_date"].map(_date_str)
+        if "estimated_revenue_at_risk" in disp.columns:
+            disp["estimated_revenue_at_risk"] = disp["estimated_revenue_at_risk"].map(format_currency)
+        if "overall_risk_tier" in disp.columns:
+            disp["overall_risk_tier"] = disp["overall_risk_tier"].map(lambda t: str(t).capitalize())
+        disp = disp.rename(columns=dict(colmap))
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.caption("One row per SKU/channel, read directly from the run's validated decision artifact.")
+        with st.expander("Advanced: technical & model contract fields", expanded=False):
+            tech = [c for c in risk.columns if c not in src_cols and c != "reason_trace"]
+            if "reason_trace" in risk.columns:
+                tech = tech + ["reason_trace"]
+            st.dataframe(risk[tech], use_container_width=True, hide_index=True)
 
 
 def page_data_quality():
@@ -2080,7 +2458,7 @@ PAGE_FUNCS = {
     "Forecast Runs": page_forecast_runs,
     "Forecast Explorer": page_forecast_explorer,
     "Inventory & Reorder": page_inventory_reorder,
-    "Stockout Scenario Lab": page_stockout_lab,
+    "Stockout Risk": page_stockout_risk,
     "Data Quality & Assumptions": page_data_quality,
 }
 PAGE_FUNCS[page]()

@@ -548,3 +548,200 @@ def test_59_datetime_object_accepted():
 def test_60_business_dates_untouched_by_helper_usage():
     # a plain business date must never be turned into a PKT instant by the dashboard
     assert rs.format_local_datetime("2026-06-30", include_time=False) == "30 Jun 2026"
+
+
+# ── Phase B: decision artifact exposure (backward compatible) ─────────────────────────────
+def _add_decision_artifacts(rd: Path, skus, run_id):
+    dec = rd / "decisions"
+    dec.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"run_id": run_id, "sku": list(skus), "channel": "naheed_web",
+                  "stockout_probability": [0.1, 0.5, 0.9][:len(skus)],
+                  "overall_risk_tier": ["low", "high", "critical"][:len(skus)]}
+                 ).to_parquet(dec / "stockout_risk.parquet", index=False)
+    dates = pd.date_range("2026-07-01", periods=3, freq="D")
+    pd.DataFrame({"run_id": run_id, "sku": [s for s in skus for _ in dates], "channel": "naheed_web",
+                  "date": [d for _ in skus for d in dates],
+                  "cumulative_stockout_probability": 0.3}
+                 ).to_parquet(dec / "stockout_trajectory.parquet", index=False)
+
+
+def test_61_context_exposes_decision_artifacts_when_present(tmp_path):
+    run_id = "20260101T000000Z_groceries-pets_top3_dec001"
+    rd = _make_completed_run(tmp_path, run_id=run_id, n_sku=3)
+    _add_decision_artifacts(rd, [f"S{i}" for i in range(3)], run_id)
+    ctx = rs.resolve_run_context(rs._run_record(rd))
+    assert ctx["has_stockout_risk"] and ctx["has_stockout_trajectory"]
+    assert ctx["stockout_risk"].exists() and ctx["stockout_trajectory"].exists()
+    # the dashboard reads the PRECOMPUTED file (never recomputes)
+    risk = pd.read_parquet(ctx["stockout_risk"])
+    assert len(risk) == 3 and set(risk["overall_risk_tier"]) == {"low", "high", "critical"}
+
+
+def test_62_old_completed_run_without_decisions_still_browsable(tmp_path):
+    rd = _make_completed_run(tmp_path, run_id="20260101T000000Z_groceries-pets_top3_old999", n_sku=3)
+    ctx = rs.resolve_run_context(rs._run_record(rd))   # must NOT raise for a pre-Phase-B run
+    assert ctx["has_stockout_risk"] is False and ctx["has_stockout_trajectory"] is False
+    assert ctx["selected_forecasts"].exists() and ctx["model_panel"].exists()  # still fully browsable
+
+
+# ── Phase B dashboard-UX helpers (pure, framework-free) ───────────────────────────────────
+def _risk_df():
+    """A deliberately shuffled stockout-risk frame with an unambiguous priority order,
+    mirroring the columns the dashboard reads from the validated decision artifact."""
+    skus = ["SK01", "SK02", "SK03", "SK04", "SK05", "SK06", "SK07", "SK08"]
+    names = ["Alpha Cleanser", "Bravo Shampoo", "Charlie Wipes", "Delta Lotion",
+             "Echo Serum", "Foxtrot Balm", "Golf Toner", "Hotel Mask"]
+    tiers = ["low", "critical", "critical", "high", "unknown", "critical", "critical", "critical"]
+    probs = [0.10, 0.90, 0.90, 0.70, 0.00, 0.90, 0.90, 0.90]
+    proj = [None, "2026-08-05", "2026-08-02", "2026-08-10", None, "2026-08-02", "2026-08-02", None]
+    rev = [10.0, 100.0, 50.0, 200.0, None, 80.0, 80.0, 999.0]
+    review = [False, False, False, False, True, False, False, False]
+    cover = [30.0, 1.0, 2.0, 6.0, None, 2.0, 2.0, 1.0]
+    return pd.DataFrame({
+        "sku": skus, "sku_name": names, "overall_risk_tier": tiers,
+        "stockout_probability": probs, "projected_stockout_date": proj,
+        "estimated_revenue_at_risk": rev, "manual_review_required": review,
+        "forecast_days_of_cover": cover, "reason_trace": [f"reason for {s}" for s in skus],
+    })
+
+
+def _traj_df(rows):
+    """rows: list of (sku, date_str, forecast_horizon_day)."""
+    return pd.DataFrame({
+        "sku": [s for s, _, _ in rows], "channel": "naheed_web",
+        "date": [d for _, d, _ in rows],
+        "forecast_horizon_day": [f for _, _, f in rows],
+        "projected_p50_inventory": [10.0 - i for i in range(len(rows))],
+        "cumulative_stockout_probability": [0.1 * i for i in range(len(rows))],
+    })
+
+
+def test_63_sort_risk_queue_deterministic_full_order():
+    ranked = rs.sort_risk_queue(_risk_df())
+    # severity → P(stockout) desc → projected date asc (nulls last) → revenue desc → name asc
+    assert list(ranked["sku"]) == ["SK06", "SK07", "SK03", "SK02", "SK08",
+                                   "SK04", "SK01", "SK05"]
+
+
+def test_64_sort_risk_queue_nulls_and_ties():
+    ranked = rs.sort_risk_queue(_risk_df()).reset_index(drop=True)
+    pos = {s: i for i, s in enumerate(ranked["sku"])}
+    # equal severity+prob+projected+revenue → name asc (Foxtrot before Golf)
+    assert pos["SK06"] < pos["SK07"]
+    # a null projected date sorts AFTER dated peers even with far higher revenue (SK08 rev=999)
+    assert pos["SK02"] < pos["SK08"]
+    # unknown tier is always last, never promoted above real risk
+    assert pos["SK05"] == len(ranked) - 1
+
+
+def test_65_sort_risk_queue_pure_and_reason_trace_untouched():
+    df = _risk_df()
+    before = df.copy(deep=True)
+    ranked = rs.sort_risk_queue(df)
+    pd.testing.assert_frame_equal(df, before)              # input never mutated
+    # reason_trace is carried through verbatim (no truncation / rewriting in the dashboard layer)
+    got = dict(zip(ranked["sku"], ranked["reason_trace"]))
+    assert got == {s: f"reason for {s}" for s in df["sku"]}
+    assert "reason_trace" in ranked.columns and not ranked["reason_trace"].isna().any()
+
+
+def test_66_risk_severity_unknown_is_not_healthy():
+    assert rs.risk_severity_rank("critical") == 0
+    assert (rs.risk_severity_rank("critical") < rs.risk_severity_rank("high")
+            < rs.risk_severity_rank("watch") < rs.risk_severity_rank("low"))
+    assert rs.risk_severity_rank("low") == rs.risk_severity_rank("healthy")
+    # unknown must rank strictly worse than healthy/low — never treated as safe
+    assert rs.risk_severity_rank("unknown") > rs.risk_severity_rank("healthy")
+    assert rs.risk_severity_rank(" Critical ") == 0        # case / whitespace tolerant
+    # the engine emits "medium"; it must rank with "watch", NOT fall through to the unknown bucket
+    assert rs.risk_severity_rank("medium") == rs.risk_severity_rank("watch") == 2
+    assert rs.risk_severity_rank("medium") < rs.risk_severity_rank("low")
+    assert rs.risk_severity_rank("nonsense") == 4          # unrecognised → unknown bucket
+
+
+def test_67_risk_tier_tone_unknown_never_green():
+    assert rs.risk_tier_tone("critical") == "red"
+    assert rs.risk_tier_tone("high") == "amber"
+    assert rs.risk_tier_tone("watch") == "blue" and rs.risk_tier_tone("medium") == "blue"
+    assert rs.risk_tier_tone("low") == "success" and rs.risk_tier_tone("healthy") == "success"
+    assert rs.risk_tier_tone("unknown") == "slate"
+    assert rs.risk_tier_tone("unknown") != rs.risk_tier_tone("healthy")   # unknown is not green
+
+
+def test_68_filter_risk_queue_by_tier():
+    out = rs.filter_risk_queue(_risk_df(), tier="critical")
+    assert set(out["sku"]) == {"SK02", "SK03", "SK06", "SK07", "SK08"}
+    assert set(rs.filter_risk_queue(_risk_df(), tier="all")["sku"]) == set(_risk_df()["sku"])
+
+
+def test_69_filter_risk_queue_query_sku_or_name_ci():
+    df = _risk_df()
+    assert set(rs.filter_risk_queue(df, query="FOXTROT")["sku"]) == {"SK06"}   # name only, case-insensitive
+    assert set(rs.filter_risk_queue(df, query="sk03")["sku"]) == {"SK03"}      # sku only, case-insensitive
+    assert rs.filter_risk_queue(df, query="zzz").empty
+
+
+def test_70_filter_risk_queue_projected_and_review_toggles():
+    df = _risk_df()
+    proj = rs.filter_risk_queue(df, projected_only=True)
+    assert proj["projected_stockout_date"].notna().all() and set(proj["sku"]) == {
+        "SK02", "SK03", "SK04", "SK06", "SK07"}
+    review = rs.filter_risk_queue(df, review_only=True)
+    assert set(review["sku"]) == {"SK05"}
+
+
+def test_71_revenue_total_excludes_nulls_never_zero():
+    total, missing = rs.risk_revenue_at_risk_total(_risk_df())
+    assert total == 1519.0        # 10+100+50+200+80+80+999 ; the null row is NOT added as 0
+    assert missing == 1           # SK05 has no price → reported as missing, not silently zeroed
+
+
+def test_72_trajectory_for_sku_filters_sku_and_horizon_sorted():
+    df = _traj_df([("SK01", "2026-07-03", 3), ("SK01", "2026-07-01", 1),
+                   ("SK01", "2026-07-02", 2), ("SK01", "2026-07-04", 4),
+                   ("SK02", "2026-07-01", 1)])
+    out, warns = rs.trajectory_for_sku(df, "SK01", horizon=3)
+    assert list(out["sku"].unique()) == ["SK01"]                       # other skus dropped
+    assert list(out["forecast_horizon_day"]) == [1, 2, 3]              # day 4 beyond horizon dropped
+    assert list(out["date"]) == list(pd.to_datetime(
+        ["2026-07-01", "2026-07-02", "2026-07-03"]))                   # sorted ascending
+    assert warns == []
+
+
+def test_73_trajectory_for_sku_dedups_with_warning():
+    df = _traj_df([("SK01", "2026-07-01", 1), ("SK01", "2026-07-01", 1),
+                   ("SK01", "2026-07-02", 2)])
+    out, warns = rs.trajectory_for_sku(df, "SK01")
+    assert len(out) == 2 and warns and "duplicate" in warns[0].lower()
+
+
+def test_74_full_product_label_is_complete_untruncated():
+    long_name = "Extra Strength Herbal Multivitamin Complex 120 Softgels Family Pack"
+    label = rs.full_product_label(long_name, "SK99")
+    assert label == f"{long_name} (SK99)" and long_name in label      # never truncated
+
+
+def test_75_full_product_label_falls_back_to_sku():
+    assert rs.full_product_label(None, "SK01") == "SK01"
+    assert rs.full_product_label(float("nan"), "SK01") == "SK01"
+    assert rs.full_product_label("SK01", "SK01") == "SK01"            # name == sku → no redundant "(SK01)"
+
+
+def test_76_legacy_context_has_no_decision_artifacts():
+    ctx = rs.legacy_context()
+    assert ctx["has_stockout_risk"] is False and ctx["has_stockout_trajectory"] is False
+    assert ctx["stockout_risk"] is None and ctx["stockout_trajectory"] is None
+    assert ctx["decisioning_status"] is None      # forecast-driven risk is unavailable in legacy mode
+
+
+def test_77_risk_artifacts_only_resolve_for_completed_run_with_decisions(tmp_path):
+    # completed run WITH decisions → flags true & files readable (dashboard reads, never recomputes)
+    run_id = "20260101T000000Z_groceries-pets_top3_dec077"
+    rd = _make_completed_run(tmp_path, run_id=run_id, n_sku=3)
+    _add_decision_artifacts(rd, [f"S{i}" for i in range(3)], run_id)
+    ctx = rs.resolve_run_context(rs._run_record(rd))
+    assert ctx["has_stockout_risk"] and ctx["stockout_risk"].exists()
+    # a running run cannot be activated at all → no risk surface for an incomplete run
+    _make_running_run(tmp_path)
+    with pytest.raises(rs.RunContextError):
+        rs.resolve_run_context(rs.discover_runs(tmp_path)[0])

@@ -617,5 +617,40 @@ CUSTOM_CSS = f"""
         letter-spacing: 0.6px; color: {COLORS["subtext"]}; }}
     .ipa-winner-card .mdl {{ font-size: 1.05rem; font-weight: 800; color: {COLORS["navy"]}; margin-top: 2px; }}
     .ipa-winner-card .met {{ font-size: 0.78rem; color: {COLORS["subtext"]}; margin-top: 4px; }}
+
+    /* ---------- Phase B: Stockout Risk page ---------- */
+    .ipa-rtier {{ display: inline-flex; align-items: center; gap: 6px; border-radius: 999px;
+        padding: 2px 10px; font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+        letter-spacing: 0.4px; }}
+    .ipa-rtier-critical {{ background: #FAE7E9; color: {COLORS["red"]}; }}
+    .ipa-rtier-high {{ background: #FBF0DC; color: {COLORS["amber"]}; }}
+    .ipa-rtier-watch {{ background: #E5EDFD; color: {COLORS["blue"]}; }}
+    .ipa-rtier-low, .ipa-rtier-healthy {{ background: #E4F5EC; color: {COLORS["success"]}; }}
+    .ipa-rtier-unknown {{ background: #EAEEF3; color: {COLORS["slate"]}; }}
+    .ipa-riskstripe {{ height: 4px; border-radius: 6px; margin: 0 0 10px 0; }}
+    .ipa-riskname {{ font-weight: 700; color: {COLORS["navy"]}; font-size: 0.95rem;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }}
+    .ipa-risksku {{ color: {COLORS["subtext"]}; font-size: 0.72rem; margin: 1px 0 6px 0; }}
+    .ipa-riskgrid {{ display: flex; flex-wrap: wrap; gap: 3px 18px; }}
+    .ipa-riskgrid .m {{ font-size: 0.75rem; color: {COLORS["subtext"]}; }}
+    .ipa-riskgrid .m b {{ color: {COLORS["navy"]}; font-weight: 700; }}
+    /* Selected risk card: stronger border + subtle red tint (scoped to keyed container) */
+    [class*="st-key-riskcard-sel-"] div[data-testid="stVerticalBlockBorderWrapper"] {{
+        border-color: {COLORS["red"]} !important;
+        box-shadow: 0 0 0 1px {COLORS["red"]}, 0 6px 16px rgba(11,31,51,0.10) !important;
+        background: #FFF7F7 !important;
+    }}
+    /* Card "open" buttons: full-width, quiet — scoped to the queue so global buttons are untouched */
+    [class*="st-key-riskopen-"] button {{ width: 100% !important; border-radius: 10px !important;
+        font-weight: 600 !important; }}
+    /* Reason-trace explanation card */
+    .ipa-reason {{ background: {COLORS["card"]}; border: 1px solid {COLORS["border"]};
+        border-left: 4px solid {COLORS["navy"]}; border-radius: 12px; padding: 14px 16px;
+        font-size: 0.9rem; color: {COLORS["text"]}; line-height: 1.55; white-space: normal; }}
+    .ipa-reason .h {{ font-weight: 700; color: {COLORS["navy"]}; margin-bottom: 4px;
+        display: flex; align-items: center; gap: 7px; }}
+    .ipa-dd-head {{ font-size: 1.15rem; font-weight: 800; color: {COLORS["navy"]}; line-height: 1.25;
+        margin: 2px 0 1px 0; }}
+    .ipa-dd-sub {{ color: {COLORS["subtext"]}; font-size: 0.82rem; margin-bottom: 6px; }}
 </style>
 """

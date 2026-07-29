@@ -15,3 +15,7 @@ pyarrow==17.0.0          # read/write data/processed/*.parquet
 statsmodels==0.14.4      # Holt / Holt-Winters exponential smoothing
 lightgbm==4.5.0          # global gradient-boosted model
 scikit-learn==1.5.2      # model utilities / metrics helpers
+
+# --- Dashboard (Streamlit UI + Plotly charts; imported by dashboard/app.py) ---
+streamlit==1.60.0        # dashboard UI
+plotly==6.9.0            # interactive charts (incl. Phase B risk trajectory)
