@@ -35,6 +35,12 @@ Doc3_Aqib_LightGBM.md's "READ THIS FIRST" callout and pilot_manifest.json):
   * Scoring: evaluate(preds, horizon=h, panel=panel) from src/evaluation.py — imported,
     never edited. preds carries only [sku, channel, date, y_pred] (never y_true).
     Reports WAPE (primary), MAE, MASE, RMSE, bias per the shared contract.
+  * Explanations: the future forecast additionally carries an `explanation` column — a
+    2-3 sentence, fully deterministic, template-based justification for each predicted
+    quantity, built from LightGBM's own `pred_contrib` (SHAP) breakdown for that exact
+    row (see _build_explanation). Not an LLM call — it can only describe features the
+    model actually used, never invent a reason. Backtest predictions don't get one
+    (they're for scoring, not dashboard display).
 
 Run:  python src/lgbm_global.py            (writes outputs/)
 """
@@ -89,6 +95,104 @@ FUTURE_COLUMN_MAP = {
     "ramadan_day": "ramadan_day",
     "ramadan_week": "ramadan_week",
 }
+
+WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+EXPLANATION_FLAG_FEATURES = ("on_promo", "is_public_holiday", "is_ramadan")
+
+
+def _feature_phrase(name: str, value: float) -> str:
+    """Human-readable phrase for one feature's real (unit-scale) value, used only to
+    pick WHICH features to talk about and how to describe them -- never to state an
+    exact numeric contribution in units (see _build_explanation's docstring for why)."""
+    if name == "units_lag_1":
+        return f"yesterday's sales of {value:.0f} units"
+    if name == "units_lag_7":
+        return f"sales of {value:.0f} units on this day last week"
+    if name == "units_lag_14":
+        return f"sales of {value:.0f} units two weeks ago"
+    if name == "units_roll_mean_7":
+        return f"a recent 7-day average of {value:.1f} units"
+    if name == "units_roll_mean_28":
+        return f"a recent 28-day average of {value:.1f} units"
+    if name == "units_roll_std_7":
+        return f"how volatile recent daily sales have been (7-day std of {value:.1f})"
+    if name == "effective_unit_price":
+        return f"the current price of {value:.0f}"
+    if name == "discount_pct":
+        return f"an active discount of {value * 100:.0f}%" if value else "no active discount"
+    if name == "on_promo":
+        return "an active promotion" if value else "no active promotion"
+    if name == "is_public_holiday":
+        return "a public holiday" if value else "no public holiday"
+    if name == "is_payday_window":
+        return "the payday window" if value else "being outside the payday window"
+    if name == "day_of_week":
+        return f"typical {WEEKDAY_NAMES[int(value)]} demand patterns"
+    if name == "is_weekend":
+        return "weekend demand patterns" if value else "weekday demand patterns"
+    if name == "week_of_year":
+        return f"this point in the year (week {int(value)})"
+    if name == "month":
+        return "seasonal patterns for this month"
+    if name == "is_ramadan":
+        return "the Ramadan period" if value else "being outside Ramadan"
+    if name in ("ramadan_day", "ramadan_week"):
+        unit = "day" if name == "ramadan_day" else "week"
+        return f"being {int(value)} {unit}s into Ramadan"
+    if name == "sku":
+        return "this product's own typical demand level"
+    return name
+
+
+def _rank_drivers(features: list[str], contrib: np.ndarray, k: int = 2, eps: float = 1e-3) -> list[tuple[str, float]]:
+    """Top-k features by |SHAP contribution|, in the model's raw (link) space.
+
+    Ranking and sign are valid in link space (tweedie uses a log link: a positive raw
+    contribution always increases the final exp()-transformed prediction, negative
+    always decreases it, regardless of the nonlinear rescaling) -- so "which features
+    mattered most" and "which direction" are both correct. The MAGNITUDE in link space
+    is not directly convertible to "N units", which is why _feature_phrase reports a
+    feature's real unit-scale VALUE (e.g. "7-day average of 14.2 units") rather than an
+    invented unit-scale contribution size.
+    """
+    pairs = [(f, contrib[i]) for i, f in enumerate(features) if abs(contrib[i]) > eps]
+    pairs.sort(key=lambda p: -abs(p[1]))
+    return pairs[:k]
+
+
+def _build_explanation(sku: str, date: pd.Timestamp, y_pred: float, features: list[str],
+                        feature_values: dict, contrib: np.ndarray) -> str:
+    """2-3 sentence, fully deterministic explanation for one future prediction.
+
+    Template-based from the model's own LightGBM `pred_contrib` (SHAP) breakdown for
+    this exact row -- not an LLM call, so it can never state a reason the model didn't
+    actually use. See _rank_drivers for why contribution magnitude isn't quoted directly.
+    """
+    date_str = pd.Timestamp(date).strftime("%b %d, %Y")
+    lead = f"Predicted {y_pred:.1f} units for {sku} on {date_str}."
+
+    drivers = _rank_drivers(features, contrib)
+    if not drivers:
+        return lead + (" This closely matches the model's baseline expectation for this "
+                        "product, with no single factor standing out.")
+
+    phrases = [
+        f"{_feature_phrase(f, feature_values[f])} ({'pushing it higher' if c > 0 else 'pulling it lower'})"
+        for f, c in drivers
+    ]
+    body = f"This is mainly shaped by {phrases[0]}" + (f" and {phrases[1]}." if len(phrases) > 1 else ".")
+
+    driver_names = {f for f, _ in drivers}
+    active_flags = [f for f in EXPLANATION_FLAG_FEATURES if feature_values.get(f)]
+    tail = ""
+    if not (driver_names & set(EXPLANATION_FLAG_FEATURES)):
+        if active_flags:
+            named = " and ".join(_feature_phrase(f, 1) for f in active_flags)
+            tail = f" {named.capitalize()} also applies to this date."
+        else:
+            tail = " No promotion, holiday, or Ramadan effect applies to this date."
+
+    return f"{lead} {body}{tail}"
 
 
 # ── contract load + audit ───────────────────────────────────────────────────────────
@@ -255,6 +359,8 @@ def run_future_forecast(panel: pd.DataFrame, future: pd.DataFrame, features: lis
             X = pd.DataFrame([feat])
             X["sku"] = X["sku"].astype(sku_categories)
             y_pred = float(np.clip(model.predict(X[features])[0], 0, None))
+            contrib = model.predict(X[features], pred_contrib=True)[0][:-1]  # drop base-value column
+            explanation = _build_explanation(sku, date, y_pred, features, feat, contrib)
 
             series.loc[date] = y_pred  # feed prediction back in for the next day's lags
             rows.append({
@@ -264,6 +370,7 @@ def run_future_forecast(panel: pd.DataFrame, future: pd.DataFrame, features: lis
                 "date": date,
                 "forecast_horizon_day": future_row["forecast_horizon_day"],
                 "y_pred": y_pred,
+                "explanation": explanation,
                 "as_of_date": as_of_date,
                 "model_version": MODEL_VERSION,
             })
