@@ -16,6 +16,7 @@ import base64
 import calendar
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from styles import (COLORS, CATEGORICAL, DONUT_COLORS, DONUT_HOVER, STATUS_COLORS, TONES, TONE_CYCLE,
                     CUSTOM_CSS, plotly_layout, style_axes, icon_svg)
+import run_service as rs   # Phase 5 run-aware backend service (framework-free, testable)
 
 # --------------------------------------------------------------------------
 # Paths
@@ -363,11 +365,13 @@ EVAL_KEYWORDS = ("wape", "mase", "scorecard", "evaluation", "comparison", "backt
 
 
 @st.cache_data(show_spinner=False)
-def discover_outputs():
-    """Scan outputs/ once and split files into forecast outputs vs evaluation outputs."""
+def discover_outputs(outputs_dir_str=None):
+    """Scan an outputs/ dir once and split files into forecast outputs vs evaluation outputs.
+    Defaults to the legacy global outputs/; run mode passes the active run's outputs dir."""
+    out_dir = Path(outputs_dir_str) if outputs_dir_str else OUTPUTS_DIR
     forecasts, evaluations = {}, {}
-    if OUTPUTS_DIR.exists():
-        for p in sorted(list(OUTPUTS_DIR.glob("*.csv")) + list(OUTPUTS_DIR.glob("*.parquet"))):
+    if out_dir.exists():
+        for p in sorted(list(out_dir.glob("*.csv")) + list(out_dir.glob("*.parquet"))):
             stem_low = p.stem.lower()
             data, status = _load_path(p)
             if data is None:
@@ -579,16 +583,74 @@ def generate_insights(mp_f, inv_f, manifest):
 
 
 # --------------------------------------------------------------------------
-# Load all data once
+# Phase 5 — resolve the ACTIVE data context (a completed run, or the legacy pilot)
 # --------------------------------------------------------------------------
-manifest, manifest_status = load_manifest()
-mp_raw, mp_status = load_model_panel()
-inv_raw, inv_status = load_inventory_context()
-ff_raw, ff_status, ff_name = load_forecast_features()
+@st.cache_data(show_spinner=False)
+def load_path_cached(path_string, mtime_ns):
+    """Path + mtime keyed loader — a completed run loads correctly and edits bust the cache."""
+    return _load_path(Path(path_string))
+
+
+def load_active(path):
+    """Load a context artifact (parquet/csv/json) or return (None, reason)."""
+    if not path:
+        return None, "not_found"
+    p = Path(path)
+    if not p.exists():
+        return None, "not_found"
+    return load_path_cached(str(p), p.stat().st_mtime_ns)
+
+
+def _discover_runs_fresh():
+    try:
+        return rs.discover_runs()
+    except Exception:            # never let a bad run tree crash the dashboard
+        return []
+
+
+RUNS_ALL = _discover_runs_fresh()
+COMPLETED_RUNS = [r for r in RUNS_ALL if r.get("is_completed")]
+LEGACY_LABEL = "Legacy fixed pilot"
+_run_labels = {rs.format_run_label(r): r for r in COMPLETED_RUNS}
+
+# The sidebar "Data source" selectbox writes this key; read the prior value now (before the
+# widget is drawn) so the loaders below pick the right paths on this rerun. A pending value
+# set by "Activate" on the Forecast Runs page is applied here, before the widget exists.
+_pending_ds = st.session_state.pop("_pending_data_source", None)
+if _pending_ds is not None:
+    st.session_state["data_source_choice"] = _pending_ds
+_ds_choice = st.session_state.get("data_source_choice")
+if _ds_choice not in ({LEGACY_LABEL} | set(_run_labels)):
+    _ds_choice = next(iter(_run_labels), LEGACY_LABEL)   # default: newest completed, else legacy
+
+ACTIVE_RUN = None
+CTX = rs.legacy_context()
+DATA_MODE = "legacy"
+if _ds_choice != LEGACY_LABEL and _ds_choice in _run_labels:
+    try:
+        ACTIVE_RUN = _run_labels[_ds_choice]
+        CTX = rs.resolve_run_context(ACTIVE_RUN)
+        DATA_MODE = "run"
+    except rs.RunContextError:
+        ACTIVE_RUN, CTX, DATA_MODE = None, rs.legacy_context(), "legacy"
+
+# --------------------------------------------------------------------------
+# Load all data once from the active context
+# --------------------------------------------------------------------------
+manifest, manifest_status = load_active(CTX["pilot_manifest"])
+mp_raw, mp_status = load_active(CTX["model_panel"])
+inv_raw, inv_status = load_active(CTX["inventory_context"])
+if DATA_MODE == "run":
+    ff_raw, ff_status = load_active(CTX["forecast_frame"])
+    ff_name = "forecast_frame.parquet"
+else:
+    ff_raw, ff_status, ff_name = load_forecast_features()
+# Synthetic scenario data + free-form outputs scanning remain legacy-global (Stockout Lab).
 stockout_raw, stockout_status = load_stockout_scenarios()
 replen_raw, replen_status = load_replenishment_events()
 simparams_raw, simparams_status = load_simulation_parameters()
-outputs_forecasts, outputs_evaluations = discover_outputs()
+outputs_forecasts, outputs_evaluations = discover_outputs(
+    str(CTX["outputs_dir"]) if DATA_MODE == "run" else None)
 
 if mp_raw is not None:
     mp_raw = mp_raw.copy()
@@ -599,6 +661,17 @@ sku_meta = build_sku_meta(mp_raw)
 inv_joined = inv_raw
 if inv_raw is not None and sku_meta is not None:
     inv_joined = inv_raw.merge(sku_meta[["sku", "category", "brand"]], on="sku", how="left")
+
+# Dynamic page-header badges from the active context (legacy keeps the pilot labels).
+def _active_badges():
+    if DATA_MODE == "run" and ACTIVE_RUN is not None:
+        n = ACTIVE_RUN.get("selected_sku_count") or (mp_raw["sku"].nunique() if mp_raw is not None else "—")
+        cat = ACTIVE_RUN.get("category") or "—"
+        return [("box", f"{n} selected SKUs"), ("folder", str(cat)), ("globe", "naheed_web")]
+    return [("box", "30 pilot SKUs"), ("globe", "naheed_web")]
+
+
+ACTIVE_BADGES = _active_badges()
 
 
 def _pretty_date(value, with_time=False):
@@ -634,9 +707,25 @@ else:
         unsafe_allow_html=True,
     )
 
+# ---- Data source selector (which run drives every page this rerun) ----
+with st.sidebar.container(key="ipa-datasource"):
+    st.markdown('<div class="ipa-nav-label">Data source</div>', unsafe_allow_html=True)
+    _ds_options = [LEGACY_LABEL] + list(_run_labels)
+    _ds_index = _ds_options.index(_ds_choice) if _ds_choice in _ds_options else 0
+    _ds_pick = st.selectbox("Data source", options=_ds_options, index=_ds_index,
+                            key="data_source_choice", label_visibility="collapsed")
+    if DATA_MODE == "run" and ACTIVE_RUN is not None:
+        st.markdown(f'<div class="ipa-ds-chip ipa-ds-run">Run · {ACTIVE_RUN.get("status")} · '
+                    f'{ACTIVE_RUN.get("selected_sku_count")} SKUs</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="ipa-ds-chip ipa-ds-legacy">Legacy fixed pilot · 30 SKUs</div>',
+                    unsafe_allow_html=True)
+st.sidebar.markdown("---")
+
 NAV_ITEMS = [
     ("Executive Overview", "home"),
     ("Demand Analytics", "bar_chart"),
+    ("Forecast Runs", "rocket_launch"),
     ("Forecast Explorer", "auto_graph"),
     ("Inventory & Reorder", "inventory_2"),
     ("Stockout Scenario Lab", "science"),
@@ -755,7 +844,7 @@ filters_active = {
 # ==========================================================================
 def page_executive_overview():
     render_page_header("Executive Overview", "Daily eCommerce Demand & Inventory Intelligence",
-                       badges=[("box", "30 pilot SKUs"), ("globe", "naheed_web")])
+                       badges=ACTIVE_BADGES)
     if mp_raw is None:
         empty_state("Historical demand data not found", "data/processed/model_panel.parquet is missing or unreadable.", "mail")
         return
@@ -884,7 +973,7 @@ def page_executive_overview():
 # ==========================================================================
 def page_demand_analytics():
     render_page_header("Demand Analytics", "Real historical sales — units observed on naheed_web",
-                       badges=[("box", "30 pilot SKUs"), ("globe", "naheed_web")])
+                       badges=ACTIVE_BADGES)
     if mp_raw is None:
         empty_state("Historical demand data not found", "data/processed/model_panel.parquet is missing or unreadable.", "mail")
         return
@@ -1048,12 +1137,76 @@ def page_demand_analytics():
 # ==========================================================================
 # PAGE 3 — FORECAST EXPLORER
 # ==========================================================================
+def _winner_card(title, row):
+    if row is None:
+        return f'<div class="ipa-winner-card"><div class="lbl">{title}</div><div class="mdl">—</div></div>'
+    return (f'<div class="ipa-winner-card"><div class="lbl">{title}</div>'
+            f'<div class="mdl">{row["model"]}</div>'
+            f'<div class="met">WAPE {row["wape"]:.3f} · MASE {row["mase"]:.3f} · '
+            f'MAE {row["mae"]:.2f} · bias {row["bias"]:+.2f}</div></div>')
+
+
+def _render_run_ranking_panel():
+    """Run-mode: model-ranking winner cards + comparison table + run summary (locked-holdout)."""
+    ranking, r_status = load_active(CTX["model_ranking"])
+    manifest_run, _ = load_active(CTX["run_manifest"])
+    section_title("Model Ranking", "Historical locked-holdout performance — not a guarantee of future accuracy.")
+    if ranking is None or getattr(ranking, "empty", True):
+        info_banner("Model ranking is unavailable for this run.", kind="synthetic")
+    else:
+        ranking = ranking.copy()
+        ranking["horizon"] = pd.to_numeric(ranking["horizon"], errors="coerce")
+
+        def _rank1(h):
+            sub = ranking[(ranking["horizon"] == h) & (ranking["rank"] == 1)]
+            return sub.iloc[0] if not sub.empty else None
+        op_model = (manifest_run or {}).get("operational_model")
+        op_h = (manifest_run or {}).get("operational_horizon")
+        op_row = None
+        if op_h is not None:
+            sub = ranking[(ranking["horizon"] == op_h) & (ranking["model"] == op_model)]
+            op_row = sub.iloc[0] if not sub.empty else _rank1(op_h)
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(_winner_card("7-day winner", _rank1(7)), unsafe_allow_html=True)
+        c2.markdown(_winner_card("14-day winner", _rank1(14)), unsafe_allow_html=True)
+        c3.markdown(_winner_card(f"Operational (h={op_h})", op_row), unsafe_allow_html=True)
+        sel_h = horizon if horizon in list(ranking["horizon"].dropna().unique()) else int(ranking["horizon"].max())
+        st.markdown(f'<div class="ipa-card-sub">Comparison @ {sel_h}-day horizon</div>', unsafe_allow_html=True)
+        cmp = ranking[ranking["horizon"] == sel_h][["rank", "model", "wape", "mase", "mae", "rmse", "bias"]]
+        st.dataframe(cmp.sort_values("rank"), width="stretch", hide_index=True)
+
+    if manifest_run:
+        with st.container(border=True):
+            st.markdown('<div class="ipa-card-title">Run Summary</div>', unsafe_allow_html=True)
+            fp = (manifest_run.get("dataset_fingerprint") or "")[:12]
+            metric_panel("", [
+                ("Run ID", manifest_run.get("run_id", "—")),
+                ("Category", (manifest_run.get("request") or {}).get("category", "—")),
+                ("Selected SKUs", manifest_run.get("selected_sku_count", "—")),
+                ("As-of date", (manifest_run.get("request") or {}).get("as_of_date", "—")),
+                ("Dataset fingerprint", f"{fp}…" if fp else "—"),
+                ("Completed models", ", ".join(manifest_run.get("completed_models", [])) or "—"),
+                ("Failed models", ", ".join(manifest_run.get("failed_models", [])) or "none"),
+                ("Operational", f"{manifest_run.get('operational_model','—')} (h={manifest_run.get('operational_horizon','—')})"),
+                ("Duration (s)", f"{manifest_run.get('duration_seconds') or 0:.1f}"),
+                ("Created (PKT)", rs.format_local_datetime(manifest_run.get("created_at"))),
+                ("Finished (PKT)", rs.format_local_datetime(
+                    manifest_run.get("completed_at") or manifest_run.get("failed_at"))),
+            ])
+            with st.expander("Artifact paths (relative)", expanded=False):
+                for a in (manifest_run.get("artifact_inventory") or [])[:24]:
+                    st.caption(f"{a.get('path')}  ·  {a.get('size_bytes')} bytes")
+
+
 def page_forecast_explorer():
     render_page_header("Forecast Explorer", "7–14 day demand forecast · historical backtest vs real future",
-                       badges=[("box", "30 pilot SKUs"), ("globe", "naheed_web")])
+                       badges=ACTIVE_BADGES)
     if mp_raw is None:
         empty_state("Historical demand data not found", "data/processed/model_panel.parquet is missing or unreadable.", "mail")
         return
+
+    if DATA_MODE == "run" and ACTIVE_RUN is not None:
+        _render_run_ranking_panel()
 
     prototype_df = build_prototype_forecast(mp_raw, horizon_days=14)
 
@@ -1218,7 +1371,7 @@ def page_forecast_explorer():
 # ==========================================================================
 def page_inventory_reorder():
     render_page_header("Inventory & Reorder", "Synthetic baseline snapshot · prioritised replenishment queue",
-                       badges=[("box", "30 pilot SKUs"), ("globe", "naheed_web")])
+                       badges=ACTIVE_BADGES)
     synthetic_warning(INVENTORY_PAGE_WARNING)
     if inv_raw is None:
         empty_state("Synthetic inventory context not generated", "data/processed/inventory_context.parquet is missing or unreadable.", "mail")
@@ -1355,7 +1508,7 @@ def page_inventory_reorder():
 # ==========================================================================
 def page_stockout_lab():
     render_page_header("Stockout Scenario Lab", "What-if simulation · fully synthetic scenario results",
-                       badges=[("box", "30 pilot SKUs"), ("globe", "naheed_web")])
+                       badges=ACTIVE_BADGES)
     synthetic_warning(
         "This entire page is synthetic and scenario-based. Rates shown are simulation outputs for pilot planning "
         "— not observed or predicted real-world probabilities."
@@ -1583,7 +1736,7 @@ def page_data_quality():
     render_page_header(
         "Data Quality & Assumptions",
         "Data contract · real vs synthetic · feature dictionary · validation",
-        badges=[("box", "30 pilot SKUs"), ("globe", "naheed_web")],
+        badges=ACTIVE_BADGES,
     )
     tab_contract, tab_split, tab_dict, tab_checks, tab_assume, tab_valid = st.tabs(
         ["Data Contract", "Real vs Synthetic", "Feature Dictionary", "Quality Checks", "Assumptions", "Validation"]
@@ -1732,12 +1885,199 @@ def page_data_quality():
             empty_state("Not available", "pilot_manifest.json is missing — validation status cannot be shown.", "file-text")
 
 
+# ==========================================================================
+# PAGE — FORECAST RUNS (Phase 5): generate a run, watch it, browse history
+# ==========================================================================
+def _friendly_status(state):
+    return rs.step_label(state)
+
+
+def _render_active_run_status(run_id):
+    """Read fresh status.json for `run_id` and render progress + per-model status."""
+    rec = next((r for r in rs.discover_runs() if r["run_id"] == run_id), None)
+    if rec is None:
+        st.info("Waiting for the run to initialise…")
+        return None
+    status = rec.get("status", "unknown")
+    st.markdown(f'<div class="ipa-run-card">', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Run", rec.get("run_id", "—")[:24] + "…")
+    c2.metric("Category", rec.get("category") or "—")
+    c3.metric("Requested Top N", rec.get("top_n") or "—")
+    st.progress(min(int(rec.get("progress_pct") or 0), 100) / 100.0,
+                text=f"{_friendly_status(rec.get('current_step', status))}  ·  {rec.get('progress_pct', 0)}%")
+    # per-model status from status.json
+    status_json = rs._read_json(Path(rec["run_dir"]) / "status.json")
+    stj = status_json.get("model_status", {})
+    m1, m2, m3 = st.columns(3)
+    for col, mdl, label in ((m1, "baseline", "Baseline"), (m2, "holtwinters", "Holt-Winters"),
+                            (m3, "lightgbm", "LightGBM")):
+        s = (stj.get(mdl) or {}).get("status", "—")
+        col.markdown(f'<div class="ipa-model-chip ipa-ms-{s}">{label}: {s}</div>', unsafe_allow_html=True)
+    # event timestamps — stored UTC, displayed in Pakistan time
+    ts_rows = [("Created", rec.get("created_at")), ("Started", status_json.get("started_at")),
+               ("Updated", status_json.get("updated_at"))]
+    if rec.get("completed_at"):
+        ts_rows.append(("Completed", rec.get("completed_at")))
+    if rec.get("failed_at"):
+        ts_rows.append(("Failed", rec.get("failed_at")))
+    st.caption(" · ".join(f"{lbl}: {rs.format_local_datetime(v)}" for lbl, v in ts_rows))
+    st.markdown('</div>', unsafe_allow_html=True)
+    if rec.get("is_failed"):
+        st.error(f"Run failed: {rec.get('error_message') or 'see pipeline log'}")
+        st.caption(f"pipeline log: runs/{rec['run_id']}/pipeline.log")
+    return rec
+
+
+@st.cache_data(show_spinner=False)
+def latest_sales_date_cached(db_mtime_ns):
+    """MAX(transaction_date) — cached per warehouse mtime (re-queried only after an ETL refresh)."""
+    return rs.get_latest_sales_date()
+
+
+@st.cache_data(show_spinner="Reading warehouse categories…")
+def eligible_categories_cached(db_mtime_ns, cutoff_str, min_history_days):
+    """Eligible-category aggregation over the full sales table — expensive, so cached per
+    (warehouse mtime, cutoff, min-history). Without this it re-ran on every widget keystroke."""
+    return rs.list_categories(rs.DEFAULT_DB_PATH, cutoff_str, int(min_history_days))
+
+
+def page_forecast_runs():
+    render_page_header("Forecast Runs", "Generate a run · watch progress · activate a completed run",
+                       badges=ACTIVE_BADGES)
+    db_ok = rs.DEFAULT_DB_PATH.exists()
+    db_mtime = rs.DEFAULT_DB_PATH.stat().st_mtime_ns if db_ok else 0
+    latest = latest_sales_date_cached(db_mtime) if db_ok else None
+
+    # ---- A. Generate Forecast ----------------------------------------------------------
+    section_title("Generate Forecast", "Launch the Phase 4 orchestrator over the live warehouse.")
+    if not db_ok:
+        empty_state("Warehouse unavailable",
+                    "inventory_etl/output/inventory.db was not found — run the ETL first.", "database")
+    else:
+        # Read the user's current cutoff / min-history (if already set) so the eligible counts
+        # match what will actually be launched; results are cached per combination.
+        _cutoff_pref = st.session_state.get("run_cutoff") or latest
+        _mhd_pref = int(st.session_state.get("run_mhd") or 28)
+        try:
+            cats = eligible_categories_cached(db_mtime, str(_cutoff_pref), _mhd_pref)
+        except Exception as exc:  # noqa: BLE001
+            cats = pd.DataFrame(columns=["category", "eligible_sku_count", "historical_units"])
+            st.warning(f"Could not list categories: {exc}")
+        cat_names = cats["category"].astype(str).tolist() if not cats.empty else []
+        cat_meta = {r["category"]: r for _, r in cats.iterrows()} if not cats.empty else {}
+
+        # Plain widgets (not st.form): st.form only pushes values to the script on submit, so
+        # the preview banner below would show the PREVIOUS submitted values (e.g. "requested 10")
+        # while the box already displays what you just typed (e.g. "3"). Live widgets keep the
+        # preview and the disabled-state in sync with what's actually in the fields.
+        fc1, fc2, fc3 = st.columns([2, 1, 1])
+        run_cat = fc1.selectbox("Category", options=cat_names or ["(no eligible categories)"],
+                                key="run_category")
+        top_n = fc2.number_input("Top N", min_value=1, max_value=100, value=10, step=1, key="run_top_n")
+        mhd = fc3.number_input("Min history days", min_value=1, max_value=365, value=28, key="run_mhd")
+        fd1, fd2 = st.columns(2)
+        as_of = fd1.date_input("As-of date", value=latest or date.today(), key="run_as_of")
+        cutoff = fd2.date_input("Selection cutoff", value=latest or date.today(), key="run_cutoff")
+        hz = st.multiselect("Forecast horizons", options=[7, 14], default=[7, 14], key="run_horizons")
+        allow_partial = st.checkbox("Allow partial success", value=False, key="run_allow_partial")
+
+        meta = cat_meta.get(run_cat)
+        elig = int(meta["eligible_sku_count"]) if meta is not None else 0
+        info_banner(
+            f"<strong>{elig}</strong> eligible products in <strong>{run_cat}</strong> · requested "
+            f"<strong>{int(top_n)}</strong> · as-of <strong>{as_of}</strong> · models: Baselines, "
+            "Holt-Winters, LightGBM. Fewer than Top N may be selected if eligible history is limited.",
+            kind="info")
+
+        session_active = st.session_state.get("active_run_id")
+        active_nonterminal = False
+        if session_active:
+            arec = next((r for r in RUNS_ALL if r["run_id"] == session_active), None)
+            active_nonterminal = bool(arec and not arec["is_terminal"])
+        disabled = (not db_ok or not cat_names or elig == 0 or cutoff > as_of or not hz or active_nonterminal)
+        if active_nonterminal:
+            st.warning("A run launched from this session is still in progress — wait for it to finish.")
+
+        if st.button("Generate Forecast", type="primary", disabled=disabled, key="generate_forecast_btn"):
+            try:
+                info = rs.launch_forecast_run(
+                    category=run_cat, top_n=int(top_n), as_of_date=as_of.isoformat(),
+                    selection_cutoff=cutoff.isoformat(), min_history_days=int(mhd),
+                    horizons=tuple(hz) or (7, 14), allow_partial_success=bool(allow_partial))
+                st.session_state["active_run_id"] = info["run_id"]
+                st.session_state["active_run_pid"] = info["pid"]
+                st.session_state["run_launch_time"] = info["launched_at"]
+                st.success(f"Launched run {info['run_id']} (pid {info['pid']}).")
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Launch failed: {exc}")
+
+    # ---- B. Active Run Status ----------------------------------------------------------
+    active_id = st.session_state.get("active_run_id")
+    if active_id:
+        section_title("Active Run Status")
+        st.caption("Times shown in Pakistan Standard Time (PKT).")
+        _launched = st.session_state.get("run_launch_time")
+        if _launched:
+            st.caption(f"Launched from this session at {rs.format_local_datetime(_launched)}"
+                       f" · pid {st.session_state.get('active_run_pid', '—')}")
+        if hasattr(st, "fragment"):
+            @st.fragment(run_every="2s")
+            def _live():
+                rec = _render_active_run_status(active_id)
+                if rec and rec.get("is_completed"):
+                    if st.button("Activate this run as the dashboard data source", key="activate_active"):
+                        st.session_state["_pending_data_source"] = rs.format_run_label(rec)
+                        st.rerun()
+            _live()
+        else:
+            _render_active_run_status(active_id)
+            if st.button("Refresh status", key="refresh_active"):
+                st.rerun()
+
+    # ---- C. Run History ----------------------------------------------------------------
+    section_title("Run History")
+    st.caption("Times shown in Pakistan Standard Time (PKT).")
+    if not RUNS_ALL:
+        empty_state("No runs yet", "Generate a forecast above to create your first run.", "rocket_launch")
+        return
+    rows = []
+    for r in RUNS_ALL:
+        w = r.get("winners_by_horizon") or {}
+        rows.append({
+            "Status": r.get("status"), "Created": rs.format_local_datetime(r.get("created_at")),
+            "Category": r.get("category"), "Top N": r.get("top_n"),
+            "SKUs": r.get("selected_sku_count"), "As-of": r.get("as_of_date"),
+            "7-day winner": w.get("7"), "14-day winner": w.get("14"),
+            "Operational": r.get("operational_model"),
+            "Duration (s)": r.get("duration_seconds"), "Run ID": r.get("run_id"),
+        })
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=280)
+
+    completed_ids = [r["run_id"] for r in RUNS_ALL if r["is_completed"]]
+    if completed_ids:
+        ac1, ac2 = st.columns([3, 1])
+        pick = ac1.selectbox("Activate a completed run", options=completed_ids, key="activate_pick")
+        if ac2.button("Activate", key="activate_history"):
+            rec = next(r for r in RUNS_ALL if r["run_id"] == pick)
+            st.session_state["_pending_data_source"] = rs.format_run_label(rec)
+            st.rerun()
+
+    insp = st.selectbox("Inspect pipeline log (any run)", options=[r["run_id"] for r in RUNS_ALL],
+                        key="inspect_run")
+    with st.expander("View pipeline log (last 200 lines)", expanded=False):
+        log_path = Path(next(r["run_dir"] for r in RUNS_ALL if r["run_id"] == insp)) / "pipeline.log"
+        st.text(rs.tail_log(log_path, 200) or "(no log yet)")
+
+
 # --------------------------------------------------------------------------
 # Router
 # --------------------------------------------------------------------------
 PAGE_FUNCS = {
     "Executive Overview": page_executive_overview,
     "Demand Analytics": page_demand_analytics,
+    "Forecast Runs": page_forecast_runs,
     "Forecast Explorer": page_forecast_explorer,
     "Inventory & Reorder": page_inventory_reorder,
     "Stockout Scenario Lab": page_stockout_lab,

@@ -596,5 +596,26 @@ CUSTOM_CSS = f"""
         .ipa-kpi-value {{ font-size: 1.1rem; }}
         .ipa-card {{ padding: 12px 14px; min-height: 90px; }}
     }}
+
+    /* ---------- Phase 5: data-source chip, run status, model chips, winner cards ---------- */
+    .st-key-ipa-datasource {{ margin-bottom: 4px; }}
+    .ipa-ds-chip {{ display: inline-block; margin-top: 6px; padding: 3px 10px; border-radius: 999px;
+        font-size: 0.7rem; font-weight: 700; letter-spacing: 0.3px; }}
+    .ipa-ds-run {{ background: {COLORS["teal"]}; color: #FFFFFF; }}
+    .ipa-ds-legacy {{ background: rgba(255,255,255,0.08); color: #DCE4EE; border: 1px solid rgba(255,255,255,0.18); }}
+    .ipa-run-card {{ background: {COLORS["card"]}; border: 1px solid {COLORS["border"]};
+        border-radius: 14px; padding: 8px 4px; margin: 4px 0 10px 0; }}
+    .ipa-model-chip {{ display: block; text-align: center; padding: 8px 10px; border-radius: 10px;
+        font-size: 0.82rem; font-weight: 700; border: 1px solid {COLORS["border"]}; }}
+    .ipa-ms-completed {{ background: #E4F5EC; color: {COLORS["success"]}; }}
+    .ipa-ms-running {{ background: #E5EDFD; color: {COLORS["blue"]}; }}
+    .ipa-ms-failed {{ background: #FAE7E9; color: {COLORS["red"]}; }}
+    .ipa-ms-pending {{ background: #EAEEF3; color: {COLORS["slate"]}; }}
+    .ipa-winner-card {{ background: {COLORS["card"]}; border: 1px solid {COLORS["border"]};
+        border-left: 4px solid {COLORS["teal"]}; border-radius: 12px; padding: 12px 14px; }}
+    .ipa-winner-card .lbl {{ font-size: 0.7rem; font-weight: 700; text-transform: uppercase;
+        letter-spacing: 0.6px; color: {COLORS["subtext"]}; }}
+    .ipa-winner-card .mdl {{ font-size: 1.05rem; font-weight: 800; color: {COLORS["navy"]}; margin-top: 2px; }}
+    .ipa-winner-card .met {{ font-size: 0.78rem; color: {COLORS["subtext"]}; margin-top: 4px; }}
 </style>
 """
