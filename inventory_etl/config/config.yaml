@@ -172,3 +172,32 @@ decisioning:
   # the sum of daily variances (cumulative sigma = root-sum-of-squares of daily sigmas).
   # Real demand errors are often autocorrelated; this is a documented pilot simplification.
   independent_daily_errors_rss: true
+
+  # ---- Phase C reorder recommendations — PILOT POLICIES ---------------------------------
+  # These turn the Phase B stockout-risk view + the operational forecast into ONE proposed
+  # buyer action per SKU/channel. They are CONFIGURABLE PILOT POLICIES, not universal business
+  # truths, and nothing here creates, submits or places a purchase order.
+  # The 14-day target cover is a pilot order-up-to policy (its source + value are recorded in
+  # every reorder output row and the reorder summary).
+  target_cover_days: 14
+  # Canonical action vocabulary (kept identity here; renaming is a display concern only).
+  action_names:
+    order_now: order_now
+    monitor: monitor
+    no_order: no_order
+    vendor_follow_up: vendor_follow_up
+    manual_review: manual_review
+  # Every actionable / follow-up / review recommendation is a PROPOSAL requiring buyer approval.
+  human_approval:
+    required_for_order_now: true
+    required_for_vendor_follow_up: true
+    required_for_manual_review: true
+  # When a critical input (stock, position, lead time, MOQ, pack size, cost) is missing/invalid.
+  missing_critical_input_policy:
+    action: manual_review
+    actionable_quantity: 0
+  # Quantity construction order: raw gap -> MOQ adjustment -> pack-size rounding -> final.
+  rounding_policy:
+    apply_moq_before_pack_rounding: true
+    require_integer_like_moq: true
+    require_integer_like_pack_size: true

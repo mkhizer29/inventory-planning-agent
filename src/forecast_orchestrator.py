@@ -48,6 +48,7 @@ import baselines                     # noqa: E402
 import holtwinters                   # noqa: E402
 import lgbm_global                   # noqa: E402
 import stockout_risk                 # noqa: E402  (Phase B — forecast-driven stockout risk)
+import reorder_recommendations       # noqa: E402  (Phase C — forecast-driven reorder recommendations)
 import decision_contract as dc       # noqa: E402
 
 DEFAULT_DB = REPO_ROOT / "inventory_etl" / "output" / "inventory.db"
@@ -77,6 +78,7 @@ STEP_PROGRESS = {
     "created": 0, "selecting_skus": 10, "preparing_data": 25,
     "running_baseline": 40, "running_holtwinters": 55, "running_lightgbm": 70,
     "validating_outputs": 85, "ranking_models": 92, "calculating_stockout_risk": 96,
+    "calculating_reorder_recommendations": 98,
     "completed": 100, "completed_with_warnings": 100, "failed": 100,
 }
 
@@ -508,6 +510,26 @@ def _validate_decision_artifacts(run_dir: Path, logger: logging.Logger) -> None:
     logger.info("Phase B artifacts validated: %d risk rows, %d trajectory rows", len(risk), len(traj))
 
 
+def _validate_reorder_artifacts(run_dir: Path, logger: logging.Logger) -> None:
+    """Independently re-load and validate the Phase C artifacts against the decision contract.
+    Raises RuntimeError on any missing/invalid artifact (fatal — a completed run must have them)."""
+    dec = run_dir / "decisions"
+    reco_p, summ_p = dec / "reorder_recommendations.parquet", dec / "reorder_summary.json"
+    for p in (reco_p, summ_p):
+        if not p.exists():
+            raise RuntimeError(f"Phase C did not write required decision artifact: {p.name}")
+    run_id = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))["run_id"]
+    risk = pd.read_parquet(dec / "stockout_risk.parquet")
+    reco = pd.read_parquet(reco_p)
+    summary = json.loads(summ_p.read_text(encoding="utf-8"))
+    if "y_true" in reco.columns or "units_observed" in reco.columns:
+        raise RuntimeError("Phase C reorder artifact contains a truth column")
+    dc.validate_reorder_recommendations(reco, risk[["sku", "channel"]].drop_duplicates(), run_id)
+    dc.validate_reorder_summary(summary, reco, run_id)
+    logger.info("Phase C artifacts validated: %d reorder rows, actions=%s",
+                len(reco), summary.get("count_by_action"))
+
+
 # ── artifact inventory + manifest ──────────────────────────────────────────────────────
 _MUTABLE = {"pipeline.log", "status.json", "run_manifest.json"}
 
@@ -573,6 +595,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
     combined = ranking = None
     op_meta: dict = {}
     decision_summary = None
+    reorder_summary = None
     sel_df = None
 
     def _fail(err_type: str, msg: str) -> dict:
@@ -585,7 +608,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
         return _finalize(run_dir, req, request_json, created_at, "failed", status,
                          sel_df, selection_warning, completed, failed, req["skip_models"],
                          combined, ranking, op_meta, errors, logger, handler,
-                         decision_summary=decision_summary)
+                         decision_summary=decision_summary, reorder_summary=reorder_summary)
 
     try:
         # 1) selection
@@ -655,6 +678,21 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
             return _fail("stockout_risk_failed",
                          f"Phase B stockout-risk failed: {type(exc).__name__}: {exc}")
 
+        # 7) Phase C — forecast-driven reorder recommendations. ALWAYS fatal on failure (even
+        # under allow_partial_success): allow_partial_success governs forecasting-model
+        # availability, NOT downstream decision-contract failures. A completed run MUST have
+        # valid reorder recommendations + summary.
+        _set_step(run_dir, status, "calculating_reorder_recommendations", logger)
+        try:
+            reorder_summary = reorder_recommendations.compute_reorder_recommendations(
+                run_dir, operational_model=op_meta["operational_model"],
+                operational_horizon=int(op_meta["operational_horizon"]), logger=logger)
+            _validate_reorder_artifacts(run_dir, logger)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Phase C failed: %s\n%s", exc, traceback.format_exc())
+            return _fail("reorder_recommendations_failed",
+                         f"Phase C reorder recommendations failed: {type(exc).__name__}: {exc}")
+
         final_status = "completed_with_warnings" if failed else "completed"
         status["status"] = final_status; status["current_step"] = final_status
         status["completed_at"] = _now()
@@ -662,7 +700,8 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
         return _finalize(run_dir, req, request_json, created_at, final_status, status,
                          sel_df, selection_warning, completed, failed, req["skip_models"],
                          combined, ranking, op_meta, errors, logger, handler,
-                         fingerprint=fingerprint, decision_summary=decision_summary)
+                         fingerprint=fingerprint, decision_summary=decision_summary,
+                         reorder_summary=reorder_summary)
     except RequestError:
         raise
     except Exception as exc:  # noqa: BLE001 — any post-dir error becomes a failed manifest, never a raise
@@ -671,7 +710,8 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
 
 def _finalize(run_dir, req, request_json, created_at, final_status, status, sel_df,
               selection_warning, completed, failed, skipped, combined, ranking, op_meta,
-              errors, logger, handler, fingerprint=None, decision_summary=None) -> dict:
+              errors, logger, handler, fingerprint=None, decision_summary=None,
+              reorder_summary=None) -> dict:
     # success/failure timestamp semantics (mirror status.json): completed_at is set only on
     # success and null on failure; failed_at is set only on failure and null on success.
     end_ts = _now()
@@ -716,6 +756,19 @@ def _finalize(run_dir, req, request_json, created_at, final_status, status, sel_
             "manual_review_count": decision_summary.get("manual_review_count"),
             "uncertainty_methods": decision_summary.get("uncertainty_methods"),
         } if decision_summary else None),
+        "stockout_policy_version": dc.STOCKOUT_POLICY_VERSION,
+        # Phase C — forecast-driven reorder recommendations
+        "reorder_recommendations_file": (reorder_summary or {}).get("reorder_recommendations_file"),
+        "reorder_summary_file": (reorder_summary or {}).get("reorder_summary_file"),
+        "reorder_validation_summary": ({
+            "reorder_rows": reorder_summary.get("reorder_rows") or reorder_summary.get("selected_series_count"),
+            "count_by_action": reorder_summary.get("count_by_action"),
+            "total_proposed_order_units": reorder_summary.get("total_proposed_order_units"),
+            "total_proposed_purchase_value": reorder_summary.get("total_proposed_purchase_value"),
+            "manual_review_count": reorder_summary.get("manual_review_count"),
+            "approval_required_count": reorder_summary.get("approval_required_count"),
+        } if reorder_summary else None),
+        "reorder_policy_version": dc.REORDER_POLICY_VERSION,
         "model_metrics": _model_metrics(combined),
         "validation_summary": {
             "fingerprints_match": fingerprint is not None,

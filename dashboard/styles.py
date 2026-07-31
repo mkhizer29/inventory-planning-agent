@@ -652,5 +652,41 @@ CUSTOM_CSS = f"""
     .ipa-dd-head {{ font-size: 1.15rem; font-weight: 800; color: {COLORS["navy"]}; line-height: 1.25;
         margin: 2px 0 1px 0; }}
     .ipa-dd-sub {{ color: {COLORS["subtext"]}; font-size: 0.82rem; margin-bottom: 6px; }}
+
+    /* ---------- Phase C: Inventory & Reorder page ---------- */
+    .ipa-action {{ display: inline-flex; align-items: center; gap: 6px; border-radius: 999px;
+        padding: 2px 10px; font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+        letter-spacing: 0.4px; }}
+    .ipa-action-order_now {{ background: #FAE7E9; color: {COLORS["red"]}; }}
+    .ipa-action-vendor_follow_up {{ background: #E5EDFD; color: {COLORS["blue"]}; }}
+    .ipa-action-manual_review {{ background: #FBF0DC; color: {COLORS["amber"]}; }}
+    .ipa-action-monitor {{ background: #EAEEF3; color: {COLORS["slate"]}; }}
+    .ipa-action-no_order {{ background: #E4F5EC; color: {COLORS["success"]}; }}
+    /* selected recommendation card: teal accent (scoped to keyed container) */
+    [class*="st-key-recocard-sel-"] div[data-testid="stVerticalBlockBorderWrapper"] {{
+        border-color: {COLORS["teal"]} !important;
+        box-shadow: 0 0 0 1px {COLORS["teal"]}, 0 6px 16px rgba(11,31,51,0.10) !important;
+        background: #F3FBFB !important;
+    }}
+    [class*="st-key-recoopen-"] button {{ width: 100% !important; border-radius: 10px !important;
+        font-weight: 600 !important; }}
+    /* quantity construction flow: raw gap -> MOQ -> pack -> final */
+    .ipa-qflow {{ display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; }}
+    .ipa-qstage {{ flex: 1 1 130px; min-width: 120px; background: {COLORS["card"]};
+        border: 1px solid {COLORS["border"]}; border-radius: 12px; padding: 10px 12px; }}
+    .ipa-qstage .lab {{ font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.4px;
+        color: {COLORS["subtext"]}; font-weight: 700; }}
+    .ipa-qstage .val {{ font-size: 1.3rem; font-weight: 800; color: {COLORS["navy"]}; margin-top: 2px; }}
+    .ipa-qstage .cap {{ font-size: 0.72rem; color: {COLORS["subtext"]}; margin-top: 3px; }}
+    .ipa-qstage.final {{ border-color: {COLORS["teal"]}; background: #F3FBFB; }}
+    /* approval panel — always "awaiting buyer review" in the pilot */
+    .ipa-approval {{ display: flex; align-items: center; gap: 12px; border-radius: 14px;
+        padding: 14px 18px; background: #FBF0DC; border: 1px solid #F0D9A6; }}
+    .ipa-approval .ico {{ color: {COLORS["amber"]}; display: inline-flex; }}
+    .ipa-approval .txt .h {{ font-weight: 800; color: {COLORS["navy"]}; }}
+    .ipa-approval .txt .s {{ font-size: 0.82rem; color: {COLORS["subtext"]}; }}
+    .ipa-recometrics {{ display: flex; flex-wrap: wrap; gap: 3px 16px; margin-top: 6px; }}
+    .ipa-recometrics .m {{ font-size: 0.75rem; color: {COLORS["subtext"]}; }}
+    .ipa-recometrics .m b {{ color: {COLORS["navy"]}; font-weight: 700; }}
 </style>
 """

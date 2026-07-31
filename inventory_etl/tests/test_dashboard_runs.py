@@ -745,3 +745,147 @@ def test_77_risk_artifacts_only_resolve_for_completed_run_with_decisions(tmp_pat
     _make_running_run(tmp_path)
     with pytest.raises(rs.RunContextError):
         rs.resolve_run_context(rs.discover_runs(tmp_path)[0])
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+# Phase C — reorder recommendation dashboard-service + UI helper tests
+# ══════════════════════════════════════════════════════════════════════════════════════════
+def _add_reorder_artifacts(rd: Path, skus, run_id):
+    dec = rd / "decisions"
+    dec.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"run_id": run_id, "sku": list(skus), "channel": "naheed_web",
+                  "action": (["order_now", "monitor", "no_order"] * 3)[:len(skus)],
+                  "recommended_order_quantity": [12, 0, 0][:len(skus)],
+                  "recommended_purchase_value": [600.0, None, None][:len(skus)]}
+                 ).to_parquet(dec / "reorder_recommendations.parquet", index=False)
+    (dec / "reorder_summary.json").write_text(json.dumps({
+        "run_id": run_id, "selected_series_count": len(skus), "order_now_count": 1}), encoding="utf-8")
+
+
+def _reorder_df():
+    """A deliberately shuffled reorder frame with an unambiguous buyer-priority order."""
+    return pd.DataFrame({
+        "sku": ["S1", "S2", "S3", "S4", "S5", "S6"],
+        "sku_name": ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"],
+        "action": ["no_order", "order_now", "order_now", "manual_review", "vendor_follow_up", "order_now"],
+        "overall_risk_tier": ["low", "critical", "critical", "high", "high", "critical"],
+        "stockout_probability": [0.05, 0.9, 0.9, 0.6, 0.6, 0.9],
+        "projected_stockout_date": [None, "2026-08-05", "2026-08-02", "2026-08-09", None, "2026-08-02"],
+        "recommended_purchase_value": [None, 100.0, 50.0, None, None, 80.0],
+        "recommended_order_quantity": [0, 24, 12, 0, 0, 36],
+        "raw_target_gap": [None, 20.0, 5.0, None, None, 30.0],
+        "moq_adjusted_quantity": [None, 24.0, 12.0, None, None, 30.0],
+        "rounded_order_quantity": [None, 24.0, 12.0, None, None, 36.0],
+        "recommended_order_date": [None, "2026-06-30", "2026-06-30", None, None, "2026-06-30"],
+        "approval_required": [False, True, True, True, True, True],
+        "assumption_flags": ["", "imputed_cost;synthetic_stock", "assumed_moq", "", "dropship", ""],
+        "reason_trace": [f"reason for S{i}" for i in range(1, 7)],
+    })
+
+
+# 40 — run_service resolves Phase C files safely when present
+def test_c40_context_exposes_reorder_when_present(tmp_path):
+    run_id = "20260101T000000Z_health-beauty_top3_rc001"
+    rd = _make_completed_run(tmp_path, run_id=run_id, n_sku=3)
+    _add_reorder_artifacts(rd, [f"S{i}" for i in range(3)], run_id)
+    ctx = rs.resolve_run_context(rs._run_record(rd))
+    assert ctx["reorder_available"] is True
+    assert ctx["reorder_recommendations"].exists() and ctx["reorder_summary"].exists()
+
+
+# 41 — reorder_available is False for an older completed run (still browsable, no crash)
+def test_c41_reorder_unavailable_old_run(tmp_path):
+    rd = _make_completed_run(tmp_path, run_id="20260101T000000Z_hb_top3_old_rc", n_sku=3)
+    ctx = rs.resolve_run_context(rs._run_record(rd))          # must NOT raise
+    assert ctx["reorder_available"] is False
+    assert ctx["reorder_recommendations"].exists() is False
+    assert ctx["selected_forecasts"].exists() and ctx["model_panel"].exists()   # still browsable
+
+
+# 42 — dynamic mode never treats inventory-context as Phase C: a run with an inventory-context
+#      recommendation column but no reorder artifacts still reports reorder_available False
+def test_c42_no_fallback_to_inventory_context(tmp_path):
+    rd = _make_completed_run(tmp_path, run_id="20260101T000000Z_hb_top3_nofb", n_sku=3)
+    # inventory_context (with its historical recommended_order_quantity) exists...
+    assert (rd / "processed" / "inventory_context.parquet").exists()
+    ctx = rs.resolve_run_context(rs._run_record(rd))
+    assert ctx["reorder_available"] is False          # ...but Phase C is still unavailable (no fallback)
+
+
+# 43 — long product names are preserved unchanged by the helper data
+def test_c43_long_name_unchanged(tmp_path):
+    long_name = "Ultra Gentle Micellar Cleansing Water for Sensitive Skin 400ml Twin Pack"
+    assert rs.full_product_label(long_name, "SK7") == f"{long_name} (SK7)"
+    assert long_name in rs.full_product_label(long_name, "SK7")
+
+
+# 44 — priority sorting is deterministic
+def test_c44_sort_reorder_deterministic(tmp_path):
+    ranked = rs.sort_reorder_queue(_reorder_df())
+    assert list(ranked["sku"]) == ["S6", "S3", "S2", "S5", "S4", "S1"]
+
+
+# 45 — action / tier / query / approval / assumed filters work
+def test_c45_filters(tmp_path):
+    df = _reorder_df()
+    assert set(rs.filter_reorder_queue(df, action="order_now")["sku"]) == {"S2", "S3", "S6"}
+    assert set(rs.filter_reorder_queue(df, tier="high")["sku"]) == {"S4", "S5"}
+    assert set(rs.filter_reorder_queue(df, query="foxtrot")["sku"]) == {"S6"}
+    assert set(rs.filter_reorder_queue(df, query="s5")["sku"]) == {"S5"}
+    assert "S1" not in set(rs.filter_reorder_queue(df, approval_only=True)["sku"])
+    # assumed/imputed inputs = imputed_cost / synthetic_stock / assumed_* (dropship is NOT one)
+    assert set(rs.filter_reorder_queue(df, assumed_only=True)["sku"]) == {"S2", "S3"}
+
+
+# 46 — null cost/purchase value stays null (never coerced to zero) in the total
+def test_c46_null_cost_stays_null(tmp_path):
+    total, missing = rs.reorder_purchase_value_total(_reorder_df())
+    assert total == 230.0            # 100 + 50 + 80 ; the null values are NOT added as 0
+    # S2, S3, S6 are order_now with values; none missing among order_now
+    assert missing == 0
+    df2 = _reorder_df()
+    df2.loc[df2["sku"] == "S2", "recommended_purchase_value"] = None
+    total2, missing2 = rs.reorder_purchase_value_total(df2)
+    assert total2 == 130.0 and missing2 == 1     # order_now S2 now unpriced -> counted, never zeroed
+
+
+# 47 — null dates remain null through the sort helper (no coercion)
+def test_c47_null_dates_preserved(tmp_path):
+    ranked = rs.sort_reorder_queue(_reorder_df())
+    s1 = ranked[ranked["sku"] == "S1"].iloc[0]
+    assert pd.isna(s1["recommended_order_date"]) and pd.isna(s1["projected_stockout_date"])
+
+
+# 48 — filtering to one SKU yields only that SKU (deep-dive selection is single-SKU)
+def test_c48_single_sku_selection(tmp_path):
+    one = rs.filter_reorder_queue(_reorder_df(), query="S3")
+    assert list(one["sku"]) == ["S3"] and len(one) == 1
+
+
+# 49 — quantity-stage values are display-only: helpers never recompute them
+def test_c49_quantity_stages_untouched(tmp_path):
+    df = _reorder_df()
+    ranked = rs.sort_reorder_queue(df)
+    s6 = ranked[ranked["sku"] == "S6"].iloc[0]
+    assert float(s6["raw_target_gap"]) == 30.0 and float(s6["moq_adjusted_quantity"]) == 30.0
+    assert float(s6["rounded_order_quantity"]) == 36.0 and int(s6["recommended_order_quantity"]) == 36
+    # filtering preserves the stages too
+    filt = rs.filter_reorder_queue(df, action="order_now")
+    assert set(filt["rounded_order_quantity"].dropna()) == {24.0, 12.0, 36.0}
+
+
+# 50 — reason trace is not truncated by the helper layer
+def test_c50_reason_trace_not_truncated(tmp_path):
+    df = _reorder_df()
+    ranked = rs.sort_reorder_queue(df)
+    got = dict(zip(ranked["sku"], ranked["reason_trace"]))
+    assert got == {f"S{i}": f"reason for S{i}" for i in range(1, 7)}
+    filt = rs.filter_reorder_queue(df, approval_only=True)
+    assert (filt["reason_trace"].astype(str).str.len() > 0).all()
+
+
+# 51 — the dashboard modules compile
+def test_c51_dashboard_modules_compile():
+    import py_compile
+    for name in ("app.py", "styles.py", "run_service.py"):
+        py_compile.compile(str(REPO_ROOT / "dashboard" / name), doraise=True)

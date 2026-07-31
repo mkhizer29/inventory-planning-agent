@@ -658,6 +658,13 @@ if DATA_MODE == "run" and CTX.get("has_stockout_trajectory"):
     traj_raw, traj_status = load_active(CTX["stockout_trajectory"])
 else:
     traj_raw, traj_status = None, "unavailable"
+# Phase C decision artifacts (run-scoped; absent on legacy or pre-Phase-C runs)
+if DATA_MODE == "run" and CTX.get("reorder_available"):
+    reorder_raw, reorder_status = load_active(CTX["reorder_recommendations"])
+    reorder_summary_raw, reorder_summary_status = load_active(CTX["reorder_summary"])
+else:
+    reorder_raw, reorder_status = None, "unavailable"
+    reorder_summary_raw, reorder_summary_status = None, "unavailable"
 outputs_forecasts, outputs_evaluations = discover_outputs(
     str(CTX["outputs_dir"]) if DATA_MODE == "run" else None)
 
@@ -944,7 +951,17 @@ def page_executive_overview():
         fig.update_xaxes(title="Total units")
         render_chart(fig, "Top 10 Products by Units Sold")
     with d2:
-        if inv_f is not None and not inv_f.empty:
+        # Run mode with Phase C → forecast-driven reorder proposals; else legacy synthetic snapshot.
+        if reorder_summary_raw and isinstance(reorder_summary_raw, dict):
+            s = reorder_summary_raw
+            metric_panel("Reorder Recommendations", [
+                ("Order Now", f"{int(s.get('order_now_count', 0))} / {int(s.get('selected_series_count', 0))}"),
+                ("Proposed Units", format_number(s.get("total_proposed_order_units"), 0)),
+                ("Proposed Purchase Value", format_currency(s.get("total_proposed_purchase_value"))),
+                ("Manual Review", format_number(s.get("manual_review_count"), 0)),
+                ("Vendor Follow-up", format_number(s.get("vendor_follow_up_count"), 0)),
+            ], sub="Forecast-driven planning proposals · buyer approval required")
+        elif inv_f is not None and not inv_f.empty:
             avg_cover = inv_f["days_of_cover"].mean()
             n_reco = int((inv_f["recommended_order_quantity"] > 0).sum())
             baseline_stockouts = int((inv_f["days_of_cover"] <= 0).sum())
@@ -1372,10 +1389,562 @@ def page_forecast_explorer():
 # ==========================================================================
 # PAGE 4 — INVENTORY & REORDER
 # ==========================================================================
+def _reorder_badges():
+    if DATA_MODE == "run" and ACTIVE_RUN is not None:
+        n_sel = ACTIVE_RUN.get("selected_sku_count")
+        cat = ACTIVE_RUN.get("category") or "All categories"
+        asof_raw = ACTIVE_RUN.get("as_of_date")
+        asof = rs.format_local_datetime(asof_raw, include_time=False) if asof_raw else "—"
+        opm = ACTIVE_RUN.get("operational_model") or "—"
+        tcd = 14
+        if reorder_summary_raw and isinstance(reorder_summary_raw, dict):
+            tcd = reorder_summary_raw.get("target_cover_days", 14)
+        return [
+            ("box", f"{n_sel if n_sel is not None else '—'} selected SKUs"),
+            ("tag", str(cat)),
+            ("calendar", f"As-of {asof}"),
+            ("layers", f"Model: {opm}"),
+            ("target", f"Target cover: {tcd}d"),
+        ]
+    return ACTIVE_BADGES
+
+
+REORDER_DISCLOSURE = (
+    "These are planning recommendations only. No purchase order has been created or sent. "
+    "Inventory stock, lead time, MOQ, pack size and unit cost may use pilot assumptions or imputation.")
+
+
 def page_inventory_reorder():
-    render_page_header("Inventory & Reorder", "Synthetic baseline snapshot · prioritised replenishment queue",
+    # Run mode with Phase C → the forecast-driven recommendation experience.
+    # Run mode without Phase C → a regeneration empty state (never fall back to the historical
+    # inventory-context quantity). Legacy fixed pilot → the clearly-labelled legacy page.
+    if DATA_MODE == "run":
+        if CTX.get("reorder_available") and reorder_raw is not None:
+            _page_inventory_reorder_run()
+        else:
+            render_page_header(
+                "Inventory & Reorder",
+                "Forecast-driven replenishment proposals · MOQ and pack rounding · buyer approval required",
+                badges=_reorder_badges())
+            empty_state(
+                "Reorder recommendations unavailable for this run",
+                "Reorder recommendations are unavailable for this run. Regenerate the forecast using "
+                "the current pipeline.", "package-search")
+        return
+    _page_inventory_reorder_legacy()
+
+
+def _page_inventory_reorder_run():
+    # ------------------------------------------------------------------
+    # Display-only helpers. This page ONLY reads the validated Phase C
+    # decision artifact — it never recomputes quantities, rounding or value.
+    # ------------------------------------------------------------------
+    ACTION_HEX = {"order_now": COLORS["red"], "vendor_follow_up": COLORS["blue"],
+                  "manual_review": COLORS["amber"], "monitor": COLORS["slate"],
+                  "no_order": COLORS["success"]}
+    TIER_HEX = {"critical": COLORS["red"], "high": COLORS["amber"], "medium": COLORS["blue"],
+                "watch": COLORS["blue"], "low": COLORS["success"], "healthy": COLORS["success"],
+                "unknown": COLORS["slate"]}
+
+    def _esc(x):
+        return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _safe_key(x):
+        return "".join(c if c.isalnum() else "-" for c in str(x))
+
+    def _help(txt, defn):
+        return f'<span title="{_esc(defn)}">{txt}</span>'
+
+    def _meta_val(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        s = str(x).strip()
+        return s if s and s.lower() not in ("nan", "none", "nat") else None
+
+    def _date_str(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return "—"
+        try:
+            d = pd.to_datetime(x)
+            return "—" if pd.isna(d) else d.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            s = str(x).strip()
+            return s if s and s.lower() not in ("nat", "nan", "none") else "—"
+
+    def _short(s, n=34):
+        s = str(s)
+        return s if len(s) <= n else s[:n - 1] + "…"
+
+    def _action_hex(a):
+        return ACTION_HEX.get(str(a).strip().lower(), COLORS["slate"])
+
+    def _action_chip(a):
+        a = str(a).strip().lower()
+        return f'<span class="ipa-action ipa-action-{a}">{rs.reorder_action_label(a)}</span>'
+
+    def _flags_to_list(flags):
+        if flags is None:
+            return []
+        if isinstance(flags, (list, tuple, np.ndarray)):
+            return [str(x).strip() for x in list(flags) if str(x).strip()]
+        if isinstance(flags, float) and pd.isna(flags):
+            return []
+        s = str(flags).strip()
+        if not s or s.lower() in ("nan", "none", "[]"):
+            return []
+        for sep in ("|", ";", ","):
+            if sep in s:
+                return [p.strip() for p in s.split(sep) if p.strip()]
+        return [s]
+
+    def _flag_pretty(f):
+        return _esc(str(f).replace("_", " ").strip().capitalize())
+
+    # ------------------------------------------------------------------
+    # Header + prominent, non-expander disclosure
+    # ------------------------------------------------------------------
+    render_page_header(
+        "Inventory & Reorder",
+        "Forecast-driven replenishment proposals · MOQ and pack rounding · buyer approval required",
+        badges=_reorder_badges())
+    info_banner(REORDER_DISCLOSURE, kind="synthetic")
+
+    reco = reorder_raw.copy()
+    if sel_skus:
+        reco = reco[reco["sku"].astype(str).isin([str(s) for s in sel_skus])]
+    if reco.empty:
+        empty_state("No SKUs in the current filter",
+                    "Clear the product filter in the sidebar to see the full recommendation queue.",
+                    "search")
+        return
+
+    # brand enrichment for display (backend cannot read model_panel; the dashboard can)
+    brand_by_sku = {}
+    if sku_meta is not None and "sku" in sku_meta.columns and "brand" in sku_meta.columns:
+        brand_by_sku = dict(zip(sku_meta["sku"].astype(str), sku_meta["brand"]))
+
+    # ==================================================================
+    # SECTION 1 — Reorder overview (exactly five KPIs)
+    # ==================================================================
+    section_title("Reorder overview",
+                  "Aggregated from the validated Phase C recommendations for the current selection.")
+    actions = reco["action"].astype(str).str.lower()
+    n_order = int((actions == "order_now").sum())
+    n_review = int((actions == "manual_review").sum())
+    n_vendor = int((actions == "vendor_follow_up").sum())
+    proposed_units = float(pd.to_numeric(reco["recommended_order_quantity"], errors="coerce").fillna(0).sum())
+    pv_total, pv_missing = rs.reorder_purchase_value_total(reco)
+
+    kpis = [
+        {"label": "Order Now", "value": format_number(n_order), "icon": "cart", "tone": "red",
+         "sub": _help("Ready to propose", "Count of SKUs whose recommended action is order_now.")},
+        {"label": "Proposed Units", "value": format_number(proposed_units), "icon": "box", "tone": "navy",
+         "sub": _help("Across order_now SKUs",
+                      "Sum of recommended_order_quantity across all rows (only order_now rows carry a positive quantity).")},
+        {"label": "Proposed Purchase Value", "value": format_currency(pv_total), "icon": "coin", "tone": "teal",
+         "sub": _help((f"{pv_missing} SKU(s) without a value" if pv_missing else "All proposed orders priced"),
+                      "Sum of recommended_purchase_value across priced order_now SKUs; unavailable values are excluded, never counted as zero.")},
+        {"label": "Manual Review", "value": format_number(n_review), "icon": "shield-check", "tone": "amber",
+         "sub": _help("Need a human decision",
+                      "Count of SKUs routed to manual_review (invalid input, insufficient horizon, or Phase B review).")},
+        {"label": "Vendor Follow-up", "value": format_number(n_vendor), "icon": "truck", "tone": "blue",
+         "sub": _help("Dropship / vendor-fulfilled",
+                      "Count of dropship SKUs where replenishment is a vendor follow-up, not a warehouse order.")},
+    ]
+    render_kpi_row(kpis, n_cols=5)
+
+    # ==================================================================
+    # SECTION 2 — Action distribution + purchase exposure
+    # ==================================================================
+    section_title("Recommended actions & purchase exposure", None)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        order = ["order_now", "vendor_follow_up", "manual_review", "monitor", "no_order"]
+        vc = actions.value_counts()
+        present = [a for a in order if a in vc.index] + [a for a in vc.index if a not in order]
+        donut = go.Figure(go.Pie(
+            labels=[rs.reorder_action_label(a) for a in present],
+            values=[int(vc[a]) for a in present], hole=0.62, sort=False, direction="clockwise",
+            marker=dict(colors=[_action_hex(a) for a in present], line=dict(color="white", width=1.5)),
+            textinfo="value",
+            hovertemplate="%{label}: %{value} SKUs (%{percent})<extra></extra>"))
+        donut.update_layout(**plotly_layout(height=330, legend=True))
+        donut.update_layout(annotations=[dict(text=f"{len(reco)}<br>SKUs", x=0.5, y=0.5, showarrow=False,
+                                              font=dict(size=15, color=COLORS["navy"]))])
+        render_chart(donut, "Recommended Actions",
+                     "One proposed buyer action per SKU. Fixed semantic colors; hover for counts and share.")
+    with col_b:
+        on = reco[actions == "order_now"].copy()
+        if on.empty:
+            with st.container(border=True):
+                empty_state("No order_now recommendations",
+                            "No SKUs in the current selection meet the reorder trigger.", "circle-dashed")
+        else:
+            on["_pv"] = pd.to_numeric(on["recommended_purchase_value"], errors="coerce").fillna(0.0)
+            on = on.sort_values("_pv", ascending=True).tail(15)
+            names = [rs.full_product_label(n, s) for n, s in zip(on.get("sku_name"), on["sku"])]
+            cust = list(zip(names, on["sku"].astype(str),
+                            [format_number(v, 0) for v in on["recommended_order_quantity"]],
+                            [format_currency(v, 2) for v in on["unit_cost_effective"]],
+                            [(_meta_val(c) or "—") for c in on["cost_source"]],
+                            ["imputed" if bool(v) else "observed" for v in on["cost_is_imputed"]]))
+            bar = go.Figure(go.Bar(
+                x=on["_pv"], y=on["sku"].astype(str), orientation="h",
+                marker=dict(color=COLORS["teal"]), customdata=cust,
+                hovertemplate=("<b>%{customdata[0]}</b><br>SKU %{customdata[1]}<br>"
+                               "Proposed qty: %{customdata[2]} u<br>Unit cost: %{customdata[3]}<br>"
+                               "Purchase value: %{x:,.0f}<br>Cost source: %{customdata[4]} (%{customdata[5]})"
+                               "<extra></extra>")))
+            bar.update_layout(**plotly_layout(legend=False, height=330))
+            style_axes(bar)
+            bar.update_yaxes(tickmode="array", tickvals=on["sku"].astype(str).tolist(),
+                             ticktext=[_short(n) for n in names], title="", automargin=True)
+            bar.update_xaxes(title_text="Proposed purchase value (PKR)")
+            render_chart(bar, "Proposed Purchase Value by Product",
+                         "order_now SKUs only. Hover for the full product name, quantity, unit cost and cost source.")
+
+    # ==================================================================
+    # SECTION 3 — Priority action queue (filters + clickable cards)
+    # ==================================================================
+    section_title("Priority action queue",
+                  "Ranked by action priority, then risk, probability, projected date, purchase value "
+                  "and name. Click a card to open its full recommendation below.")
+    fc = st.columns([1.2, 1.2, 1.6, 1, 1])
+    with fc[0]:
+        act_opts = ["All actions"] + [rs.reorder_action_label(a) for a in present]
+        act_pick = st.selectbox("Action", options=act_opts, key="reorder_action")
+    with fc[1]:
+        tiers_present = [t for t in ["critical", "high", "medium", "watch", "low", "healthy", "unknown"]
+                        if t in set(reco["overall_risk_tier"].astype(str).str.lower())]
+        tier_opts = ["All tiers"] + [t.capitalize() for t in tiers_present]
+        tier_pick = st.selectbox("Risk tier", options=tier_opts, key="reorder_tier")
+    with fc[2]:
+        query = st.text_input("Search product or SKU", key="reorder_query",
+                              placeholder="product name or SKU code")
+    with fc[3]:
+        approval_only = st.checkbox("Approval only", key="reorder_approval_only")
+    with fc[4]:
+        assumed_only = st.checkbox("Assumed only", key="reorder_assumed_only")
+
+    action_arg = None
+    if act_pick != "All actions":
+        action_arg = {rs.reorder_action_label(a): a for a in present}.get(act_pick, act_pick)
+    tier_arg = None if tier_pick == "All tiers" else tier_pick
+    filtered = rs.filter_reorder_queue(reco, action=action_arg, tier=tier_arg, query=query,
+                                       approval_only=approval_only, assumed_only=assumed_only)
+    ranked = rs.sort_reorder_queue(filtered)
+    valid_skus = ranked["sku"].astype(str).tolist() if ranked is not None and not ranked.empty else []
+
+    cur = st.session_state.get("reorder_selected_sku")
+    if cur not in valid_skus:
+        cur = valid_skus[0] if valid_skus else None
+        st.session_state["reorder_selected_sku"] = cur
+
+    if not valid_skus:
+        info_banner("No SKUs match these filters. Adjust the action, tier, search or toggles above.", kind="info")
+        return
+
+    def _render_reco_card(row, selected):
+        sku = str(row["sku"])
+        safe = _safe_key(sku)
+        keyname = f"recocard-sel-{safe}" if selected else f"recocard-{safe}"
+        name = row.get("sku_name")
+        nm = None if (name is None or (isinstance(name, float) and pd.isna(name))) else str(name).strip()
+        disp = nm if (nm and nm.lower() != "nan") else sku
+        full = rs.full_product_label(name, sku)
+        tier = str(row.get("overall_risk_tier") or "unknown")
+        with st.container(border=True, key=keyname):
+            st.markdown(f'<div class="ipa-riskstripe" style="background:{_action_hex(row.get("action"))};"></div>',
+                        unsafe_allow_html=True)
+            st.markdown(
+                '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">'
+                f'<span class="ipa-riskname" title="{_esc(full)}">{_esc(disp)}</span>'
+                f'{_action_chip(row.get("action"))}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="ipa-risksku" title="{_esc(full)}">SKU {_esc(sku)} · risk {_esc(tier)}</div>',
+                        unsafe_allow_html=True)
+            st.markdown(
+                '<div class="ipa-recometrics">'
+                f'<span class="m">Days cover <b>{format_number(row.get("days_of_cover"), 1)}</b></span>'
+                f'<span class="m">Inv. position <b>{format_number(row.get("inventory_position_for_risk"), 0)}</b></span>'
+                f'<span class="m">Reorder pt <b>{format_number(row.get("forecast_driven_reorder_point"), 0)}</b></span>'
+                f'<span class="m">Proposed qty <b>{format_number(row.get("recommended_order_quantity"), 0)}</b></span>'
+                f'<span class="m">Value <b>{format_currency(row.get("recommended_purchase_value"))}</b></span>'
+                f'<span class="m">Approval <b>{"required" if bool(row.get("approval_required")) else "—"}</b></span>'
+                '</div>', unsafe_allow_html=True)
+            with st.container(key=f"recoopen-{safe}"):
+                if st.button(("● Selected" if selected else "View details"),
+                             key=f"recobtn-{safe}", width="stretch",
+                             type="primary" if selected else "secondary"):
+                    st.session_state["reorder_selected_sku"] = sku
+                    st.rerun()
+
+    MAX_CARDS = 60
+    show_rows = ranked.head(MAX_CARDS)
+    if len(ranked) > MAX_CARDS:
+        info_banner(f"Showing the top {MAX_CARDS} of {len(ranked)} matching SKUs by priority.", kind="info")
+    records = show_rows.to_dict("records")
+    for i in range(0, len(records), 2):
+        ccols = st.columns(2)
+        for ccol, rec in zip(ccols, records[i:i + 2]):
+            with ccol:
+                _render_reco_card(rec, selected=(str(rec["sku"]) == str(cur)))
+
+    # ==================================================================
+    # SECTION 4 — Selected recommendation deep dive
+    # ==================================================================
+    sel = reco[reco["sku"].astype(str) == str(cur)]
+    if sel.empty:
+        return
+    r = sel.iloc[0]
+    full = rs.full_product_label(r.get("sku_name"), r["sku"])
+    cat_val = _meta_val(r.get("category"))
+    brand_val = _meta_val(brand_by_sku.get(str(r["sku"])))
+    meta_bits = [b for b in (cat_val, brand_val, _meta_val(r.get("channel"))) if b]
+
+    section_title("Selected recommendation", None)
+    st.markdown(f'<div class="ipa-dd-head">{_esc(full)}</div>', unsafe_allow_html=True)
+    st.markdown('<div class="ipa-dd-sub">'
+                f'{_esc(" · ".join(meta_bits) if meta_bits else "—")} &nbsp;{_action_chip(r.get("action"))}'
+                '</div>', unsafe_allow_html=True)
+
+    # A. decision summary — exactly four cards
+    approval_txt = "Buyer approval required" if bool(r.get("approval_required")) else "No approval needed"
+    dd = [
+        {"label": "Recommended action", "value": rs.reorder_action_label(r.get("action")),
+         "icon": "target", "tone": rs.reorder_action_tone(r.get("action")),
+         "sub": "One proposed action per SKU"},
+        {"label": "Proposed quantity", "value": f'{format_number(r.get("recommended_order_quantity"), 0)} u',
+         "icon": "box", "tone": "navy", "sub": "0 for non-order actions"},
+        {"label": "Proposed purchase value", "value": format_currency(r.get("recommended_purchase_value")),
+         "icon": "coin", "tone": "teal", "sub": "Quantity × effective unit cost"},
+        {"label": "Approval status", "value": ("Awaiting review" if bool(r.get("approval_required")) else "—"),
+         "icon": "shield-check", "tone": "amber", "sub": approval_txt},
+    ]
+    render_kpi_row(dd, n_cols=4)
+
+    # B. trigger & inventory position
+    trig = "Yes" if bool(r.get("reorder_triggered")) else "No"
+    left, right = st.columns([1, 1])
+    with left:
+        metric_panel("Trigger & inventory position", [
+            ("Current stock", format_number(r.get("stock_on_hand"), 0)
+             + (" (synthetic)" if bool(r.get("stock_on_hand_is_synthetic")) else "")),
+            ("Reported on-order", format_number(r.get("reported_on_order_quantity"), 0)),
+            ("Usable on-order", format_number(r.get("usable_on_order_quantity"), 0)),
+            ("Inventory position", format_number(r.get("inventory_position_for_risk"), 0)),
+            ("Forecast-driven reorder point", format_number(r.get("forecast_driven_reorder_point"), 0)),
+            ("Reorder triggered", trig),
+            ("Days of cover", format_number(r.get("days_of_cover"), 1)),
+            ("Risk tier", str(r.get("overall_risk_tier") or "—").capitalize()),
+            ("Stockout probability", format_percentage(r.get("stockout_probability"))),
+            ("Projected stockout date", _date_str(r.get("projected_stockout_date"))),
+        ], sub="“—” means not available (never shown as zero).")
+    with right:
+        # comparison chart: inventory position vs reorder point vs target stock
+        comp_labels = ["Inventory position", "Forecast reorder point", "Target stock"]
+        comp_vals = [r.get("inventory_position_for_risk"), r.get("forecast_driven_reorder_point"),
+                     r.get("target_stock")]
+        comp_num = [float(v) if _meta_val(v) is not None and pd.notna(v) else None for v in comp_vals]
+        cmp = go.Figure(go.Bar(
+            x=comp_labels, y=[v if v is not None else 0 for v in comp_num],
+            marker=dict(color=[COLORS["navy"], COLORS["amber"], COLORS["teal"]]),
+            customdata=[format_number(v, 0) for v in comp_num],
+            hovertemplate="%{x}: %{customdata} units<extra></extra>"))
+        cmp.update_layout(**plotly_layout(legend=False, height=300))
+        style_axes(cmp)
+        cmp.update_yaxes(title_text="Units")
+        render_chart(cmp, "Position vs Reorder Point vs Target Stock",
+                     "Exact units on hover. Target stock is the order-up-to level for the target-cover policy.")
+
+    # C. quantity construction (four-stage flow)
+    section_title("Quantity construction", "Raw target gap → MOQ adjusted → pack rounded → final proposal.")
+    is_order = str(r.get("action")).lower() == "order_now"
+    raw_gap = r.get("raw_target_gap")
+    moq = r.get("moq")
+    pack = r.get("pack_size")
+    moq_adj = r.get("moq_adjusted_quantity")
+    rounded = r.get("rounded_order_quantity")
+    final_q = r.get("recommended_order_quantity")
+    prov = r.get("provisional_calculated_quantity")
+    if is_order:
+        stages = [
+            ("Raw target gap", format_number(raw_gap, 0), "target stock − inventory position"),
+            ("MOQ adjusted", format_number(moq_adj, 0), f"MOQ {format_number(moq, 0)}"),
+            ("Pack rounded", format_number(rounded, 0), f"pack {format_number(pack, 0)}"),
+            ("Final proposal", format_number(final_q, 0), "buyer approval required"),
+        ]
+        flow = ""
+        for i, (lab, val, cap) in enumerate(stages):
+            cls = "ipa-qstage final" if i == len(stages) - 1 else "ipa-qstage"
+            flow += (f'<div class="{cls}"><div class="lab">{_esc(lab)}</div>'
+                     f'<div class="val">{_esc(val)}</div><div class="cap">{_esc(cap)}</div></div>')
+            if i < len(stages) - 1:
+                flow += '<div class="ipa-qarrow">→</div>'
+        st.markdown(f'<div class="ipa-qflow">{flow}</div>', unsafe_allow_html=True)
+    else:
+        prov_txt = (f"A provisional (non-actionable) quantity of {format_number(prov, 0)} units was safely "
+                    f"calculated for reference." if prov is not None and pd.notna(prov)
+                    else "No provisional quantity could be safely calculated.")
+        info_banner(f"Final actionable quantity is <strong>0</strong> for a "
+                    f"<strong>{_esc(rs.reorder_action_label(r.get('action')))}</strong> recommendation "
+                    f"— MOQ and pack rounding are not applied to the actionable quantity. {prov_txt}",
+                    kind="info")
+        if raw_gap is not None and pd.notna(raw_gap):
+            st.caption(f"Diagnostic raw target gap: {format_number(raw_gap, 0)} units "
+                       f"(does not create an order without the reorder trigger).")
+
+    # D. demand & target-stock inputs
+    # E. ordering & cost — shown side by side
+    d_col, e_col = st.columns(2)
+    with d_col:
+        metric_panel("Demand & target-stock inputs", [
+            ("Operational model", _esc(str(r.get("operational_model") or "—"))),
+            ("Operational horizon", f'{format_number(r.get("operational_horizon"), 0)} d'),
+            ("Lead time", f'{format_number(r.get("lead_time_days"), 0)} d '
+                          f'({_meta_val(r.get("lead_time_source")) or "—"})'),
+            ("Lead-time demand (mean)", format_number(r.get("lead_time_demand_mean"), 0)),
+            ("Lead-time safety stock", format_number(r.get("lead_time_safety_stock"), 0)),
+            ("Target-cover days", format_number(r.get("target_cover_days"), 0)),
+            ("Planning-horizon days", format_number(r.get("planning_horizon_days"), 0)),
+            ("Planning-horizon demand", format_number(r.get("planning_horizon_demand_mean"), 1)),
+            ("Planning-horizon sigma", format_number(r.get("planning_horizon_sigma"), 1)),
+            ("Service-level target", format_percentage(r.get("service_level_target"))),
+            ("Service-level z", format_number(r.get("service_level_z"), 2)),
+            ("Planning safety stock", format_number(r.get("planning_safety_stock"), 0)),
+            ("Target stock", format_number(r.get("target_stock"), 0)),
+        ], sub="Forecast-driven; “—” means not available.")
+    with e_col:
+        metric_panel("Ordering & cost", [
+            ("Recommended order date", _date_str(r.get("recommended_order_date"))),
+            ("Expected arrival date", _date_str(r.get("expected_arrival_date"))),
+            ("MOQ", f'{format_number(r.get("moq"), 0)} ({_meta_val(r.get("moq_source")) or "—"})'),
+            ("Pack size", f'{format_number(r.get("pack_size"), 0)} ({_meta_val(r.get("pack_size_source")) or "—"})'),
+            ("Unit cost (effective)", format_currency(r.get("unit_cost_effective"), 2)),
+            ("Cost source", _meta_val(r.get("cost_source")) or "—"),
+            ("Cost imputed", "Yes (estimated)" if bool(r.get("cost_is_imputed")) else "No"),
+            ("Cost quality", _meta_val(r.get("cost_quality_flag")) or "—"),
+            ("Currency", _meta_val(r.get("cost_currency")) or "—"),
+            ("Cost basis", _meta_val(r.get("cost_basis")) or "—"),
+            ("Proposed purchase value", format_currency(r.get("recommended_purchase_value"))),
+        ], sub="Supplier calendars, weekends and working-day schedules are not available.")
+
+    # ==================================================================
+    # SECTION 5 — Why this action was recommended
+    # ==================================================================
+    section_title("Why this action was recommended", None)
+    reason = r.get("reason_trace")
+    reason_txt = "" if (reason is None or (isinstance(reason, float) and pd.isna(reason))) else str(reason)
+    st.markdown(
+        f'<div class="ipa-reason"><div class="h">{icon_svg("file-text", 16)} Decision rationale</div>'
+        f'{_esc(reason_txt) if reason_txt else "No reason trace was recorded for this SKU."}</div>',
+        unsafe_allow_html=True)
+    codes = _flags_to_list(r.get("review_reason_codes"))
+    if codes:
+        chips = "".join(f'<span class="ipa-rtier ipa-rtier-unknown">{_flag_pretty(c)}</span> ' for c in codes)
+        st.markdown(f'<div style="margin-top:8px;">{chips}</div>', unsafe_allow_html=True)
+
+    # ==================================================================
+    # SECTION 6 — Assumptions & approval
+    # ==================================================================
+    st.markdown(
+        '<div class="ipa-approval" style="margin-top:10px;">'
+        f'<span class="ico">{icon_svg("clock", 22)}</span>'
+        '<div class="txt"><div class="h">Status: Awaiting buyer review</div>'
+        '<div class="s">This is a planning proposal. No purchase order has been approved, submitted, '
+        'placed or sent to any supplier.</div></div></div>', unsafe_allow_html=True)
+
+    with st.expander("Assumptions, cost quality and decision limitations", expanded=False):
+        def _yn(b):
+            return "Yes" if b else "No"
+        flag_items = _flags_to_list(r.get("assumption_flags"))
+        conds = [
+            f"Synthetic stock: {_yn(bool(r.get('stock_on_hand_is_synthetic')))}",
+            f"Lead-time source: {_meta_val(r.get('lead_time_source')) or '—'}",
+            f"MOQ source: {_meta_val(r.get('moq_source')) or '—'}",
+            f"Pack-size source: {_meta_val(r.get('pack_size_source')) or '—'}",
+            f"Cost source: {_meta_val(r.get('cost_source')) or '—'}",
+            f"Cost imputed (estimated): {_yn(bool(r.get('cost_is_imputed')))}",
+            f"Insufficient forecast horizon: {_yn(bool(r.get('insufficient_horizon')))}",
+            f"Decision policy version: {_meta_val(r.get('decision_policy_version')) or '—'}",
+        ]
+        st.markdown("**Conditions for this SKU**")
+        st.markdown("\n".join(f"- {c}" for c in conds))
+        if flag_items:
+            st.markdown("**Assumption flags recorded in the artifact**")
+            st.markdown("\n".join(f"- {_flag_pretty(f)}" for f in flag_items))
+        if codes:
+            st.markdown("**Manual-review reasons**")
+            st.markdown("\n".join(f"- {_flag_pretty(c)}" for c in codes))
+        st.markdown("**Known limitations**")
+        for d in (
+            "Supplier calendars, weekends and working-day schedules are not available, so the expected "
+            "arrival date is a simple lead-time offset.",
+            "Undated inbound (on-order) stock is excluded from the inventory position.",
+            "Lead time, MOQ and pack size may be pilot assumptions; unit cost may be imputed.",
+            "Recommendations are forecast-driven planning proposals — no purchase order is created.",
+        ):
+            st.markdown(f"- {d}")
+        with st.expander("Advanced: raw decision fields", expanded=False):
+            adv_fields = ["reorder_triggered", "insufficient_horizon", "raw_target_gap",
+                          "raw_order_quantity", "moq_adjusted_quantity", "rounded_order_quantity",
+                          "provisional_calculated_quantity", "planning_horizon_days",
+                          "available_forecast_horizon_days", "service_level_z", "confidence_label",
+                          "order_placed", "human_follow_up_required", "manual_review_required",
+                          "decision_policy_version", "generated_at"]
+            adv_rows = []
+            for f in adv_fields:
+                v = r.get(f)
+                disp = "—" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)
+                adv_rows.append({"field": f, "value": disp})
+            st.dataframe(pd.DataFrame(adv_rows), use_container_width=True, hide_index=True)
+
+    # ==================================================================
+    # SECTION 7 — Complete recommendation table
+    # ==================================================================
+    with st.expander("View complete reorder recommendations", expanded=False):
+        colmap = [
+            ("action", "Action"), ("sku_name", "Product"), ("sku", "SKU"), ("channel", "Channel"),
+            ("overall_risk_tier", "Risk"), ("stockout_probability", "Stockout Probability"),
+            ("days_of_cover", "Days of Cover"), ("inventory_position_for_risk", "Inventory Position"),
+            ("forecast_driven_reorder_point", "Reorder Point"), ("target_stock", "Target Stock"),
+            ("raw_target_gap", "Raw Gap"), ("moq", "MOQ"), ("pack_size", "Pack Size"),
+            ("recommended_order_quantity", "Proposed Quantity"),
+            ("recommended_order_date", "Order Date"), ("expected_arrival_date", "Expected Arrival"),
+            ("unit_cost_effective", "Unit Cost"), ("recommended_purchase_value", "Purchase Value"),
+            ("approval_required", "Approval"), ("manual_review_required", "Manual Review"),
+        ]
+        src_cols = [c for c, _ in colmap if c in reco.columns]
+        disp = reco[src_cols].copy()
+        if "action" in disp.columns:
+            disp["action"] = disp["action"].map(rs.reorder_action_label)
+        if "overall_risk_tier" in disp.columns:
+            disp["overall_risk_tier"] = disp["overall_risk_tier"].map(lambda t: str(t).capitalize())
+        if "stockout_probability" in disp.columns:
+            disp["stockout_probability"] = pd.to_numeric(disp["stockout_probability"], errors="coerce").map(format_percentage)
+        for dcol in ("recommended_order_date", "expected_arrival_date"):
+            if dcol in disp.columns:
+                disp[dcol] = disp[dcol].map(_date_str)
+        for ccol in ("unit_cost_effective", "recommended_purchase_value"):
+            if ccol in disp.columns:
+                disp[ccol] = disp[ccol].map(lambda v: format_currency(v, 2) if ccol == "unit_cost_effective" else format_currency(v))
+        disp = disp.rename(columns=dict(colmap))
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.caption("One row per SKU/channel, read directly from the run's validated reorder artifact.")
+        with st.expander("Advanced: technical & contract fields", expanded=False):
+            tech = [c for c in reco.columns if c not in src_cols and c != "reason_trace"]
+            if "reason_trace" in reco.columns:
+                tech = tech + ["reason_trace"]
+            st.dataframe(reco[tech], use_container_width=True, hide_index=True)
+
+
+def _page_inventory_reorder_legacy():
+    render_page_header("Inventory & Reorder",
+                       "Legacy fixed pilot · synthetic baseline snapshot · prioritised replenishment queue",
                        badges=ACTIVE_BADGES)
     synthetic_warning(INVENTORY_PAGE_WARNING)
+    info_banner("Legacy fixed-pilot view: these are historical synthetic-baseline figures from "
+                "inventory_context, NOT the forecast-driven Phase C recommendations. Activate a "
+                "completed forecast run to see forecast-driven reorder proposals.", kind="info")
     if inv_raw is None:
         empty_state("Synthetic inventory context not generated", "data/processed/inventory_context.parquet is missing or unreadable.", "mail")
         return

@@ -725,3 +725,110 @@ def test_phase_b_failure_fails_whole_run_even_partial(tmp_path, monkeypatch):
     status = json.loads((tmp_path / "runs" / "pbfail" / "status.json").read_text())
     assert status["status"] == "failed"
     assert m.get("decisioning_status") in (None, "failed")
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Phase C — forecast-driven reorder recommendations
+# ══════════════════════════════════════════════════════════════════════════════════
+# 32 — Phase C runs only AFTER Phase B: if Phase B fails, no Phase C artifacts are written
+def test_c_runs_only_after_phase_b(tmp_path, monkeypatch):
+    install_fakes(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("phase b boom")
+
+    monkeypatch.setattr(orch.stockout_risk, "compute_stockout_risk", _boom)
+    m = _run(tmp_path, monkeypatch, run_id="cnob")
+    assert m["status"] == "failed"
+    rd = tmp_path / "runs" / "cnob"
+    assert not (rd / "decisions" / "reorder_recommendations.parquet").exists()
+    assert not (rd / "decisions" / "reorder_summary.json").exists()
+
+
+# 33 — a Phase C failure fails the whole run
+def test_c_failure_fails_run(tmp_path, monkeypatch):
+    install_fakes(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("phase c boom")
+
+    monkeypatch.setattr(orch.reorder_recommendations, "compute_reorder_recommendations", _boom)
+    m = _run(tmp_path, monkeypatch, run_id="cfail")
+    assert m["status"] == "failed"
+    assert any("reorder" in e.lower() for e in m["errors"])
+    status = json.loads((tmp_path / "runs" / "cfail" / "status.json").read_text())
+    assert status["status"] == "failed"
+
+
+# 34 — allow_partial_success does NOT hide a Phase C failure
+def test_c_failure_not_hidden_by_partial(tmp_path, monkeypatch):
+    install_fakes(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("phase c boom")
+
+    monkeypatch.setattr(orch.reorder_recommendations, "compute_reorder_recommendations", _boom)
+    m = _run(tmp_path, monkeypatch, run_id="cpart", allow_partial_success=True)
+    assert m["status"] == "failed"
+    assert any("reorder" in e.lower() for e in m["errors"])
+
+
+# 35 — a completed run contains valid Phase C artifacts + manifest fields
+def test_c_completed_run_has_artifacts(good):
+    rd, m = good["run_dir"], good["manifest"]
+    assert m["status"] == "completed"
+    assert (rd / "decisions" / "reorder_recommendations.parquet").exists()
+    assert (rd / "decisions" / "reorder_summary.json").exists()
+    assert m["reorder_recommendations_file"] == "decisions/reorder_recommendations.parquet"
+    assert m["reorder_summary_file"] == "decisions/reorder_summary.json"
+    assert m["reorder_policy_version"] == orch.dc.REORDER_POLICY_VERSION
+    assert m["stockout_policy_version"] == orch.dc.STOCKOUT_POLICY_VERSION
+    assert m["reorder_validation_summary"]["count_by_action"] is not None
+    reco = pd.read_parquet(rd / "decisions" / "reorder_recommendations.parquet")
+    assert list(reco.columns) == orch.dc.REORDER_RECOMMENDATION_COLUMNS
+    assert not reco["order_placed"].any()
+    sel = pd.read_parquet(rd / "selected_forecasts.parquet")
+    assert len(reco) == sel[["sku", "channel"]].drop_duplicates().shape[0]
+
+
+# 36 — Phase C artifact hashes in the manifest match the files on disk
+def test_c_artifact_hashes_match(good):
+    import hashlib
+    rd, m = good["run_dir"], good["manifest"]
+    inv = {a["path"]: a for a in m["artifact_inventory"]}
+    for rel in ("decisions/reorder_recommendations.parquet", "decisions/reorder_summary.json"):
+        assert rel in inv, rel
+        actual = hashlib.sha256((rd / rel).read_bytes()).hexdigest()
+        assert inv[rel]["sha256"] == actual
+        assert inv[rel]["size_bytes"] == (rd / rel).stat().st_size
+
+
+# 37 — manifest artifact paths are run-relative, never absolute
+def test_c_manifest_paths_relative(good):
+    m = good["manifest"]
+    assert not any(ch in m["reorder_recommendations_file"] for ch in (":", "\\"))
+    assert m["reorder_recommendations_file"].startswith("decisions/")
+    assert m["reorder_summary_file"].startswith("decisions/")
+
+
+# 38 — the status lifecycle includes calculating_reorder_recommendations, after stockout risk
+def test_c_lifecycle_step_present(good):
+    assert "calculating_reorder_recommendations" in orch.STEP_PROGRESS
+    log = (good["run_dir"] / "pipeline.log").read_text(encoding="utf-8")
+    assert "calculating_reorder_recommendations" in log
+    assert "calculating_stockout_risk" in log
+    assert log.index("calculating_stockout_risk") < log.index("calculating_reorder_recommendations")
+
+
+# 39 — an older completed run WITHOUT Phase C stays valid/browsable (Phase C never mutated Phase B)
+def test_c_older_run_without_phase_c_still_valid(good):
+    rd = good["run_dir"]
+    # simulate a pre-Phase-C run by removing the Phase C artifacts
+    (rd / "decisions" / "reorder_recommendations.parquet").unlink()
+    (rd / "decisions" / "reorder_summary.json").unlink()
+    # the Phase B artifacts + manifest remain independently valid and readable
+    risk = pd.read_parquet(rd / "decisions" / "stockout_risk.parquet")
+    sel = pd.read_parquet(rd / "selected_forecasts.parquet")
+    orch.dc.validate_stockout_risk(risk, sel[["sku", "channel"]].drop_duplicates(),
+                                   good["manifest"]["run_id"])
+    assert json.loads((rd / "run_manifest.json").read_text())["status"] == "completed"

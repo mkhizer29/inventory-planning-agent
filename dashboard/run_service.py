@@ -46,19 +46,24 @@ LAUNCHER_LOG_DIRNAME = ".launcher_logs"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 TERMINAL_STATES = {"completed", "completed_with_warnings", "failed"}
 RUNNING_STATES = {"created", "selecting_skus", "preparing_data", "running_baseline",
-                  "running_holtwinters", "running_lightgbm", "validating_outputs", "ranking_models"}
+                  "running_holtwinters", "running_lightgbm", "validating_outputs", "ranking_models",
+                  "calculating_stockout_risk", "calculating_reorder_recommendations"}
 STEP_LABELS = {
     "created": "Creating run", "selecting_skus": "Selecting products",
     "preparing_data": "Preparing forecasting data", "running_baseline": "Running baseline models",
     "running_holtwinters": "Running Holt-Winters", "running_lightgbm": "Running LightGBM",
     "validating_outputs": "Validating model outputs", "ranking_models": "Ranking models",
+    "calculating_stockout_risk": "Calculating stockout risk",
+    "calculating_reorder_recommendations": "Calculating reorder recommendations",
     "completed": "Completed", "completed_with_warnings": "Completed with warnings",
     "failed": "Failed",
 }
 PROGRESS_PCT = {
     "created": 0, "selecting_skus": 10, "preparing_data": 25, "running_baseline": 40,
     "running_holtwinters": 55, "running_lightgbm": 70, "validating_outputs": 85,
-    "ranking_models": 92, "completed": 100, "completed_with_warnings": 100, "failed": 100,
+    "ranking_models": 92, "calculating_stockout_risk": 96,
+    "calculating_reorder_recommendations": 98,
+    "completed": 100, "completed_with_warnings": 100, "failed": 100,
 }
 BASELINE_METHODS = ("last_day_naive", "seasonal_naive_7", "moving_average_7", "moving_average_14")
 
@@ -206,10 +211,14 @@ def resolve_run_context(run_record: dict) -> dict:
         "decisions_dir": run_dir / "decisions",
         "stockout_risk": run_dir / "decisions" / "stockout_risk.parquet",
         "stockout_trajectory": run_dir / "decisions" / "stockout_trajectory.parquet",
+        # Phase C decision artifacts (OPTIONAL — absent on runs created before Phase C)
+        "reorder_recommendations": run_dir / "decisions" / "reorder_recommendations.parquet",
+        "reorder_summary": run_dir / "decisions" / "reorder_summary.json",
     }
     # availability flags let the UI show a graceful "unavailable" notice for older runs
     ctx["has_stockout_risk"] = ctx["stockout_risk"].exists()
     ctx["has_stockout_trajectory"] = ctx["stockout_trajectory"].exists()
+    ctx["reorder_available"] = ctx["reorder_recommendations"].exists() and ctx["reorder_summary"].exists()
     ctx["decisioning_status"] = run_record.get("decisioning_status")
     required = ["model_panel", "forecast_frame", "inventory_context", "pilot_manifest",
                "combined_scorecard", "model_ranking", "selected_forecasts", "run_manifest"]
@@ -234,9 +243,11 @@ def legacy_context() -> dict:
         "pilot_manifest": proc / "pilot_manifest.json",
         "combined_scorecard": None, "model_ranking": None, "selected_forecasts": None,
         "run_manifest": None,
-        # Phase B is run-scoped; the legacy fixed-pilot context never has decision artifacts
+        # Phase B/C are run-scoped; the legacy fixed-pilot context never has decision artifacts
         "decisions_dir": None, "stockout_risk": None, "stockout_trajectory": None,
-        "has_stockout_risk": False, "has_stockout_trajectory": False, "decisioning_status": None,
+        "reorder_recommendations": None, "reorder_summary": None,
+        "has_stockout_risk": False, "has_stockout_trajectory": False,
+        "reorder_available": False, "decisioning_status": None,
     }
 
 
@@ -568,6 +579,89 @@ def trajectory_for_sku(traj: pd.DataFrame, sku: str, horizon: "int | None" = Non
         warnings.append(f"duplicate (sku, date) trajectory rows for {sku} were de-duplicated")
         d = d.drop_duplicates(["sku", "date"], keep="first")
     return d.sort_values("date").reset_index(drop=True), warnings
+
+
+# ── Phase C: reorder recommendations (pure, framework-free display helpers) ───────────────
+# Buyer-facing queue priority (order_now first). Matches reorder_recommendations.ACTION_PRIORITY.
+REORDER_ACTION_RANK = {"order_now": 0, "vendor_follow_up": 1, "manual_review": 2,
+                       "monitor": 3, "no_order": 4}
+REORDER_ACTION_TONE = {"order_now": "red", "vendor_follow_up": "blue", "manual_review": "amber",
+                       "monitor": "slate", "no_order": "success"}
+REORDER_ACTION_LABEL = {"order_now": "Order now", "vendor_follow_up": "Vendor follow-up",
+                        "manual_review": "Manual review", "monitor": "Monitor", "no_order": "No order"}
+
+
+def reorder_action_rank(action) -> int:
+    """Lower = higher on the buyer's queue. Unknown actions rank last."""
+    return REORDER_ACTION_RANK.get(str(action).strip().lower(), 5)
+
+
+def reorder_action_tone(action) -> str:
+    return REORDER_ACTION_TONE.get(str(action).strip().lower(), "slate")
+
+
+def reorder_action_label(action) -> str:
+    a = str(action).strip().lower()
+    return REORDER_ACTION_LABEL.get(a, a.replace("_", " ").capitalize() or "—")
+
+
+def sort_reorder_queue(df: pd.DataFrame) -> pd.DataFrame:
+    """Deterministic buyer priority: action priority → risk severity → P(stockout) desc →
+    projected date asc (nulls last) → proposed purchase value desc → product name asc → sku asc.
+    Never mutates the input."""
+    if df is None or df.empty:
+        return df.copy() if df is not None else df
+    d = df.copy()
+    d["_arank"] = d["action"].map(reorder_action_rank)
+    d["_sev"] = d["overall_risk_tier"].map(risk_severity_rank)
+    d["_prob"] = pd.to_numeric(d.get("stockout_probability"), errors="coerce").fillna(-1.0)
+    proj = pd.to_datetime(d.get("projected_stockout_date"), errors="coerce")
+    d["_projkey"] = proj.rank(method="min", na_option="bottom")            # ascending, nulls last
+    d["_pv"] = pd.to_numeric(d.get("recommended_purchase_value"), errors="coerce").fillna(-1.0)
+    d["_name"] = (d["sku_name"].astype(str) if "sku_name" in d.columns else d["sku"].astype(str))
+    d["_sku"] = d["sku"].astype(str)
+    d = d.sort_values(by=["_arank", "_sev", "_prob", "_projkey", "_pv", "_name", "_sku"],
+                      ascending=[True, True, False, True, False, True, True], kind="mergesort")
+    return d.drop(columns=["_arank", "_sev", "_prob", "_projkey", "_pv", "_name", "_sku"]).reset_index(drop=True)
+
+
+def filter_reorder_queue(df: pd.DataFrame, *, action=None, tier=None, query=None,
+                         approval_only: bool = False, assumed_only: bool = False) -> pd.DataFrame:
+    """Apply the page-local reorder filters. `action`/`tier` None or 'all' keep everything;
+    `query` matches SKU or product name (case-insensitive substring). Never mutates the input."""
+    if df is None or df.empty:
+        return df.copy() if df is not None else df
+    d = df
+    if action and str(action).strip().lower() not in ("all", ""):
+        d = d[d["action"].astype(str).str.lower() == str(action).strip().lower()]
+    if tier and str(tier).strip().lower() not in ("all", ""):
+        d = d[d["overall_risk_tier"].astype(str).str.lower() == str(tier).strip().lower()]
+    if query and str(query).strip():
+        q = str(query).strip().lower()
+        mask = d["sku"].astype(str).str.lower().str.contains(q, regex=False)
+        if "sku_name" in d.columns:
+            mask = mask | d["sku_name"].astype(str).str.lower().str.contains(q, regex=False, na=False)
+        d = d[mask]
+    if approval_only:
+        d = d[d["approval_required"].astype(bool)]
+    if assumed_only:
+        flags = d["assumption_flags"].astype(str).str.lower()
+        d = d[flags.str.contains("assumed", regex=False) | flags.str.contains("imputed", regex=False)
+              | flags.str.contains("synthetic", regex=False)]
+    return d.reset_index(drop=True)
+
+
+def reorder_purchase_value_total(df: pd.DataFrame) -> tuple[float, int]:
+    """(sum of non-null recommended_purchase_value, count of order_now rows with a null value).
+    Null purchase value is NEVER treated as zero in the sum."""
+    if df is None or df.empty or "recommended_purchase_value" not in df.columns:
+        return 0.0, 0
+    s = pd.to_numeric(df["recommended_purchase_value"], errors="coerce")
+    missing = 0
+    if "action" in df.columns:
+        order_now = df["action"].astype(str).str.lower() == "order_now"
+        missing = int((s.isna() & order_now).sum())
+    return float(s.dropna().sum()), missing
 
 
 def tail_log(path: "str | Path", max_lines: int = 200) -> str:
