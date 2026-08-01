@@ -19,3 +19,5 @@ scikit-learn==1.5.2      # model utilities / metrics helpers
 # --- Dashboard (Streamlit UI + Plotly charts; imported by dashboard/app.py) ---
 streamlit==1.60.0        # dashboard UI
 plotly==6.9.0            # interactive charts (incl. Phase B risk trajectory)
+openpyxl==3.1.5          # in-memory .xlsx table exports (dashboard/export_utils.py)
+reportlab==4.2.5         # in-memory .pdf table reports (dashboard/export_utils.py)

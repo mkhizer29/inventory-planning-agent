@@ -889,3 +889,68 @@ def test_c51_dashboard_modules_compile():
     import py_compile
     for name in ("app.py", "styles.py", "run_service.py"):
         py_compile.compile(str(REPO_ROOT / "dashboard" / name), doraise=True)
+
+
+# ── UX pass: compact vs full run labels ────────────────────────────────────────────────
+def _lbl_rec(run_id="20260731T060331Z_g_top10_a4c921", created="2026-07-31T06:03:31+00:00",
+             category="Groceries & Pets", top_n=10, status="completed"):
+    return {"run_id": run_id, "created_at": created, "category": category,
+            "top_n": top_n, "status": status}
+
+
+def test_70_short_label_is_compact_format():
+    short = rs.format_run_label_short(_lbl_rec())
+    assert short.startswith("31 Jul · Groceries & Pets · Top 10")
+    # the compact label must NOT carry the noisy bits
+    assert "PKT" not in short and "2026" not in short and "completed" not in short
+    assert "a4c921" not in short                       # full/partial run id only when disambiguating
+    assert len(short) < 45
+
+
+def test_71_short_label_status_symbol():
+    assert rs.format_run_label_short(_lbl_rec(status="completed")).endswith("✓")
+    assert rs.format_run_label_short(_lbl_rec(status="failed")).endswith("✕")
+    assert rs.format_run_label_short(_lbl_rec(status="completed_with_warnings")).endswith("⚠")
+
+
+def test_72_full_label_retains_everything():
+    full = rs.format_run_label_full(_lbl_rec())
+    assert "31 Jul 2026" in full and "11:03 AM PKT" in full
+    assert "Groceries & Pets" in full and "Top 10" in full and "completed" in full
+    assert rs.format_run_label(_lbl_rec()) == full     # back-compat alias
+
+
+def test_73_similar_runs_get_distinguishable_short_labels():
+    a = _lbl_rec(run_id="20260731T060331Z_g_top10_a4c921", created="2026-07-31T06:03:31+00:00")
+    b = _lbl_rec(run_id="20260731T090000Z_g_top10_b7f333", created="2026-07-31T09:00:00+00:00")
+    labels = rs.build_short_labels([a, b])
+    assert labels[a["run_id"]] != labels[b["run_id"]]
+    assert labels[a["run_id"]].endswith("a4c921") and labels[b["run_id"]].endswith("b7f333")
+
+
+def test_74_distinct_runs_keep_clean_labels():
+    a = _lbl_rec(run_id="r1", category="Groceries & Pets", top_n=10)
+    b = _lbl_rec(run_id="r2", category="Kids & Babies", top_n=5)
+    labels = rs.build_short_labels([a, b])
+    assert not labels["r1"].endswith("r1") and "Kids & Babies" in labels["r2"]
+    assert len(set(labels.values())) == 2
+
+
+def test_75_short_labels_unique_across_many_runs(tmp_path):
+    recs = [_lbl_rec(run_id=f"20260731T0600{i:02d}Z_g_top10_x{i:05d}") for i in range(12)]
+    labels = rs.build_short_labels(recs)
+    assert len(set(labels.values())) == len(recs)      # selectbox keys must stay unique
+
+
+def test_76_short_label_handles_missing_fields():
+    short = rs.format_run_label_short({"run_id": "r", "status": "running_lightgbm"})
+    assert isinstance(short, str) and short             # no crash on partial records
+    assert rs.format_run_label_full({}) .startswith("?") or "?" in rs.format_run_label_full({})
+
+
+def test_77_active_run_never_shows_full_id_as_giant_metric():
+    """The compact status strip shows only the run-id suffix; the full id lives in details."""
+    rec = _lbl_rec()
+    short_id = str(rec["run_id"])[-6:]
+    assert short_id == "a4c921" and len(short_id) == 6
+    assert rs.format_run_label_short(rec).count(rec["run_id"]) == 0

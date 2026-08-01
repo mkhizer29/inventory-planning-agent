@@ -474,14 +474,59 @@ def format_local_datetime(value, *, include_date: bool = True, include_time: boo
     return " · ".join(parts) if parts else "—"
 
 
-def format_run_label(record: dict) -> str:
-    """e.g. '29 Jul 2026 · 11:03 AM PKT · Groceries & Pets · Top 10 · completed' (Pakistan time)."""
+STATUS_SYMBOLS = {"completed": "✓", "completed_with_warnings": "⚠", "failed": "✕"}
+
+
+def format_run_label_full(record: dict) -> str:
+    """Complete label for tooltips / detail panels:
+    '29 Jul 2026 · 11:03 AM PKT · Groceries & Pets · Top 10 · completed'."""
     when = format_local_datetime(record.get("created_at"))
     if when == "—":
         when = str(record.get("created_at") or "?")
     cat = record.get("category") or "?"
-    topn = record.get("top_n")
-    return f"{when} · {cat} · Top {topn} · {record.get('status')}"
+    return f"{when} · {cat} · Top {record.get('top_n')} · {record.get('status')}"
+
+
+def format_run_label_short(record: dict, *, disambiguate: bool = False) -> str:
+    """Compact selectbox label that fits the sidebar: '31 Jul · Groceries & Pets · Top 10 · ✓'.
+
+    Deliberately omits the full timestamp, 'PKT', the operational model, the complete run id
+    and the long status word — those live in the tooltip and the Run details expander.
+    ``disambiguate`` appends the run id's last 6 characters when two runs would otherwise
+    collide (same day + category + Top N).
+    """
+    when = format_local_datetime(record.get("created_at"), include_time=False,
+                                 include_timezone=False)
+    day = "?" if when == "—" else when[:6].strip()          # '29 Jul 2026' -> '29 Jul'
+    cat = record.get("category") or "?"
+    parts = [day, str(cat), f"Top {record.get('top_n')}"]
+    sym = STATUS_SYMBOLS.get(str(record.get("status")))
+    if sym:
+        parts.append(sym)
+    if disambiguate:
+        parts.append(str(record.get("run_id") or "")[-6:])
+    return " · ".join(p for p in parts if p)
+
+
+def build_short_labels(records: "list[dict]") -> dict:
+    """run_id -> UNIQUE short label. Collisions get the run-id suffix appended so two runs
+    from the same day/category/Top-N stay distinguishable in the selectbox."""
+    counts: dict[str, int] = {}
+    for r in records:
+        counts[format_run_label_short(r)] = counts.get(format_run_label_short(r), 0) + 1
+    out: dict = {}
+    for r in records:
+        base = format_run_label_short(r)
+        label = format_run_label_short(r, disambiguate=True) if counts.get(base, 0) > 1 else base
+        while label in out.values():                        # last-resort uniqueness guard
+            label = f"{label}·"
+        out[r.get("run_id")] = label
+    return out
+
+
+def format_run_label(record: dict) -> str:
+    """Backwards-compatible alias for the full label (kept for existing call sites)."""
+    return format_run_label_full(record)
 
 
 # ── Phase B stockout-risk: pure dashboard helpers (no Streamlit) ─────────────────────────

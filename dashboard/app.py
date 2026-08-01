@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from styles import (COLORS, CATEGORICAL, DONUT_COLORS, DONUT_HOVER, STATUS_COLORS, TONES, TONE_CYCLE,
                     CUSTOM_CSS, plotly_layout, style_axes, icon_svg)
 import run_service as rs   # Phase 5 run-aware backend service (framework-free, testable)
+import export_utils as eu  # one reusable in-memory CSV/Excel/PDF export menu
 
 # --------------------------------------------------------------------------
 # Paths
@@ -265,6 +266,36 @@ def _status_cell_css(val):
         if isinstance(val, str) and name in val:
             return f"background-color:{bg}; color:{fg}; font-weight:700;"
     return ""
+
+
+# Risk-tier cell colours for the complete datasets (critical / high / medium / low all
+# visually distinct — colour always accompanies the tier TEXT, never colour alone).
+RISK_TIER_CELL = {
+    "critical": ("#FAE7E9", COLORS["red"]),
+    "high": ("#FBE3D6", "#C2410C"),
+    "medium": ("#FBF0DC", COLORS["amber"]),
+    "watch": ("#E5EDFD", COLORS["blue"]),
+    "low": ("#E4F5EC", COLORS["success"]),
+    "healthy": ("#E3F3F1", COLORS["teal"]),
+    "unknown": ("#EAEEF3", COLORS["slate"]),
+}
+REORDER_ACTION_CELL = {
+    "order_now": ("#FAE7E9", COLORS["red"]),
+    "manual_review": ("#FBF0DC", COLORS["amber"]),
+    "vendor_follow_up": ("#E5EDFD", COLORS["blue"]),
+    "monitor": ("#E3F3F1", COLORS["teal"]),
+    "no_order": ("#EAEEF3", COLORS["slate"]),
+}
+
+
+def _risk_tier_cell_css(val):
+    bg_fg = RISK_TIER_CELL.get(str(val).strip().lower())
+    return f"background-color:{bg_fg[0]}; color:{bg_fg[1]}; font-weight:700;" if bg_fg else ""
+
+
+def _reorder_action_cell_css(val):
+    bg_fg = REORDER_ACTION_CELL.get(str(val).strip().lower())
+    return f"background-color:{bg_fg[0]}; color:{bg_fg[1]}; font-weight:700;" if bg_fg else ""
 
 
 # --------------------------------------------------------------------------
@@ -551,7 +582,7 @@ def generate_insights(mp_f, inv_f, manifest):
         if len(cat_totals) and cat_totals.sum() > 0:
             top_cat = cat_totals.index[0]
             share = cat_totals.iloc[0] / cat_totals.sum() * 100
-            insights.append(f"**{top_cat}** contributes {share:.1f}% of pilot demand in the selected filters.")
+            insights.append(f"<b>{top_cat}</b> contributes {share:.1f}% of pilot demand in the selected filters.")
 
         zero_rate = (mp_f["units_observed"] == 0).mean() * 100
         insights.append(f"{zero_rate:.1f}% of demand-history rows in the current view contain zero sales.")
@@ -562,7 +593,7 @@ def generate_insights(mp_f, inv_f, manifest):
         sku_totals = mp_f.groupby("sku")["units_observed"].sum().sort_values(ascending=False)
         if len(sku_totals):
             insights.append(
-                f"SKU **{sku_totals.index[0]}** leads the current view with "
+                f"SKU <b>{sku_totals.index[0]}</b> leads the current view with "
                 f"{sku_totals.iloc[0]:,.0f} total units sold."
             )
 
@@ -611,7 +642,10 @@ def _discover_runs_fresh():
 RUNS_ALL = _discover_runs_fresh()
 COMPLETED_RUNS = [r for r in RUNS_ALL if r.get("is_completed")]
 LEGACY_LABEL = "Legacy fixed pilot"
-_run_labels = {rs.format_run_label(r): r for r in COMPLETED_RUNS}
+# Compact, UNIQUE selectbox labels ('31 Jul · Groceries & Pets · Top 10 · ✓'); the full
+# label + technical detail live in the tooltip and the "Run details" expander.
+_short_by_id = rs.build_short_labels(COMPLETED_RUNS)
+_run_labels = {_short_by_id[r["run_id"]]: r for r in COMPLETED_RUNS}
 
 # The sidebar "Data source" selectbox writes this key; read the prior value now (before the
 # widget is drawn) so the loaders below pick the right paths on this rerun. A pending value
@@ -728,14 +762,26 @@ with st.sidebar.container(key="ipa-datasource"):
     st.markdown('<div class="ipa-nav-label">Data source</div>', unsafe_allow_html=True)
     _ds_options = [LEGACY_LABEL] + list(_run_labels)
     _ds_index = _ds_options.index(_ds_choice) if _ds_choice in _ds_options else 0
-    _ds_pick = st.selectbox("Data source", options=_ds_options, index=_ds_index,
-                            key="data_source_choice", label_visibility="collapsed")
+    _ds_pick = st.selectbox(
+        "Data source", options=_ds_options, index=_ds_index,
+        key="data_source_choice", label_visibility="collapsed",
+        help=(rs.format_run_label_full(ACTIVE_RUN) if (DATA_MODE == "run" and ACTIVE_RUN)
+              else "Legacy fixed 30-SKU pilot (data/processed)"))
     if DATA_MODE == "run" and ACTIVE_RUN is not None:
-        st.markdown(f'<div class="ipa-ds-chip ipa-ds-run">Run · {ACTIVE_RUN.get("status")} · '
-                    f'{ACTIVE_RUN.get("selected_sku_count")} SKUs</div>', unsafe_allow_html=True)
+        _op = ACTIVE_RUN.get("operational_model") or "—"
+        _sym = rs.STATUS_SYMBOLS.get(str(ACTIVE_RUN.get("status")), "•")
+        st.markdown(
+            f'<div class="ipa-src"><div class="ipa-src-row">'
+            f'<span class="ipa-src-chip">{ACTIVE_RUN.get("selected_sku_count", "—")} SKUs</span>'
+            f'<span class="ipa-src-chip">{ACTIVE_RUN.get("category") or "—"}</span></div>'
+            f'<div class="ipa-src-row"><span class="ipa-src-meta">As-of {ACTIVE_RUN.get("as_of_date") or "—"}'
+            f' · {_op} · {_sym}</span></div></div>', unsafe_allow_html=True)
     else:
-        st.markdown('<div class="ipa-ds-chip ipa-ds-legacy">Legacy fixed pilot · 30 SKUs</div>',
-                    unsafe_allow_html=True)
+        st.markdown('<div class="ipa-src"><div class="ipa-src-row">'
+                    '<span class="ipa-src-chip">30 SKUs</span>'
+                    '<span class="ipa-src-chip">Legacy pilot</span></div>'
+                    '<div class="ipa-src-row"><span class="ipa-src-meta">Fixed 30-SKU pilot · naheed_web'
+                    '</span></div></div>', unsafe_allow_html=True)
 st.sidebar.markdown("---")
 
 NAV_ITEMS = [
@@ -762,52 +808,49 @@ with st.sidebar.container(key="ipa-nav"):
             st.rerun()
 page = st.session_state["nav_page"]
 
-st.sidebar.markdown("---")
-st.sidebar.markdown('<div class="ipa-nav-label">Filters</div>', unsafe_allow_html=True)
+# --------------------------------------------------------------------------
+# Filter STATE lives here (read from session_state); the filter WIDGETS are rendered
+# per page by render_filter_bar() so controls sit next to the data they affect.
+# Shadow copies keep values alive on pages that don't render a given control.
+# --------------------------------------------------------------------------
+FILTER_KEYS = ["flt_skus", "flt_category", "flt_brands", "flt_daterange",
+               "flt_horizon", "flt_focus_sku", "flt_cmp_labels"]
+
+
+def _flt(key, default):
+    """Current value of a filter: live widget value if present, else the shadow copy."""
+    shadow = f"_shadow_{key}"
+    if key in st.session_state:
+        st.session_state[shadow] = st.session_state[key]
+        return st.session_state[key]
+    return st.session_state.get(shadow, default)
+
 
 if mp_raw is not None:
     all_skus = sorted(mp_raw["sku"].unique().tolist())
     all_categories = sorted(mp_raw["category"].dropna().unique().tolist())
     all_brands = sorted(mp_raw["brand"].dropna().unique().tolist())
     SKU_LABELS = build_sku_labels(mp_raw)      # "Product name — Brand (SKU)" for search/legends
-    SKU_NAMES = build_sku_names(mp_raw)         # name-only, for tables/profile that show SKU separately
+    SKU_NAMES = build_sku_names(mp_raw)        # name only, for tables/headings that show SKU separately
     min_date, max_date = mp_raw["date"].min().date(), mp_raw["date"].max().date()
 
-    st.sidebar.selectbox("Channel", options=["naheed_web"], key="flt_channel")
-
-    cat_choice = st.sidebar.selectbox("Category", options=["All categories"] + all_categories, key="flt_category")
+    cat_choice = _flt("flt_category", "All categories")
+    if cat_choice not in (["All categories"] + all_categories):
+        cat_choice = "All categories"
     sel_categories = all_categories if cat_choice == "All categories" else [cat_choice]
 
-    # Options stay SKU codes (stable internal keys); the label — real product name,
-    # brand, and the SKU code — is shown & searched via format_func, so users find a
-    # product by its actual name, its brand, OR its SKU code.
-    with st.sidebar.container(key="ipa-sku-search"):
-        focus_sku_choice = st.multiselect(
-            "Compare products", options=all_skus, default=[all_skus[0]] if all_skus else [],
-            format_func=lambda s: SKU_LABELS.get(s, s), placeholder="Search by product name, brand or SKU...",
-            help="Each selected product is shown as a separate line on the Demand Analytics "
-                 "deep-dive. Search by product name, brand, or SKU code.",
-            key="flt_focus_sku"
-        )
-        cmp_label_mode = st.selectbox(
-            "Comparison labels", options=CMP_LABEL_MODES, index=0, key="flt_cmp_labels",
-            help="How selected products are labelled in comparison legends, hover text, "
-                 "chart titles and headings. Filtering always uses the SKU internally.",
-        )
-    focus_skus = focus_sku_choice if focus_sku_choice else [all_skus[0]] if all_skus else []
+    sel_skus = [s for s in _flt("flt_skus", []) if s in all_skus]
+    sel_brands = [b for b in _flt("flt_brands", []) if b in all_brands]
 
-    date_val = st.sidebar.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date, key="flt_daterange")
-    date_range = date_val if isinstance(date_val, tuple) and len(date_val) == 2 else (min_date, max_date)
-    horizon = st.sidebar.radio("Forecast horizon", options=[7, 14], format_func=lambda x: f"{x} days", index=1, horizontal=True, key="flt_horizon")
+    _focus = [s for s in _flt("flt_focus_sku", []) if s in all_skus]
+    focus_skus = _focus if _focus else ([all_skus[0]] if all_skus else [])
 
-    with st.sidebar.expander("Advanced filters", expanded=False):
-        sel_skus = st.multiselect(
-            "Dashboard product filter (blank = all)", options=all_skus, default=[],
-            format_func=lambda s: SKU_LABELS.get(s, s),
-            help="Filters the WHOLE dashboard: every total and aggregate chart is recalculated "
-                 "using only the selected products (they are combined into one total). Blank = all.",
-            key="flt_skus")
-        sel_brands = st.multiselect("Brand (blank = all)", options=all_brands, default=[], key="flt_brands")
+    _dr = _flt("flt_daterange", (min_date, max_date))
+    date_range = _dr if isinstance(_dr, (tuple, list)) and len(_dr) == 2 else (min_date, max_date)
+
+    horizon = _flt("flt_horizon", 14)
+    horizon = horizon if horizon in (7, 14) else 14
+    cmp_label_mode = _flt("flt_cmp_labels", CMP_LABEL_MODES[0])
     sel_scenario = None      # retired: synthetic Scenario Lab replaced by forecast-driven Stockout Risk
 else:
     all_skus, all_categories, all_brands = [], [], []
@@ -820,13 +863,52 @@ else:
     horizon = 14
     sel_scenario = SCENARIO_NAMES[0]
 
-FILTER_KEYS = ["flt_skus", "flt_category", "flt_brands", "flt_daterange", "flt_channel",
-               "flt_scenario", "flt_horizon", "flt_focus_sku", "flt_cmp_labels"]
-with st.sidebar.container(key="ipa-clear-filters"):
-    if st.button("Clear Filters", icon=":material/filter_alt_off:", width="stretch"):
-        for k in FILTER_KEYS:
-            st.session_state.pop(k, None)
-        st.rerun()
+
+def render_filter_bar(*, products=True, category=True, dates=False, horizon_ctl=False,
+                      compare=False, key_prefix="page"):
+    """Compact per-page filter toolbar. Widgets use the SHARED flt_* keys, so a filter set
+    on one page still applies everywhere — the control is simply visible where it matters."""
+    if mp_raw is None:
+        return
+    with st.container(key=f"ipa-filterbar-{key_prefix}"):
+        cols = st.columns([1.3, 2.2, 1.6, 1.1, 0.8])
+        if category:
+            with cols[0]:
+                st.selectbox("Category", options=["All categories"] + all_categories,
+                             key="flt_category")
+        if products:
+            with cols[1]:
+                st.multiselect("Products (blank = all)", options=all_skus,
+                               format_func=lambda s: SKU_LABELS.get(s, s),
+                               placeholder="Search by product name, brand or SKU…",
+                               help="Narrows every page: totals, charts, risk and reorder queues.",
+                               key="flt_skus")
+        if dates:
+            with cols[2]:
+                st.date_input("Date range", min_value=min_date, max_value=max_date,
+                              key="flt_daterange")
+        if horizon_ctl:
+            with cols[3]:
+                st.radio("Horizon", options=[7, 14], format_func=lambda x: f"{x} days",
+                         horizontal=True, key="flt_horizon")
+        with cols[4]:
+            st.write("")
+            if st.button("Reset", key=f"reset_{key_prefix}", width="stretch",
+                         help="Clear all product/category filters"):
+                for k in FILTER_KEYS:
+                    st.session_state.pop(k, None)
+                    st.session_state.pop(f"_shadow_{k}", None)
+                st.rerun()
+        if compare:
+            c1, c2 = st.columns([3, 1.4])
+            with c1:
+                st.multiselect("Compare products", options=all_skus,
+                               default=focus_skus if focus_skus else None,
+                               format_func=lambda s: SKU_LABELS.get(s, s),
+                               placeholder="Search by product name, brand or SKU…",
+                               key="flt_focus_sku")
+            with c2:
+                st.selectbox("Comparison labels", options=CMP_LABEL_MODES, key="flt_cmp_labels")
 
 st.sidebar.markdown("---")
 if manifest:
@@ -848,6 +930,53 @@ filters_active = {
     "date_range": date_range, "horizon": horizon, "scenario": sel_scenario,
 }
 
+# ---- ONE effective SKU set implied by every sidebar filter (category + brand + SKU list).
+# Decision artifacts (stockout risk, reorder recommendations) are keyed by SKU only, so they
+# are narrowed through this set — that is what makes a single sidebar change reflect on
+# EVERY page instead of only the demand pages.
+FILTERED_SKUS = (set(mp_f["sku"].astype(str)) if (mp_f is not None and not mp_f.empty
+                                                  and "sku" in mp_f.columns) else None)
+FILTER_IS_NARROWED = bool(sel_skus or sel_brands or
+                          (sel_categories and all_categories and
+                           len(sel_categories) < len(all_categories)))
+
+
+def narrow_to_filtered_skus(df):
+    """Restrict any SKU-keyed frame to the sidebar's effective product selection."""
+    if df is None or FILTERED_SKUS is None or getattr(df, "empty", True):
+        return df
+    if "sku" not in getattr(df, "columns", []):
+        return df
+    return df[df["sku"].astype(str).isin(FILTERED_SKUS)]
+
+
+def filter_scope_caption():
+    """Short, honest note about what the current selection is showing."""
+    if not FILTER_IS_NARROWED or FILTERED_SKUS is None:
+        return None
+    return f"Filtered to {len(FILTERED_SKUS)} product(s)."
+
+
+def enrich_product_names(df):
+    """Fill a display-only `sku_name` from model_panel.
+
+    The decision artifacts (stockout_risk / reorder_recommendations) ship a `sku_name`
+    column that the backend leaves NULL, so every UI surface fell back to the bare SKU
+    code. The backend cannot read model_panel — the dashboard can — so names are joined
+    here for DISPLAY ONLY. SKU remains the join/identity key everywhere.
+    """
+    if df is None or getattr(df, "empty", True) or "sku" not in getattr(df, "columns", []):
+        return df
+    out = df.copy()
+    mapped = out["sku"].astype(str).map(SKU_NAMES)
+    if "sku_name" in out.columns:
+        existing = out["sku_name"]
+        blank = existing.isna() | (existing.astype(str).str.strip().isin(["", "nan", "None"]))
+        out["sku_name"] = existing.where(~blank, mapped)
+    else:
+        out["sku_name"] = mapped
+    return out
+
 
 # ==========================================================================
 # PAGE 1 — EXECUTIVE OVERVIEW
@@ -855,6 +984,7 @@ filters_active = {
 def page_executive_overview():
     render_page_header("Executive Overview", "Daily eCommerce Demand & Inventory Intelligence",
                        badges=ACTIVE_BADGES)
+    render_filter_bar(products=True, category=True, dates=True, key_prefix="exec")
     if mp_raw is None:
         empty_state("Historical demand data not found", "data/processed/model_panel.parquet is missing or unreadable.", "mail")
         return
@@ -994,6 +1124,7 @@ def page_executive_overview():
 def page_demand_analytics():
     render_page_header("Demand Analytics", "Real historical sales — units observed on naheed_web",
                        badges=ACTIVE_BADGES)
+    render_filter_bar(products=True, category=True, dates=True, compare=True, key_prefix="demand")
     if mp_raw is None:
         empty_state("Historical demand data not found", "data/processed/model_panel.parquet is missing or unreadable.", "mail")
         return
@@ -1157,6 +1288,21 @@ def page_demand_analytics():
 # ==========================================================================
 # PAGE 3 — FORECAST EXPLORER
 # ==========================================================================
+def scroll_into_view(anchor_id: str):
+    """Scroll the page to a named anchor after a rerun (used by the Details fallback panel).
+
+    Uses a tiny, self-contained components.html snippet — no external JS, no custom
+    frontend. When st.dialog is available the details open in a modal and this is not
+    needed; this keeps the fallback path from stranding the user mid-page.
+    """
+    import streamlit.components.v1 as components
+    components.html(
+        "<script>"
+        "const el = window.parent.document.getElementById('%s');"
+        "if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }"
+        "</script>" % anchor_id, height=0)
+
+
 def _winner_card(title, row):
     if row is None:
         return f'<div class="ipa-winner-card"><div class="lbl">{title}</div><div class="mdl">—</div></div>'
@@ -1186,18 +1332,27 @@ def _render_run_ranking_panel():
         if op_h is not None:
             sub = ranking[(ranking["horizon"] == op_h) & (ranking["model"] == op_model)]
             op_row = sub.iloc[0] if not sub.empty else _rank1(op_h)
+        # Only the three winner cards stay on screen — the full comparison table and the
+        # run summary live in dropdowns (progressive disclosure).
         c1, c2, c3 = st.columns(3)
         c1.markdown(_winner_card("7-day winner", _rank1(7)), unsafe_allow_html=True)
         c2.markdown(_winner_card("14-day winner", _rank1(14)), unsafe_allow_html=True)
         c3.markdown(_winner_card(f"Operational (h={op_h})", op_row), unsafe_allow_html=True)
+
         sel_h = horizon if horizon in list(ranking["horizon"].dropna().unique()) else int(ranking["horizon"].max())
-        st.markdown(f'<div class="ipa-card-sub">Comparison @ {sel_h}-day horizon</div>', unsafe_allow_html=True)
-        cmp = ranking[ranking["horizon"] == sel_h][["rank", "model", "wape", "mase", "mae", "rmse", "bias"]]
-        st.dataframe(cmp.sort_values("rank"), width="stretch", hide_index=True)
+        with st.expander(f"Model comparison @ {sel_h}-day horizon (locked-holdout)", expanded=False):
+            cmp = ranking[ranking["horizon"] == sel_h][["rank", "model", "wape", "mase", "mae", "rmse", "bias"]]
+            cmp = cmp.sort_values("rank")
+            st.dataframe(cmp, width="stretch", hide_index=True)
+            with st.container(key="ipa-export-1"):
+                eu.render_table_export_menu(
+                    cmp, filename_stem=f"model_ranking_h{sel_h}",
+                    title=f"Model Ranking — {sel_h}-day locked holdout",
+                    metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"),
+                              "Horizon": sel_h}, key="exp_ranking")
 
     if manifest_run:
-        with st.container(border=True):
-            st.markdown('<div class="ipa-card-title">Run Summary</div>', unsafe_allow_html=True)
+        with st.expander("Run summary", expanded=False):
             fp = (manifest_run.get("dataset_fingerprint") or "")[:12]
             metric_panel("", [
                 ("Run ID", manifest_run.get("run_id", "—")),
@@ -1221,6 +1376,7 @@ def _render_run_ranking_panel():
 def page_forecast_explorer():
     render_page_header("Forecast Explorer", "7–14 day demand forecast · historical backtest vs real future",
                        badges=ACTIVE_BADGES)
+    render_filter_bar(products=True, category=True, horizon_ctl=True, compare=True, key_prefix="forecast")
     if mp_raw is None:
         empty_state("Historical demand data not found", "data/processed/model_panel.parquet is missing or unreadable.", "mail")
         return
@@ -1507,11 +1663,13 @@ def _page_inventory_reorder_run():
         "Inventory & Reorder",
         "Forecast-driven replenishment proposals · MOQ and pack rounding · buyer approval required",
         badges=_reorder_badges())
+    render_filter_bar(products=True, category=True, key_prefix="reorder")
     info_banner(REORDER_DISCLOSURE, kind="synthetic")
 
     reco = reorder_raw.copy()
-    if sel_skus:
-        reco = reco[reco["sku"].astype(str).isin([str(s) for s in sel_skus])]
+    # Shared product filter + display product names (artifact sku_name is null).
+    reco = narrow_to_filtered_skus(reco)
+    reco = enrich_product_names(reco)
     if reco.empty:
         empty_state("No SKUs in the current filter",
                     "Clear the product filter in the sidebar to see the full recommendation queue.",
@@ -1547,61 +1705,61 @@ def _page_inventory_reorder_run():
         {"label": "Manual Review", "value": format_number(n_review), "icon": "shield-check", "tone": "amber",
          "sub": _help("Need a human decision",
                       "Count of SKUs routed to manual_review (invalid input, insufficient horizon, or Phase B review).")},
-        {"label": "Vendor Follow-up", "value": format_number(n_vendor), "icon": "truck", "tone": "blue",
-         "sub": _help("Dropship / vendor-fulfilled",
-                      "Count of dropship SKUs where replenishment is a vendor follow-up, not a warehouse order.")},
     ]
-    render_kpi_row(kpis, n_cols=5)
+    # Four equal-height primary KPIs; Vendor follow-up + Manual review appear as chips
+    # beside the queue filters so they stop competing with the headline numbers.
+    with st.container(key="ipa-kpirow"):
+        render_kpi_row(kpis, n_cols=4)
 
     # ==================================================================
     # SECTION 2 — Action distribution + purchase exposure
     # ==================================================================
-    section_title("Recommended actions & purchase exposure", None)
-    col_a, col_b = st.columns(2)
-    with col_a:
-        order = ["order_now", "vendor_follow_up", "manual_review", "monitor", "no_order"]
-        vc = actions.value_counts()
-        present = [a for a in order if a in vc.index] + [a for a in vc.index if a not in order]
-        donut = go.Figure(go.Pie(
-            labels=[rs.reorder_action_label(a) for a in present],
-            values=[int(vc[a]) for a in present], hole=0.62, sort=False, direction="clockwise",
-            marker=dict(colors=[_action_hex(a) for a in present], line=dict(color="white", width=1.5)),
-            textinfo="value",
-            hovertemplate="%{label}: %{value} SKUs (%{percent})<extra></extra>"))
-        donut.update_layout(**plotly_layout(height=330, legend=True))
-        donut.update_layout(annotations=[dict(text=f"{len(reco)}<br>SKUs", x=0.5, y=0.5, showarrow=False,
-                                              font=dict(size=15, color=COLORS["navy"]))])
-        render_chart(donut, "Recommended Actions",
-                     "One proposed buyer action per SKU. Fixed semantic colors; hover for counts and share.")
-    with col_b:
-        on = reco[actions == "order_now"].copy()
-        if on.empty:
-            with st.container(border=True):
-                empty_state("No order_now recommendations",
-                            "No SKUs in the current selection meet the reorder trigger.", "circle-dashed")
-        else:
-            on["_pv"] = pd.to_numeric(on["recommended_purchase_value"], errors="coerce").fillna(0.0)
-            on = on.sort_values("_pv", ascending=True).tail(15)
-            names = [rs.full_product_label(n, s) for n, s in zip(on.get("sku_name"), on["sku"])]
-            cust = list(zip(names, on["sku"].astype(str),
-                            [format_number(v, 0) for v in on["recommended_order_quantity"]],
-                            [format_currency(v, 2) for v in on["unit_cost_effective"]],
-                            [(_meta_val(c) or "—") for c in on["cost_source"]],
-                            ["imputed" if bool(v) else "observed" for v in on["cost_is_imputed"]]))
-            bar = go.Figure(go.Bar(
-                x=on["_pv"], y=on["sku"].astype(str), orientation="h",
-                marker=dict(color=COLORS["teal"]), customdata=cust,
-                hovertemplate=("<b>%{customdata[0]}</b><br>SKU %{customdata[1]}<br>"
-                               "Proposed qty: %{customdata[2]} u<br>Unit cost: %{customdata[3]}<br>"
-                               "Purchase value: %{x:,.0f}<br>Cost source: %{customdata[4]} (%{customdata[5]})"
-                               "<extra></extra>")))
-            bar.update_layout(**plotly_layout(legend=False, height=330))
-            style_axes(bar)
-            bar.update_yaxes(tickmode="array", tickvals=on["sku"].astype(str).tolist(),
-                             ticktext=[_short(n) for n in names], title="", automargin=True)
-            bar.update_xaxes(title_text="Proposed purchase value (PKR)")
-            render_chart(bar, "Proposed Purchase Value by Product",
-                         "order_now SKUs only. Hover for the full product name, quantity, unit cost and cost source.")
+    with st.expander("Action distribution & purchase exposure", expanded=False):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            order = ["order_now", "vendor_follow_up", "manual_review", "monitor", "no_order"]
+            vc = actions.value_counts()
+            present = [a for a in order if a in vc.index] + [a for a in vc.index if a not in order]
+            donut = go.Figure(go.Pie(
+                labels=[rs.reorder_action_label(a) for a in present],
+                values=[int(vc[a]) for a in present], hole=0.62, sort=False, direction="clockwise",
+                marker=dict(colors=[_action_hex(a) for a in present], line=dict(color="white", width=1.5)),
+                textinfo="value",
+                hovertemplate="%{label}: %{value} SKUs (%{percent})<extra></extra>"))
+            donut.update_layout(**plotly_layout(height=330, legend=True))
+            donut.update_layout(annotations=[dict(text=f"{len(reco)}<br>SKUs", x=0.5, y=0.5, showarrow=False,
+                                                  font=dict(size=15, color=COLORS["navy"]))])
+            render_chart(donut, "Recommended Actions",
+                         "One proposed buyer action per SKU. Fixed semantic colors; hover for counts and share.")
+        with col_b:
+            on = reco[actions == "order_now"].copy()
+            if on.empty:
+                with st.container(border=True):
+                    empty_state("No order_now recommendations",
+                                "No SKUs in the current selection meet the reorder trigger.", "circle-dashed")
+            else:
+                on["_pv"] = pd.to_numeric(on["recommended_purchase_value"], errors="coerce").fillna(0.0)
+                on = on.sort_values("_pv", ascending=True).tail(15)
+                names = [rs.full_product_label(n, s) for n, s in zip(on.get("sku_name"), on["sku"])]
+                cust = list(zip(names, on["sku"].astype(str),
+                                [format_number(v, 0) for v in on["recommended_order_quantity"]],
+                                [format_currency(v, 2) for v in on["unit_cost_effective"]],
+                                [(_meta_val(c) or "—") for c in on["cost_source"]],
+                                ["imputed" if bool(v) else "observed" for v in on["cost_is_imputed"]]))
+                bar = go.Figure(go.Bar(
+                    x=on["_pv"], y=on["sku"].astype(str), orientation="h",
+                    marker=dict(color=COLORS["teal"]), customdata=cust,
+                    hovertemplate=("<b>%{customdata[0]}</b><br>SKU %{customdata[1]}<br>"
+                                   "Proposed qty: %{customdata[2]} u<br>Unit cost: %{customdata[3]}<br>"
+                                   "Purchase value: %{x:,.0f}<br>Cost source: %{customdata[4]} (%{customdata[5]})"
+                                   "<extra></extra>")))
+                bar.update_layout(**plotly_layout(legend=False, height=330))
+                style_axes(bar)
+                bar.update_yaxes(tickmode="array", tickvals=on["sku"].astype(str).tolist(),
+                                 ticktext=[_short(n) for n in names], title="", automargin=True)
+                bar.update_xaxes(title_text="Proposed purchase value (PKR)")
+                render_chart(bar, "Proposed Purchase Value by Product",
+                             "order_now SKUs only. Hover for the full product name, quantity, unit cost and cost source.")
 
     # ==================================================================
     # SECTION 3 — Priority action queue (filters + clickable cards)
@@ -1644,259 +1802,309 @@ def _page_inventory_reorder_run():
         info_banner("No SKUs match these filters. Adjust the action, tier, search or toggles above.", kind="info")
         return
 
-    def _render_reco_card(row, selected):
-        sku = str(row["sku"])
+    # Secondary counts as chips (they are no longer primary KPIs) + one export menu.
+    qc1, qc2 = st.columns([3, 1])
+    with qc1:
+        _nrev = int(pd.Series(ranked.get("action", pd.Series(dtype=str))).astype(str)
+                    .eq("manual_review").sum()) if not ranked.empty else 0
+        _nven = int(pd.Series(ranked.get("action", pd.Series(dtype=str))).astype(str)
+                    .eq("vendor_follow_up").sum()) if not ranked.empty else 0
+        st.markdown(
+            f'<div class="ipa-src-row"><span class="ipa-tier ipa-tier-unknown">{len(ranked)} in queue</span>'
+            f'<span class="ipa-tier ipa-tier-{"high" if _nrev else "healthy"}">⚑ {_nrev} manual review</span>'
+            f'<span class="ipa-tier ipa-tier-medium">🚚 {_nven} vendor follow-up</span></div>',
+            unsafe_allow_html=True)
+    with qc2:
+        with st.container(key="ipa-export-2"):
+            eu.render_table_export_menu(
+                ranked, filename_stem="inventory_action_queue",
+                title="Inventory & Reorder — Priority Action Queue",
+                metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"),
+                          "Category": (ACTIVE_RUN or {}).get("category", "—")},
+                key="exp_reco_queue")
+
+    # ---- dense selectable rows (fixed height, 8 per page) ----
+    PAGE = 8
+    shown = int(st.session_state.get("reorder_queue_shown", PAGE))
+    shown = max(PAGE, min(shown, len(ranked)))
+    for rec_row in ranked.head(shown).to_dict("records"):
+        sku = str(rec_row["sku"])
         safe = _safe_key(sku)
-        keyname = f"recocard-sel-{safe}" if selected else f"recocard-{safe}"
-        name = row.get("sku_name")
+        name = rec_row.get("sku_name")
         nm = None if (name is None or (isinstance(name, float) and pd.isna(name))) else str(name).strip()
         disp = nm if (nm and nm.lower() != "nan") else sku
         full = rs.full_product_label(name, sku)
-        tier = str(row.get("overall_risk_tier") or "unknown")
-        with st.container(border=True, key=keyname):
-            st.markdown(f'<div class="ipa-riskstripe" style="background:{_action_hex(row.get("action"))};"></div>',
-                        unsafe_allow_html=True)
+        tier = str(rec_row.get("overall_risk_tier") or "unknown").lower()
+        is_sel = (sku == str(cur))
+        rcols = st.columns([3.2, 1.3, 1.0, 1.1, 1.3, 1.0])
+        with rcols[0]:
             st.markdown(
-                '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">'
-                f'<span class="ipa-riskname" title="{_esc(full)}">{_esc(disp)}</span>'
-                f'{_action_chip(row.get("action"))}</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="ipa-risksku" title="{_esc(full)}">SKU {_esc(sku)} · risk {_esc(tier)}</div>',
-                        unsafe_allow_html=True)
-            st.markdown(
-                '<div class="ipa-recometrics">'
-                f'<span class="m">Days cover <b>{format_number(row.get("days_of_cover"), 1)}</b></span>'
-                f'<span class="m">Inv. position <b>{format_number(row.get("inventory_position_for_risk"), 0)}</b></span>'
-                f'<span class="m">Reorder pt <b>{format_number(row.get("forecast_driven_reorder_point"), 0)}</b></span>'
-                f'<span class="m">Proposed qty <b>{format_number(row.get("recommended_order_quantity"), 0)}</b></span>'
-                f'<span class="m">Value <b>{format_currency(row.get("recommended_purchase_value"))}</b></span>'
-                f'<span class="m">Approval <b>{"required" if bool(row.get("approval_required")) else "—"}</b></span>'
-                '</div>', unsafe_allow_html=True)
-            with st.container(key=f"recoopen-{safe}"):
-                if st.button(("● Selected" if selected else "View details"),
-                             key=f"recobtn-{safe}", width="stretch",
-                             type="primary" if selected else "secondary"):
-                    st.session_state["reorder_selected_sku"] = sku
-                    st.rerun()
-
-    MAX_CARDS = 60
-    show_rows = ranked.head(MAX_CARDS)
-    if len(ranked) > MAX_CARDS:
-        info_banner(f"Showing the top {MAX_CARDS} of {len(ranked)} matching SKUs by priority.", kind="info")
-    records = show_rows.to_dict("records")
-    for i in range(0, len(records), 2):
-        ccols = st.columns(2)
-        for ccol, rec in zip(ccols, records[i:i + 2]):
-            with ccol:
-                _render_reco_card(rec, selected=(str(rec["sku"]) == str(cur)))
+                f'<div class="ipa-qrow ipa-q-{tier}" title="{_esc(full)}">'
+                f'<div style="min-width:0;"><div class="q-name">{_esc(disp)}</div>'
+                f'<div class="q-sub">SKU {_esc(sku)} · risk {_esc(tier)}</div></div></div>',
+                unsafe_allow_html=True)
+        rcols[1].markdown(f'<div class="ipa-qcell">{_action_chip(rec_row.get("action"))}</div>',
+                          unsafe_allow_html=True)
+        rcols[2].markdown(f'<div class="ipa-qcell"><b>{format_number(rec_row.get("days_of_cover"), 1)}</b>'
+                          f'<div class="q-sub">days cover</div></div>', unsafe_allow_html=True)
+        rcols[3].markdown(f'<div class="ipa-qcell"><b>{format_number(rec_row.get("recommended_order_quantity"), 0)}</b>'
+                          f'<div class="q-sub">proposed qty</div></div>', unsafe_allow_html=True)
+        rcols[4].markdown(f'<div class="ipa-qcell"><b>{format_currency(rec_row.get("recommended_purchase_value"))}</b>'
+                          f'<div class="q-sub">value</div></div>', unsafe_allow_html=True)
+        with rcols[5]:
+            if st.button("Details", key=f"recobtn-{safe}", width="stretch",
+                         type="primary" if is_sel else "secondary",
+                         help=f"Open full recommendation for {full}"):
+                st.session_state["reorder_selected_sku"] = sku
+                st.session_state["reorder_open_dialog"] = True
+                st.rerun()
+    if len(ranked) > shown:
+        if st.button(f"Show more ({len(ranked) - shown} remaining)", key="reco_show_more"):
+            st.session_state["reorder_queue_shown"] = shown + PAGE
+            st.rerun()
+    elif shown > PAGE:
+        if st.button("Show fewer", key="reco_show_fewer"):
+            st.session_state["reorder_queue_shown"] = PAGE
+            st.rerun()
 
     # ==================================================================
     # SECTION 4 — Selected recommendation deep dive
     # ==================================================================
-    sel = reco[reco["sku"].astype(str) == str(cur)]
-    if sel.empty:
-        return
-    r = sel.iloc[0]
-    full = rs.full_product_label(r.get("sku_name"), r["sku"])
-    cat_val = _meta_val(r.get("category"))
-    brand_val = _meta_val(brand_by_sku.get(str(r["sku"])))
-    meta_bits = [b for b in (cat_val, brand_val, _meta_val(r.get("channel"))) if b]
+    # ------------------------------------------------------------------
+    # Selected recommendation — shown in st.dialog (no long scroll) with an
+    # inline-expander fallback. Identical content in both paths.
+    # ------------------------------------------------------------------
+    def _render_selected_reco(cur):
+        sel = reco[reco["sku"].astype(str) == str(cur)]
+        if sel.empty:
+            return
+        r = sel.iloc[0]
+        full = rs.full_product_label(r.get("sku_name"), r["sku"])
+        cat_val = _meta_val(r.get("category"))
+        brand_val = _meta_val(brand_by_sku.get(str(r["sku"])))
+        meta_bits = [b for b in (cat_val, brand_val, _meta_val(r.get("channel"))) if b]
 
-    section_title("Selected recommendation", None)
-    st.markdown(f'<div class="ipa-dd-head">{_esc(full)}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="ipa-dd-sub">'
-                f'{_esc(" · ".join(meta_bits) if meta_bits else "—")} &nbsp;{_action_chip(r.get("action"))}'
-                '</div>', unsafe_allow_html=True)
+        st.markdown('<div class="ipa-dd-sub">'
+                    f'{_esc(" · ".join(meta_bits) if meta_bits else "—")} &nbsp;{_action_chip(r.get("action"))}'
+                    '</div>', unsafe_allow_html=True)
 
-    # A. decision summary — exactly four cards
-    approval_txt = "Buyer approval required" if bool(r.get("approval_required")) else "No approval needed"
-    dd = [
-        {"label": "Recommended action", "value": rs.reorder_action_label(r.get("action")),
-         "icon": "target", "tone": rs.reorder_action_tone(r.get("action")),
-         "sub": "One proposed action per SKU"},
-        {"label": "Proposed quantity", "value": f'{format_number(r.get("recommended_order_quantity"), 0)} u',
-         "icon": "box", "tone": "navy", "sub": "0 for non-order actions"},
-        {"label": "Proposed purchase value", "value": format_currency(r.get("recommended_purchase_value")),
-         "icon": "coin", "tone": "teal", "sub": "Quantity × effective unit cost"},
-        {"label": "Approval status", "value": ("Awaiting review" if bool(r.get("approval_required")) else "—"),
-         "icon": "shield-check", "tone": "amber", "sub": approval_txt},
-    ]
-    render_kpi_row(dd, n_cols=4)
-
-    # B. trigger & inventory position
-    trig = "Yes" if bool(r.get("reorder_triggered")) else "No"
-    left, right = st.columns([1, 1])
-    with left:
-        metric_panel("Trigger & inventory position", [
-            ("Current stock", format_number(r.get("stock_on_hand"), 0)
-             + (" (synthetic)" if bool(r.get("stock_on_hand_is_synthetic")) else "")),
-            ("Reported on-order", format_number(r.get("reported_on_order_quantity"), 0)),
-            ("Usable on-order", format_number(r.get("usable_on_order_quantity"), 0)),
-            ("Inventory position", format_number(r.get("inventory_position_for_risk"), 0)),
-            ("Forecast-driven reorder point", format_number(r.get("forecast_driven_reorder_point"), 0)),
-            ("Reorder triggered", trig),
-            ("Days of cover", format_number(r.get("days_of_cover"), 1)),
-            ("Risk tier", str(r.get("overall_risk_tier") or "—").capitalize()),
-            ("Stockout probability", format_percentage(r.get("stockout_probability"))),
-            ("Projected stockout date", _date_str(r.get("projected_stockout_date"))),
-        ], sub="“—” means not available (never shown as zero).")
-    with right:
-        # comparison chart: inventory position vs reorder point vs target stock
-        comp_labels = ["Inventory position", "Forecast reorder point", "Target stock"]
-        comp_vals = [r.get("inventory_position_for_risk"), r.get("forecast_driven_reorder_point"),
-                     r.get("target_stock")]
-        comp_num = [float(v) if _meta_val(v) is not None and pd.notna(v) else None for v in comp_vals]
-        cmp = go.Figure(go.Bar(
-            x=comp_labels, y=[v if v is not None else 0 for v in comp_num],
-            marker=dict(color=[COLORS["navy"], COLORS["amber"], COLORS["teal"]]),
-            customdata=[format_number(v, 0) for v in comp_num],
-            hovertemplate="%{x}: %{customdata} units<extra></extra>"))
-        cmp.update_layout(**plotly_layout(legend=False, height=300))
-        style_axes(cmp)
-        cmp.update_yaxes(title_text="Units")
-        render_chart(cmp, "Position vs Reorder Point vs Target Stock",
-                     "Exact units on hover. Target stock is the order-up-to level for the target-cover policy.")
-
-    # C. quantity construction (four-stage flow)
-    section_title("Quantity construction", "Raw target gap → MOQ adjusted → pack rounded → final proposal.")
-    is_order = str(r.get("action")).lower() == "order_now"
-    raw_gap = r.get("raw_target_gap")
-    moq = r.get("moq")
-    pack = r.get("pack_size")
-    moq_adj = r.get("moq_adjusted_quantity")
-    rounded = r.get("rounded_order_quantity")
-    final_q = r.get("recommended_order_quantity")
-    prov = r.get("provisional_calculated_quantity")
-    if is_order:
-        stages = [
-            ("Raw target gap", format_number(raw_gap, 0), "target stock − inventory position"),
-            ("MOQ adjusted", format_number(moq_adj, 0), f"MOQ {format_number(moq, 0)}"),
-            ("Pack rounded", format_number(rounded, 0), f"pack {format_number(pack, 0)}"),
-            ("Final proposal", format_number(final_q, 0), "buyer approval required"),
+        # A. decision summary — exactly four cards
+        approval_txt = "Buyer approval required" if bool(r.get("approval_required")) else "No approval needed"
+        dd = [
+            {"label": "Recommended action", "value": rs.reorder_action_label(r.get("action")),
+             "icon": "target", "tone": rs.reorder_action_tone(r.get("action")),
+             "sub": "One proposed action per SKU"},
+            {"label": "Proposed quantity", "value": f'{format_number(r.get("recommended_order_quantity"), 0)} u',
+             "icon": "box", "tone": "navy", "sub": "0 for non-order actions"},
+            {"label": "Proposed purchase value", "value": format_currency(r.get("recommended_purchase_value")),
+             "icon": "coin", "tone": "teal", "sub": "Quantity × effective unit cost"},
+            {"label": "Approval status", "value": ("Awaiting review" if bool(r.get("approval_required")) else "—"),
+             "icon": "shield-check", "tone": "amber", "sub": approval_txt},
         ]
-        flow = ""
-        for i, (lab, val, cap) in enumerate(stages):
-            cls = "ipa-qstage final" if i == len(stages) - 1 else "ipa-qstage"
-            flow += (f'<div class="{cls}"><div class="lab">{_esc(lab)}</div>'
-                     f'<div class="val">{_esc(val)}</div><div class="cap">{_esc(cap)}</div></div>')
-            if i < len(stages) - 1:
-                flow += '<div class="ipa-qarrow">→</div>'
-        st.markdown(f'<div class="ipa-qflow">{flow}</div>', unsafe_allow_html=True)
+        render_kpi_row(dd, n_cols=4)
+
+        # Tabs keep the modal short (mirrors the Stockout Risk detail dialog).
+        _r_sum, _r_qty, _r_why = st.tabs(["Summary", "Quantity build", "Why & assumptions"])
+
+        # B. trigger & inventory position
+        trig = "Yes" if bool(r.get("reorder_triggered")) else "No"
+        with _r_sum, st.container(height=460):
+            left, right = st.columns([1, 1])
+            with left:
+                metric_panel("Trigger & inventory position", [
+                    ("Current stock", format_number(r.get("stock_on_hand"), 0)
+                     + (" (synthetic)" if bool(r.get("stock_on_hand_is_synthetic")) else "")),
+                    ("Reported on-order", format_number(r.get("reported_on_order_quantity"), 0)),
+                    ("Usable on-order", format_number(r.get("usable_on_order_quantity"), 0)),
+                    ("Inventory position", format_number(r.get("inventory_position_for_risk"), 0)),
+                    ("Forecast-driven reorder point", format_number(r.get("forecast_driven_reorder_point"), 0)),
+                    ("Reorder triggered", trig),
+                    ("Days of cover", format_number(r.get("days_of_cover"), 1)),
+                    ("Risk tier", str(r.get("overall_risk_tier") or "—").capitalize()),
+                    ("Stockout probability", format_percentage(r.get("stockout_probability"))),
+                    ("Projected stockout date", _date_str(r.get("projected_stockout_date"))),
+                ], sub="“—” means not available (never shown as zero).")
+            with right:
+                # comparison chart: inventory position vs reorder point vs target stock
+                comp_labels = ["Inventory position", "Forecast reorder point", "Target stock"]
+                comp_vals = [r.get("inventory_position_for_risk"), r.get("forecast_driven_reorder_point"),
+                             r.get("target_stock")]
+                comp_num = [float(v) if _meta_val(v) is not None and pd.notna(v) else None for v in comp_vals]
+                cmp = go.Figure(go.Bar(
+                    x=comp_labels, y=[v if v is not None else 0 for v in comp_num],
+                    marker=dict(color=[COLORS["navy"], COLORS["amber"], COLORS["teal"]]),
+                    customdata=[format_number(v, 0) for v in comp_num],
+                    hovertemplate="%{x}: %{customdata} units<extra></extra>"))
+                cmp.update_layout(**plotly_layout(legend=False, height=300))
+                style_axes(cmp)
+                cmp.update_yaxes(title_text="Units")
+                render_chart(cmp, "Position vs Reorder Point vs Target Stock",
+                             "Exact units on hover. Target stock is the order-up-to level for the target-cover policy.")
+
+            # C. quantity construction (four-stage flow)
+        with _r_qty, st.container(height=460):
+            section_title("Quantity construction", "Raw target gap → MOQ adjusted → pack rounded → final proposal.")
+            is_order = str(r.get("action")).lower() == "order_now"
+            raw_gap = r.get("raw_target_gap")
+            moq = r.get("moq")
+            pack = r.get("pack_size")
+            moq_adj = r.get("moq_adjusted_quantity")
+            rounded = r.get("rounded_order_quantity")
+            final_q = r.get("recommended_order_quantity")
+            prov = r.get("provisional_calculated_quantity")
+            if is_order:
+                stages = [
+                    ("Raw target gap", format_number(raw_gap, 0), "target stock − inventory position"),
+                    ("MOQ adjusted", format_number(moq_adj, 0), f"MOQ {format_number(moq, 0)}"),
+                    ("Pack rounded", format_number(rounded, 0), f"pack {format_number(pack, 0)}"),
+                    ("Final proposal", format_number(final_q, 0), "buyer approval required"),
+                ]
+                flow = ""
+                for i, (lab, val, cap) in enumerate(stages):
+                    cls = "ipa-qstage final" if i == len(stages) - 1 else "ipa-qstage"
+                    flow += (f'<div class="{cls}"><div class="lab">{_esc(lab)}</div>'
+                             f'<div class="val">{_esc(val)}</div><div class="cap">{_esc(cap)}</div></div>')
+                    if i < len(stages) - 1:
+                        flow += '<div class="ipa-qarrow">→</div>'
+                st.markdown(f'<div class="ipa-qflow">{flow}</div>', unsafe_allow_html=True)
+            else:
+                prov_txt = (f"A provisional (non-actionable) quantity of {format_number(prov, 0)} units was safely "
+                            f"calculated for reference." if prov is not None and pd.notna(prov)
+                            else "No provisional quantity could be safely calculated.")
+                info_banner(f"Final actionable quantity is <strong>0</strong> for a "
+                            f"<strong>{_esc(rs.reorder_action_label(r.get('action')))}</strong> recommendation "
+                            f"— MOQ and pack rounding are not applied to the actionable quantity. {prov_txt}",
+                            kind="info")
+                if raw_gap is not None and pd.notna(raw_gap):
+                    st.caption(f"Diagnostic raw target gap: {format_number(raw_gap, 0)} units "
+                               f"(does not create an order without the reorder trigger).")
+
+            # D. demand & target-stock inputs
+            # E. ordering & cost — shown side by side
+            d_col, e_col = st.columns(2)
+            with d_col:
+                metric_panel("Demand & target-stock inputs", [
+                    ("Operational model", _esc(str(r.get("operational_model") or "—"))),
+                    ("Operational horizon", f'{format_number(r.get("operational_horizon"), 0)} d'),
+                    ("Lead time", f'{format_number(r.get("lead_time_days"), 0)} d '
+                                  f'({_meta_val(r.get("lead_time_source")) or "—"})'),
+                    ("Lead-time demand (mean)", format_number(r.get("lead_time_demand_mean"), 0)),
+                    ("Lead-time safety stock", format_number(r.get("lead_time_safety_stock"), 0)),
+                    ("Target-cover days", format_number(r.get("target_cover_days"), 0)),
+                    ("Planning-horizon days", format_number(r.get("planning_horizon_days"), 0)),
+                    ("Planning-horizon demand", format_number(r.get("planning_horizon_demand_mean"), 1)),
+                    ("Planning-horizon sigma", format_number(r.get("planning_horizon_sigma"), 1)),
+                    ("Service-level target", format_percentage(r.get("service_level_target"))),
+                    ("Service-level z", format_number(r.get("service_level_z"), 2)),
+                    ("Planning safety stock", format_number(r.get("planning_safety_stock"), 0)),
+                    ("Target stock", format_number(r.get("target_stock"), 0)),
+                ], sub="Forecast-driven; “—” means not available.")
+            with e_col:
+                metric_panel("Ordering & cost", [
+                    ("Recommended order date", _date_str(r.get("recommended_order_date"))),
+                    ("Expected arrival date", _date_str(r.get("expected_arrival_date"))),
+                    ("MOQ", f'{format_number(r.get("moq"), 0)} ({_meta_val(r.get("moq_source")) or "—"})'),
+                    ("Pack size", f'{format_number(r.get("pack_size"), 0)} ({_meta_val(r.get("pack_size_source")) or "—"})'),
+                    ("Unit cost (effective)", format_currency(r.get("unit_cost_effective"), 2)),
+                    ("Cost source", _meta_val(r.get("cost_source")) or "—"),
+                    ("Cost imputed", "Yes (estimated)" if bool(r.get("cost_is_imputed")) else "No"),
+                    ("Cost quality", _meta_val(r.get("cost_quality_flag")) or "—"),
+                    ("Currency", _meta_val(r.get("cost_currency")) or "—"),
+                    ("Cost basis", _meta_val(r.get("cost_basis")) or "—"),
+                    ("Proposed purchase value", format_currency(r.get("recommended_purchase_value"))),
+                ], sub="Supplier calendars, weekends and working-day schedules are not available.")
+
+            # ==================================================================
+            # SECTION 5 — Why this action was recommended
+            # ==================================================================
+        with _r_why, st.container(height=460):
+            section_title("Why this action was recommended", None)
+            reason = r.get("reason_trace")
+            reason_txt = "" if (reason is None or (isinstance(reason, float) and pd.isna(reason))) else str(reason)
+            st.markdown(
+                f'<div class="ipa-reason"><div class="h">{icon_svg("file-text", 16)} Decision rationale</div>'
+                f'{_esc(reason_txt) if reason_txt else "No reason trace was recorded for this SKU."}</div>',
+                unsafe_allow_html=True)
+            codes = _flags_to_list(r.get("review_reason_codes"))
+            if codes:
+                chips = "".join(f'<span class="ipa-rtier ipa-rtier-unknown">{_flag_pretty(c)}</span> ' for c in codes)
+                st.markdown(f'<div style="margin-top:8px;">{chips}</div>', unsafe_allow_html=True)
+
+            # ==================================================================
+            # SECTION 6 — Assumptions & approval
+            # ==================================================================
+            st.markdown(
+                '<div class="ipa-approval" style="margin-top:10px;">'
+                f'<span class="ico">{icon_svg("clock", 22)}</span>'
+                '<div class="txt"><div class="h">Status: Awaiting buyer review</div>'
+                '<div class="s">This is a planning proposal. No purchase order has been approved, submitted, '
+                'placed or sent to any supplier.</div></div></div>', unsafe_allow_html=True)
+
+            with st.expander("Assumptions, cost quality and decision limitations", expanded=False):
+                def _yn(b):
+                    return "Yes" if b else "No"
+                flag_items = _flags_to_list(r.get("assumption_flags"))
+                conds = [
+                    f"Synthetic stock: {_yn(bool(r.get('stock_on_hand_is_synthetic')))}",
+                    f"Lead-time source: {_meta_val(r.get('lead_time_source')) or '—'}",
+                    f"MOQ source: {_meta_val(r.get('moq_source')) or '—'}",
+                    f"Pack-size source: {_meta_val(r.get('pack_size_source')) or '—'}",
+                    f"Cost source: {_meta_val(r.get('cost_source')) or '—'}",
+                    f"Cost imputed (estimated): {_yn(bool(r.get('cost_is_imputed')))}",
+                    f"Insufficient forecast horizon: {_yn(bool(r.get('insufficient_horizon')))}",
+                    f"Decision policy version: {_meta_val(r.get('decision_policy_version')) or '—'}",
+                ]
+                st.markdown("**Conditions for this SKU**")
+                st.markdown("\n".join(f"- {c}" for c in conds))
+                if flag_items:
+                    st.markdown("**Assumption flags recorded in the artifact**")
+                    st.markdown("\n".join(f"- {_flag_pretty(f)}" for f in flag_items))
+                if codes:
+                    st.markdown("**Manual-review reasons**")
+                    st.markdown("\n".join(f"- {_flag_pretty(c)}" for c in codes))
+                st.markdown("**Known limitations**")
+                for d in (
+                    "Supplier calendars, weekends and working-day schedules are not available, so the expected "
+                    "arrival date is a simple lead-time offset.",
+                    "Undated inbound (on-order) stock is excluded from the inventory position.",
+                    "Lead time, MOQ and pack size may be pilot assumptions; unit cost may be imputed.",
+                    "Recommendations are forecast-driven planning proposals — no purchase order is created.",
+                ):
+                    st.markdown(f"- {d}")
+                with st.expander("Advanced: raw decision fields", expanded=False):
+                    adv_fields = ["reorder_triggered", "insufficient_horizon", "raw_target_gap",
+                                  "raw_order_quantity", "moq_adjusted_quantity", "rounded_order_quantity",
+                                  "provisional_calculated_quantity", "planning_horizon_days",
+                                  "available_forecast_horizon_days", "service_level_z", "confidence_label",
+                                  "order_placed", "human_follow_up_required", "manual_review_required",
+                                  "decision_policy_version", "generated_at"]
+                    adv_rows = []
+                    for f in adv_fields:
+                        v = r.get(f)
+                        disp = "—" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)
+                        adv_rows.append({"field": f, "value": disp})
+                    st.dataframe(pd.DataFrame(adv_rows), use_container_width=True, hide_index=True)
+
+    # ---- recommendation details: dialog when supported, compact inline panel otherwise ----
+    _rsel = reco[reco["sku"].astype(str) == str(cur)]
+    _rfull = (rs.full_product_label(_rsel.iloc[0].get("sku_name"), _rsel.iloc[0]["sku"])
+              if not _rsel.empty else str(cur))
+    if hasattr(st, "dialog"):
+        @st.dialog(f"{_rfull}", width="large")
+        def _reco_dialog():
+            _render_selected_reco(cur)
+            if st.button("Close", key="reco_dialog_close", type="primary"):
+                st.session_state["reorder_open_dialog"] = False
+                st.rerun()
+
+        if st.session_state.get("reorder_open_dialog"):
+            st.session_state["reorder_open_dialog"] = False
+            _reco_dialog()
     else:
-        prov_txt = (f"A provisional (non-actionable) quantity of {format_number(prov, 0)} units was safely "
-                    f"calculated for reference." if prov is not None and pd.notna(prov)
-                    else "No provisional quantity could be safely calculated.")
-        info_banner(f"Final actionable quantity is <strong>0</strong> for a "
-                    f"<strong>{_esc(rs.reorder_action_label(r.get('action')))}</strong> recommendation "
-                    f"— MOQ and pack rounding are not applied to the actionable quantity. {prov_txt}",
-                    kind="info")
-        if raw_gap is not None and pd.notna(raw_gap):
-            st.caption(f"Diagnostic raw target gap: {format_number(raw_gap, 0)} units "
-                       f"(does not create an order without the reorder trigger).")
-
-    # D. demand & target-stock inputs
-    # E. ordering & cost — shown side by side
-    d_col, e_col = st.columns(2)
-    with d_col:
-        metric_panel("Demand & target-stock inputs", [
-            ("Operational model", _esc(str(r.get("operational_model") or "—"))),
-            ("Operational horizon", f'{format_number(r.get("operational_horizon"), 0)} d'),
-            ("Lead time", f'{format_number(r.get("lead_time_days"), 0)} d '
-                          f'({_meta_val(r.get("lead_time_source")) or "—"})'),
-            ("Lead-time demand (mean)", format_number(r.get("lead_time_demand_mean"), 0)),
-            ("Lead-time safety stock", format_number(r.get("lead_time_safety_stock"), 0)),
-            ("Target-cover days", format_number(r.get("target_cover_days"), 0)),
-            ("Planning-horizon days", format_number(r.get("planning_horizon_days"), 0)),
-            ("Planning-horizon demand", format_number(r.get("planning_horizon_demand_mean"), 1)),
-            ("Planning-horizon sigma", format_number(r.get("planning_horizon_sigma"), 1)),
-            ("Service-level target", format_percentage(r.get("service_level_target"))),
-            ("Service-level z", format_number(r.get("service_level_z"), 2)),
-            ("Planning safety stock", format_number(r.get("planning_safety_stock"), 0)),
-            ("Target stock", format_number(r.get("target_stock"), 0)),
-        ], sub="Forecast-driven; “—” means not available.")
-    with e_col:
-        metric_panel("Ordering & cost", [
-            ("Recommended order date", _date_str(r.get("recommended_order_date"))),
-            ("Expected arrival date", _date_str(r.get("expected_arrival_date"))),
-            ("MOQ", f'{format_number(r.get("moq"), 0)} ({_meta_val(r.get("moq_source")) or "—"})'),
-            ("Pack size", f'{format_number(r.get("pack_size"), 0)} ({_meta_val(r.get("pack_size_source")) or "—"})'),
-            ("Unit cost (effective)", format_currency(r.get("unit_cost_effective"), 2)),
-            ("Cost source", _meta_val(r.get("cost_source")) or "—"),
-            ("Cost imputed", "Yes (estimated)" if bool(r.get("cost_is_imputed")) else "No"),
-            ("Cost quality", _meta_val(r.get("cost_quality_flag")) or "—"),
-            ("Currency", _meta_val(r.get("cost_currency")) or "—"),
-            ("Cost basis", _meta_val(r.get("cost_basis")) or "—"),
-            ("Proposed purchase value", format_currency(r.get("recommended_purchase_value"))),
-        ], sub="Supplier calendars, weekends and working-day schedules are not available.")
-
-    # ==================================================================
-    # SECTION 5 — Why this action was recommended
-    # ==================================================================
-    section_title("Why this action was recommended", None)
-    reason = r.get("reason_trace")
-    reason_txt = "" if (reason is None or (isinstance(reason, float) and pd.isna(reason))) else str(reason)
-    st.markdown(
-        f'<div class="ipa-reason"><div class="h">{icon_svg("file-text", 16)} Decision rationale</div>'
-        f'{_esc(reason_txt) if reason_txt else "No reason trace was recorded for this SKU."}</div>',
-        unsafe_allow_html=True)
-    codes = _flags_to_list(r.get("review_reason_codes"))
-    if codes:
-        chips = "".join(f'<span class="ipa-rtier ipa-rtier-unknown">{_flag_pretty(c)}</span> ' for c in codes)
-        st.markdown(f'<div style="margin-top:8px;">{chips}</div>', unsafe_allow_html=True)
-
-    # ==================================================================
-    # SECTION 6 — Assumptions & approval
-    # ==================================================================
-    st.markdown(
-        '<div class="ipa-approval" style="margin-top:10px;">'
-        f'<span class="ico">{icon_svg("clock", 22)}</span>'
-        '<div class="txt"><div class="h">Status: Awaiting buyer review</div>'
-        '<div class="s">This is a planning proposal. No purchase order has been approved, submitted, '
-        'placed or sent to any supplier.</div></div></div>', unsafe_allow_html=True)
-
-    with st.expander("Assumptions, cost quality and decision limitations", expanded=False):
-        def _yn(b):
-            return "Yes" if b else "No"
-        flag_items = _flags_to_list(r.get("assumption_flags"))
-        conds = [
-            f"Synthetic stock: {_yn(bool(r.get('stock_on_hand_is_synthetic')))}",
-            f"Lead-time source: {_meta_val(r.get('lead_time_source')) or '—'}",
-            f"MOQ source: {_meta_val(r.get('moq_source')) or '—'}",
-            f"Pack-size source: {_meta_val(r.get('pack_size_source')) or '—'}",
-            f"Cost source: {_meta_val(r.get('cost_source')) or '—'}",
-            f"Cost imputed (estimated): {_yn(bool(r.get('cost_is_imputed')))}",
-            f"Insufficient forecast horizon: {_yn(bool(r.get('insufficient_horizon')))}",
-            f"Decision policy version: {_meta_val(r.get('decision_policy_version')) or '—'}",
-        ]
-        st.markdown("**Conditions for this SKU**")
-        st.markdown("\n".join(f"- {c}" for c in conds))
-        if flag_items:
-            st.markdown("**Assumption flags recorded in the artifact**")
-            st.markdown("\n".join(f"- {_flag_pretty(f)}" for f in flag_items))
-        if codes:
-            st.markdown("**Manual-review reasons**")
-            st.markdown("\n".join(f"- {_flag_pretty(c)}" for c in codes))
-        st.markdown("**Known limitations**")
-        for d in (
-            "Supplier calendars, weekends and working-day schedules are not available, so the expected "
-            "arrival date is a simple lead-time offset.",
-            "Undated inbound (on-order) stock is excluded from the inventory position.",
-            "Lead time, MOQ and pack size may be pilot assumptions; unit cost may be imputed.",
-            "Recommendations are forecast-driven planning proposals — no purchase order is created.",
-        ):
-            st.markdown(f"- {d}")
-        with st.expander("Advanced: raw decision fields", expanded=False):
-            adv_fields = ["reorder_triggered", "insufficient_horizon", "raw_target_gap",
-                          "raw_order_quantity", "moq_adjusted_quantity", "rounded_order_quantity",
-                          "provisional_calculated_quantity", "planning_horizon_days",
-                          "available_forecast_horizon_days", "service_level_z", "confidence_label",
-                          "order_placed", "human_follow_up_required", "manual_review_required",
-                          "decision_policy_version", "generated_at"]
-            adv_rows = []
-            for f in adv_fields:
-                v = r.get(f)
-                disp = "—" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)
-                adv_rows.append({"field": f, "value": disp})
-            st.dataframe(pd.DataFrame(adv_rows), use_container_width=True, hide_index=True)
+        st.markdown('<div id="reco-details-anchor"></div>', unsafe_allow_html=True)
+        with st.expander(f"Recommendation — {_rfull}", expanded=True):
+            _render_selected_reco(cur)
+        scroll_into_view("reco-details-anchor")
 
     # ==================================================================
     # SECTION 7 — Complete recommendation table
@@ -1928,7 +2136,18 @@ def _page_inventory_reorder_run():
             if ccol in disp.columns:
                 disp[ccol] = disp[ccol].map(lambda v: format_currency(v, 2) if ccol == "unit_cost_effective" else format_currency(v))
         disp = disp.rename(columns=dict(colmap))
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+        _sty = disp.style
+        for _c in ("Action", "Risk"):
+            if _c in disp.columns:
+                _sty = _sty.map(_reorder_action_cell_css if _c == "Action" else _risk_tier_cell_css,
+                                subset=[_c])
+        st.dataframe(_sty, use_container_width=True, hide_index=True)
+        with st.container(key="ipa-export-3"):
+            eu.render_table_export_menu(
+                disp, filename_stem="reorder_recommendations_complete",
+                title="Inventory & Reorder — Complete Recommendations",
+                metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"),
+                          "Rows": len(disp)}, key="exp_reco_full")
         st.caption("One row per SKU/channel, read directly from the run's validated reorder artifact.")
         with st.expander("Advanced: technical & contract fields", expanded=False):
             tech = [c for c in reco.columns if c not in src_cols and c != "reason_trace"]
@@ -1988,6 +2207,10 @@ def _page_inventory_reorder_legacy():
     })
     styler = view.style.map(_status_cell_css, subset=["Status"])
     st.dataframe(styler, width="stretch", hide_index=True, height=430)
+    with st.container(key="ipa-export-4"):
+        eu.render_table_export_menu(view, filename_stem="inventory_action_queue",
+                                    title="Inventory & Reorder — Priority Action Queue", metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"), "Category": (ACTIVE_RUN or {}).get("category", "—"), "As-of": (ACTIVE_RUN or {}).get("as_of_date", "—")},
+                                    key="exp_invqueue")
 
     # --- Two focused charts ---
     c1, c2 = st.columns(2)
@@ -2172,6 +2395,7 @@ def page_stockout_risk():
         "Stockout Risk",
         "Forecast-driven inventory exposure · lead-time demand · projected stockout probability",
         badges=badges)
+    render_filter_bar(products=True, category=True, key_prefix="risk")
 
     # ------------------------------------------------------------------
     # Run-scoped guards → polished empty states (legacy + old runs)
@@ -2193,8 +2417,10 @@ def page_stockout_risk():
 
     # Read-only copy of the validated artifact, narrowed to the sidebar product filter
     risk = risk_raw.copy()
-    if sel_skus:
-        risk = risk[risk["sku"].astype(str).isin([str(s) for s in sel_skus])]
+    # Narrow through the SHARED product filter, then join display product names (the
+    # artifact's sku_name is null — names live in model_panel).
+    risk = narrow_to_filtered_skus(risk)
+    risk = enrich_product_names(risk)
     if risk.empty:
         empty_state("No SKUs in the current filter",
                     "Clear the product filter in the sidebar to see the full stockout-risk queue.",
@@ -2246,99 +2472,97 @@ def page_stockout_risk():
          "sub": _help("Across SKUs with a cover estimate",
                       "Mean forecast days of cover over SKUs where it is defined; SKUs without an "
                       "estimate are excluded (never treated as zero).")},
-        {"label": "Manual Review Required", "value": format_number(n_review),
-         "icon": "shield-check", "tone": "slate",
-         "sub": _help("Needs a human decision",
-                      "SKUs the engine flagged for manual review — unknown tier, insufficient forecast "
-                      "horizon, missing price, or other recorded manual-review conditions.")},
     ]
-    render_kpi_row(kpis, n_cols=5)
+    # Exactly four equal-height primary KPIs. Manual-review count moved to a chip beside
+    # the queue filters (see SECTION 3) so it no longer competes with the headline numbers.
+    with st.container(key="ipa-kpirow"):
+        render_kpi_row(kpis, n_cols=4)
 
     # ==================================================================
-    # SECTION 2 — Risk composition (donut + probability/cover scatter)
+    # SECTION 2 — Risk composition (secondary → progressive disclosure)
     # ==================================================================
-    section_title("Risk composition", None)
-    tier_order = ["critical", "high", "medium", "watch", "low", "healthy", "unknown"]
-    vc = tiers.value_counts()
-    present = [t for t in tier_order if t in vc.index] + [t for t in vc.index if t not in tier_order]
+    with st.expander("Risk composition charts", expanded=False):
+        tier_order = ["critical", "high", "medium", "watch", "low", "healthy", "unknown"]
+        vc = tiers.value_counts()
+        present = [t for t in tier_order if t in vc.index] + [t for t in vc.index if t not in tier_order]
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        donut = go.Figure(go.Pie(
-            labels=[t.capitalize() for t in present],
-            values=[int(vc[t]) for t in present],
-            hole=0.62, sort=False, direction="clockwise",
-            marker=dict(colors=[_tier_hex(t) for t in present], line=dict(color="white", width=1.5)),
-            textinfo="value",
-            hovertemplate="%{label}: %{value} SKUs (%{percent})<extra></extra>"))
-        donut.update_layout(**plotly_layout(height=330, legend=True))
-        donut.update_layout(annotations=[dict(
-            text=f"{len(risk)}<br>SKUs", x=0.5, y=0.5, showarrow=False,
-            font=dict(size=15, color=COLORS["navy"]))])
-        render_chart(donut, "Risk Tier Distribution",
-                     "Fixed semantic colors — Critical (red) through Unknown (grey); Unknown is never green.")
-    with col_b:
-        rev_all = pd.to_numeric(risk["estimated_revenue_at_risk"], errors="coerce")
-        rev_max = float(rev_all.max()) if rev_all.notna().any() and float(rev_all.max()) > 0 else None
+        col_a, col_b = st.columns(2)
+        with col_a:
+            donut = go.Figure(go.Pie(
+                labels=[t.capitalize() for t in present],
+                values=[int(vc[t]) for t in present],
+                hole=0.62, sort=False, direction="clockwise",
+                marker=dict(colors=[_tier_hex(t) for t in present], line=dict(color="white", width=1.5)),
+                textinfo="value",
+                hovertemplate="%{label}: %{value} SKUs (%{percent})<extra></extra>"))
+            donut.update_layout(**plotly_layout(height=330, legend=True))
+            donut.update_layout(annotations=[dict(
+                text=f"{len(risk)}<br>SKUs", x=0.5, y=0.5, showarrow=False,
+                font=dict(size=15, color=COLORS["navy"]))])
+            render_chart(donut, "Risk Tier Distribution",
+                         "Fixed semantic colors — Critical (red) through Unknown (grey); Unknown is never green.")
+        with col_b:
+            rev_all = pd.to_numeric(risk["estimated_revenue_at_risk"], errors="coerce")
+            rev_max = float(rev_all.max()) if rev_all.notna().any() and float(rev_all.max()) > 0 else None
 
-        def _msize(v):
-            # bubble size ∝ revenue at risk when available; a stable default otherwise
-            if rev_max and pd.notna(v) and float(v) > 0:
-                return 11 + 24 * (float(v) / rev_max)
-            return 11
+            def _msize(v):
+                # bubble size ∝ revenue at risk when available; a stable default otherwise
+                if rev_max and pd.notna(v) and float(v) > 0:
+                    return 11 + 24 * (float(v) / rev_max)
+                return 11
 
-        scatter = go.Figure()
-        for t in present:
-            sub = risk[tiers == t]
-            if sub.empty:
-                continue
-            names = [rs.full_product_label(n, s) for n, s in zip(sub.get("sku_name"), sub["sku"])]
-            cust = list(zip(
-                names,
-                sub["sku"].astype(str),
-                [(_meta_val(c) or "—") for c in sub["channel"]],
-                [str(x).capitalize() for x in sub["overall_risk_tier"]],
-                [format_number(v, 0) for v in sub["stock_on_hand"]],
-                [_date_str(x) for x in sub["projected_stockout_date"]],
-                [format_number(v, 0) for v in sub["expected_shortage_units"]],
-                [format_currency(v) for v in sub["estimated_revenue_at_risk"]]))
-            scatter.add_trace(go.Scatter(
-                x=pd.to_numeric(sub["forecast_days_of_cover"], errors="coerce"),
-                y=pd.to_numeric(sub["stockout_probability"], errors="coerce"),
-                mode="markers", name=t.capitalize(),
-                marker=dict(size=[_msize(v) for v in sub["estimated_revenue_at_risk"]],
-                            color=_tier_hex(t), line=dict(color="white", width=1)),
-                customdata=cust,
-                hovertemplate=("<b>%{customdata[0]}</b><br>SKU %{customdata[1]} · %{customdata[2]}<br>"
-                               "Tier: %{customdata[3]}<br>P(stockout): %{y:.0%}<br>"
-                               "Days of cover: %{x:.1f}<br>Current stock: %{customdata[4]} u<br>"
-                               "Projected stockout: %{customdata[5]}<br>"
-                               "Expected shortage: %{customdata[6]} u<br>"
-                               "Revenue at risk: %{customdata[7]}<extra></extra>")))
-        scatter.update_layout(**plotly_layout(height=330, legend=True))
-        style_axes(scatter)
-        scatter.update_yaxes(range=[-0.03, 1.03], tickformat=".0%", title_text="P(stockout) in lead time")
-        scatter.update_xaxes(title_text="Forecast days of cover")
-        render_chart(scatter, "Stockout Probability vs Days of Cover",
-                     "Top-left corner = most urgent; bubble size ∝ revenue at risk. Hover for full detail.")
+            scatter = go.Figure()
+            for t in present:
+                sub = risk[tiers == t]
+                if sub.empty:
+                    continue
+                names = [rs.full_product_label(n, s) for n, s in zip(sub.get("sku_name"), sub["sku"])]
+                cust = list(zip(
+                    names,
+                    sub["sku"].astype(str),
+                    [(_meta_val(c) or "—") for c in sub["channel"]],
+                    [str(x).capitalize() for x in sub["overall_risk_tier"]],
+                    [format_number(v, 0) for v in sub["stock_on_hand"]],
+                    [_date_str(x) for x in sub["projected_stockout_date"]],
+                    [format_number(v, 0) for v in sub["expected_shortage_units"]],
+                    [format_currency(v) for v in sub["estimated_revenue_at_risk"]]))
+                scatter.add_trace(go.Scatter(
+                    x=pd.to_numeric(sub["forecast_days_of_cover"], errors="coerce"),
+                    y=pd.to_numeric(sub["stockout_probability"], errors="coerce"),
+                    mode="markers", name=t.capitalize(),
+                    marker=dict(size=[_msize(v) for v in sub["estimated_revenue_at_risk"]],
+                                color=_tier_hex(t), line=dict(color="white", width=1)),
+                    customdata=cust,
+                    hovertemplate=("<b>%{customdata[0]}</b><br>SKU %{customdata[1]} · %{customdata[2]}<br>"
+                                   "Tier: %{customdata[3]}<br>P(stockout): %{y:.0%}<br>"
+                                   "Days of cover: %{x:.1f}<br>Current stock: %{customdata[4]} u<br>"
+                                   "Projected stockout: %{customdata[5]}<br>"
+                                   "Expected shortage: %{customdata[6]} u<br>"
+                                   "Revenue at risk: %{customdata[7]}<extra></extra>")))
+            scatter.update_layout(**plotly_layout(height=330, legend=True))
+            style_axes(scatter)
+            scatter.update_yaxes(range=[-0.03, 1.03], tickformat=".0%", title_text="P(stockout) in lead time")
+            scatter.update_xaxes(title_text="Forecast days of cover")
+            render_chart(scatter, "Stockout Probability vs Days of Cover",
+                         "Top-left corner = most urgent; bubble size ∝ revenue at risk. Hover for full detail.")
 
     # ==================================================================
     # SECTION 3 — Priority risk queue (filters + clickable cards)
     # ==================================================================
     section_title("Priority risk queue",
-                  "Ranked by urgency: tier, then probability, projected date, revenue and name. "
-                  "Click a card to open its full details below.")
-    fc = st.columns([1.2, 1.8, 1, 1])
-    with fc[0]:
-        tier_opts = ["All tiers"] + [t.capitalize() for t in present]
-        tier_pick = st.selectbox("Risk tier", options=tier_opts, key="risk_tier")
-    with fc[1]:
-        query = st.text_input("Search product or SKU", key="risk_query",
-                              placeholder="product name or SKU code")
-    with fc[2]:
-        proj_only = st.checkbox("Projected only", key="risk_projected_only")
-    with fc[3]:
-        review_only = st.checkbox("Review only", key="risk_review_only")
+                  "Ranked by urgency: tier, then probability, projected date, revenue and name.")
+    with st.container(key="ipa-toolbar"):
+        fc = st.columns([1.2, 1.8, 1, 1])
+        with fc[0]:
+            tier_opts = ["All tiers"] + [t.capitalize() for t in present]
+            tier_pick = st.selectbox("Risk tier", options=tier_opts, key="risk_tier")
+        with fc[1]:
+            query = st.text_input("Search product or SKU", key="risk_query",
+                                  placeholder="product name or SKU code")
+        with fc[2]:
+            proj_only = st.checkbox("Projected only", key="risk_projected_only")
+        with fc[3]:
+            review_only = st.checkbox("Review only", key="risk_review_only")
 
     tier_arg = None if tier_pick == "All tiers" else tier_pick
     filtered = rs.filter_risk_queue(risk, tier=tier_arg, query=query,
@@ -2356,293 +2580,361 @@ def page_stockout_risk():
         info_banner("No SKUs match these filters. Adjust the tier, search or toggles above.", kind="info")
         return
 
-    def _render_risk_card(row, selected):
-        sku = str(row["sku"])
+    # Manual-review chip + export sit beside the filters (review is no longer a primary KPI).
+    mc1, mc2 = st.columns([3, 1])
+    with mc1:
+        n_review_v = int(pd.Series(filtered.get("manual_review_required", pd.Series(dtype=bool)))
+                         .astype(bool).sum()) if not filtered.empty else 0
+        st.markdown(
+            f'<div class="ipa-src-row"><span class="ipa-tier ipa-tier-unknown">'
+            f'{len(ranked)} in queue</span>'
+            f'<span class="ipa-tier ipa-tier-{"high" if n_review_v else "healthy"}">'
+            f'⚑ {n_review_v} manual review</span></div>', unsafe_allow_html=True)
+    with mc2:
+        with st.container(key="ipa-export-5"):
+            _q_export = rs.risk_queue_export_frame(ranked) if hasattr(rs, "risk_queue_export_frame") else ranked
+            eu.render_table_export_menu(
+                _q_export, filename_stem="stockout_priority_queue",
+                title="Stockout Risk — Priority Queue",
+                metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"),
+                          "Category": (ACTIVE_RUN or {}).get("category", "—"),
+                          "As-of": (ACTIVE_RUN or {}).get("as_of_date", "—")},
+                key="exp_riskqueue")
+
+    # ---- dense selectable rows (fixed height, 8 per page, no unbounded growth) ----
+    PAGE = 8
+    shown = int(st.session_state.get("risk_queue_shown", PAGE))
+    shown = max(PAGE, min(shown, len(ranked)))
+    for rec_row in ranked.head(shown).to_dict("records"):
+        sku = str(rec_row["sku"])
         safe = _safe_key(sku)
-        keyname = f"riskcard-sel-{safe}" if selected else f"riskcard-{safe}"
-        tier = row.get("overall_risk_tier")
-        name = row.get("sku_name")
+        tier = str(rec_row.get("overall_risk_tier") or "unknown").lower()
+        name = rec_row.get("sku_name")
         nm = None if (name is None or (isinstance(name, float) and pd.isna(name))) else str(name).strip()
         disp = nm if (nm and nm.lower() != "nan") else sku
         full = rs.full_product_label(name, sku)
-        with st.container(border=True, key=keyname):
-            st.markdown(f'<div class="ipa-riskstripe" style="background:{_tier_hex(tier)};"></div>',
-                        unsafe_allow_html=True)
+        is_sel = (sku == str(cur))
+        rcols = st.columns([3.2, 1.1, 1.0, 1.2, 1.2, 1.0])
+        with rcols[0]:
             st.markdown(
-                '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">'
-                f'<span class="ipa-riskname" title="{_esc(full)}">{_esc(disp)}</span>'
-                f'{_tier_chip(tier)}</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="ipa-risksku" title="{_esc(full)}">SKU {_esc(sku)}</div>',
-                        unsafe_allow_html=True)
-            st.markdown(
-                '<div class="ipa-riskgrid">'
-                f'<span class="m">P(stockout) <b>{format_percentage(row.get("stockout_probability"))}</b></span>'
-                f'<span class="m">Days cover <b>{format_number(row.get("forecast_days_of_cover"), 1)}</b></span>'
-                f'<span class="m">Projected <b>{_date_str(row.get("projected_stockout_date"))}</b></span>'
-                f'<span class="m">Current stock <b>{format_number(row.get("stock_on_hand"), 0)}</b></span>'
-                f'<span class="m">Lead-time demand <b>{format_number(row.get("lead_time_demand_p50"), 0)}</b></span>'
-                f'<span class="m">Rev at risk <b>{format_currency(row.get("estimated_revenue_at_risk"))}</b></span>'
-                '</div>', unsafe_allow_html=True)
-            if bool(row.get("manual_review_required")):
-                st.markdown('<div class="ipa-risksku">⚑ Manual review required</div>',
-                            unsafe_allow_html=True)
-            with st.container(key=f"riskopen-{safe}"):
-                if st.button(("● Selected" if selected else "View details"),
-                             key=f"riskbtn-{safe}", width="stretch",
-                             type="primary" if selected else "secondary"):
-                    st.session_state["risk_selected_sku"] = sku
-                    st.rerun()
+                f'<div class="ipa-qrow ipa-q-{tier}" title="{_esc(full)}">'
+                f'<div style="min-width:0;"><div class="q-name">{_esc(disp)}</div>'
+                f'<div class="q-sub">SKU {_esc(sku)}'
+                f'{" · ⚑ review" if bool(rec_row.get("manual_review_required")) else ""}</div></div>'
+                f'</div>', unsafe_allow_html=True)
+        rcols[1].markdown(f'<div class="ipa-qcell">{_tier_chip(tier)}</div>', unsafe_allow_html=True)
+        rcols[2].markdown(f'<div class="ipa-qcell"><b>{format_percentage(rec_row.get("stockout_probability"))}</b>'
+                          f'<div class="q-sub">P(stockout)</div></div>', unsafe_allow_html=True)
+        rcols[3].markdown(f'<div class="ipa-qcell"><b>{format_number(rec_row.get("forecast_days_of_cover"), 1)}</b>'
+                          f'<div class="q-sub">days cover</div></div>', unsafe_allow_html=True)
+        rcols[4].markdown(f'<div class="ipa-qcell"><b>{_date_str(rec_row.get("projected_stockout_date"))}</b>'
+                          f'<div class="q-sub">projected</div></div>', unsafe_allow_html=True)
+        with rcols[5]:
+            if st.button("Details", key=f"riskbtn-{safe}", width="stretch",
+                         type="primary" if is_sel else "secondary",
+                         help=f"Open full details for {full}"):
+                st.session_state["risk_selected_sku"] = sku
+                st.session_state["risk_open_dialog"] = True
+                st.rerun()
+    if len(ranked) > shown:
+        if st.button(f"Show more ({len(ranked) - shown} remaining)", key="risk_show_more"):
+            st.session_state["risk_queue_shown"] = shown + PAGE
+            st.rerun()
+    elif shown > PAGE:
+        if st.button("Show fewer", key="risk_show_fewer"):
+            st.session_state["risk_queue_shown"] = PAGE
+            st.rerun()
 
-    MAX_CARDS = 60
-    show_rows = ranked.head(MAX_CARDS)
-    if len(ranked) > MAX_CARDS:
-        info_banner(f"Showing the top {MAX_CARDS} of {len(ranked)} matching SKUs by urgency.", kind="info")
-    records = show_rows.to_dict("records")
-    for i in range(0, len(records), 2):
-        ccols = st.columns(2)
-        for ccol, rec in zip(ccols, records[i:i + 2]):
-            with ccol:
-                _render_risk_card(rec, selected=(str(rec["sku"]) == str(cur)))
 
     # ==================================================================
     # SECTION 4 — Selected SKU deep dive
     # ==================================================================
-    sel = risk[risk["sku"].astype(str) == str(cur)]
-    if sel.empty:
-        return
-    r = sel.iloc[0]
-    full = rs.full_product_label(r.get("sku_name"), r["sku"])
+    # ------------------------------------------------------------------
+    # Selected-product details — rendered inside st.dialog when available so the
+    # user never scrolls to the page bottom; otherwise a compact panel right
+    # under the queue. Content is identical in both paths.
+    # ------------------------------------------------------------------
+    def _render_selected_detail(cur):
+        sel = risk[risk["sku"].astype(str) == str(cur)]
+        if sel.empty:
+            return
+        r = sel.iloc[0]
+        full = rs.full_product_label(r.get("sku_name"), r["sku"])
 
-    cat_val = brand_val = None
-    if mp_raw is not None and "sku" in mp_raw.columns:
-        m = mp_raw[mp_raw["sku"].astype(str) == str(r["sku"])]
-        if not m.empty:
-            cat_val = _meta_val(m["category"].iloc[0]) if "category" in m.columns else None
-            brand_val = _meta_val(m["brand"].iloc[0]) if "brand" in m.columns else None
-    meta_bits = [b for b in (cat_val, brand_val, _meta_val(r.get("channel"))) if b]
+        cat_val = brand_val = None
+        if mp_raw is not None and "sku" in mp_raw.columns:
+            m = mp_raw[mp_raw["sku"].astype(str) == str(r["sku"])]
+            if not m.empty:
+                cat_val = _meta_val(m["category"].iloc[0]) if "category" in m.columns else None
+                brand_val = _meta_val(m["brand"].iloc[0]) if "brand" in m.columns else None
+        meta_bits = [b for b in (cat_val, brand_val, _meta_val(r.get("channel"))) if b]
 
-    section_title("Selected SKU details", None)
-    st.markdown(f'<div class="ipa-dd-head">{_esc(full)}</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="ipa-dd-sub">'
-        f'{_esc(" · ".join(meta_bits) if meta_bits else "—")} &nbsp;{_tier_chip(r.get("overall_risk_tier"))}'
-        '</div>', unsafe_allow_html=True)
 
-    dd = [
-        {"label": "Overall risk tier",
-         "value": (str(r.get("overall_risk_tier") or "—").capitalize()),
-         "icon": "alert-triangle", "tone": rs.risk_tier_tone(r.get("overall_risk_tier")),
-         "sub": "Worse of the probability & cover tiers"},
-        {"label": "P(stockout) in lead time", "value": format_percentage(r.get("stockout_probability")),
-         "icon": "percent", "tone": "amber",
-         "sub": f"Service level {format_percentage(r.get('service_level'))}"},
-        {"label": "Forecast days of cover", "value": format_number(r.get("forecast_days_of_cover"), 1),
-         "icon": "clock", "tone": "blue",
-         "sub": f"Lead time {format_number(r.get('lead_time_days'), 0)} d"},
-        {"label": "Projected stockout date", "value": _date_str(r.get("projected_stockout_date")),
-         "icon": "calendar", "tone": "amber",
-         "sub": (f"In {format_number(r.get('days_until_projected_stockout'), 0)} days"
-                 if pd.notna(r.get("days_until_projected_stockout"))
-                 else "No stockout projected in horizon")},
-    ]
-    render_kpi_row(dd, n_cols=4)
+        st.markdown(
+            '<div class="ipa-dd-sub">'
+            f'{_esc(" · ".join(meta_bits) if meta_bits else "—")} &nbsp;{_tier_chip(r.get("overall_risk_tier"))}'
+            '</div>', unsafe_allow_html=True)
 
-    stock_disp = format_number(r.get("stock_on_hand"), 0)
-    if bool(r.get("stock_on_hand_is_synthetic")):
-        stock_disp += " (synthetic)"
-    ltd_p50 = pd.to_numeric(pd.Series([r.get("lead_time_demand_p50")]), errors="coerce").iloc[0]
-    lt_days = pd.to_numeric(pd.Series([r.get("lead_time_days")]), errors="coerce").iloc[0]
-    mean_daily = (ltd_p50 / lt_days) if (pd.notna(ltd_p50) and pd.notna(lt_days) and lt_days > 0) else None
-    short_disp = format_number(r.get("expected_shortage_units"), 0)
-    short_disp = f"{short_disp} u" if short_disp != "—" else "—"
-    rows = [
-        ("Current stock on hand", stock_disp),
-        ("Stock source", _meta_val(r.get("stock_source")) or "—"),
-        ("Reported on-order qty", format_number(r.get("reported_on_order_quantity"), 0)),
-        ("Usable on-order qty", format_number(r.get("usable_on_order_quantity"), 0)),
-        ("Inventory position (for risk)", format_number(r.get("inventory_position_for_risk"), 0)),
-        ("Mean daily forecast", format_number(mean_daily, 1)),
-        ("Lead-time days",
-         f"{format_number(r.get('lead_time_days'), 0)} ({_meta_val(r.get('lead_time_source')) or '—'})"),
-        ("Lead-time demand (mean / P80 / P95)",
-         f"{format_number(r.get('lead_time_demand_p50'), 0)} / "
-         f"{format_number(r.get('lead_time_demand_p80'), 0)} / "
-         f"{format_number(r.get('lead_time_demand_p95'), 0)}"),
-        ("Lead-time demand σ", format_number(r.get("lead_time_sigma"), 1)),
-        ("Safety stock", format_number(r.get("safety_stock"), 0)),
-        ("Reorder point", format_number(r.get("reorder_point"), 0)),
-        ("Expected shortage", short_disp),
-        ("Estimated revenue at risk", format_currency(r.get("estimated_revenue_at_risk"))),
-        ("Service-level target", format_percentage(r.get("service_level"))),
-        ("Operational model", _esc(op_model)),
-        ("Uncertainty method", _meta_val(r.get("uncertainty_method")) or "—"),
-        ("Confidence", _meta_val(r.get("confidence_label")) or "—"),
-    ]
-
-    traj_ok = bool(CTX.get("has_stockout_trajectory")) and traj_raw is not None
-    tdf, twarn = (rs.trajectory_for_sku(traj_raw, cur, horizon=op_h)
-                  if traj_ok else (pd.DataFrame(), []))
-    for w in twarn:
-        info_banner(w, kind="info")
-    has_traj = traj_ok and tdf is not None and not tdf.empty
-
-    left, right = st.columns([1, 1.25])
-    with left:
-        metric_panel("Inventory & demand inputs", rows,
-                     sub="“—” means the value is not available — it is never shown as zero.")
-    with right:
-        if has_traj:
-            inv = go.Figure()
-            # cumulative demand P50–P95 uncertainty band (upper first, then fill down to P50)
-            if {"demand_p95", "demand_p50"}.issubset(tdf.columns):
-                inv.add_trace(go.Scatter(
-                    x=tdf["date"], y=tdf["demand_p95"], mode="lines", line=dict(width=0),
-                    hoverinfo="skip", showlegend=False, name="P95"))
-                inv.add_trace(go.Scatter(
-                    x=tdf["date"], y=tdf["demand_p50"], mode="lines", line=dict(width=0),
-                    fill="tonexty", fillcolor="rgba(14,124,123,0.12)", hoverinfo="skip",
-                    name="Demand P50–P95 band"))
-            inv.add_trace(go.Scatter(
-                x=tdf["date"], y=tdf["cumulative_demand_mean"], name="Cumulative demand (P50)",
-                mode="lines", line=dict(color=COLORS["teal"], width=2, dash="dash"),
-                hovertemplate="%{x|%Y-%m-%d}<br>Cumulative demand: %{y:.0f} u<extra></extra>"))
-            inv.add_trace(go.Scatter(
-                x=tdf["date"], y=tdf["projected_p50_inventory"], name="Projected inventory (P50)",
-                mode="lines+markers", line=dict(color=COLORS["navy"], width=2.5),
-                hovertemplate="%{x|%Y-%m-%d}<br>Projected inventory: %{y:.0f} u<extra></extra>"))
-            inv.add_hline(y=0, line_dash="dot", line_color=COLORS["red"], line_width=1.5,
-                          annotation_text="Zero stock", annotation_position="bottom right")
-            rop = r.get("reorder_point")
-            if pd.notna(rop):
-                inv.add_hline(y=float(rop), line_dash="dash", line_color=COLORS["amber"], line_width=1,
-                              annotation_text="Reorder point", annotation_position="top right")
-            # lead-time window shading (the decision-relevant horizon)
-            if pd.notna(lt_days) and float(lt_days) > 0:
-                start = pd.to_datetime(tdf["date"].iloc[0])
-                inv.add_vrect(x0=start, x1=start + pd.Timedelta(days=int(lt_days)),
-                              fillcolor=COLORS["navy"], opacity=0.05, line_width=0,
-                              annotation_text="Lead-time window", annotation_position="top left")
-            # projected stockout date marker
-            psd = r.get("projected_stockout_date")
-            if pd.notna(psd):
-                inv.add_vline(x=pd.to_datetime(psd), line_dash="dash", line_color=COLORS["red"],
-                              line_width=1.2, annotation_text="Projected stockout",
-                              annotation_position="top right")
-            inv.update_layout(**plotly_layout(height=340, legend=True))
-            style_axes(inv)
-            inv.update_yaxes(title_text="Units")
-            render_chart(inv, f"Inventory trajectory — {_esc(full)}",
-                         "Forecast-driven; zero-stock line marks the projected stockout, shaded = lead-time "
-                         "window, band = cumulative demand P50–P95.")
-        else:
-            with st.container(border=True):
-                empty_state("Daily trajectory unavailable",
-                            "This run did not persist a daily stockout trajectory for this SKU.",
-                            "circle-dashed")
-
-    if has_traj:
-        pf = go.Figure()
-        pf.add_trace(go.Scatter(
-            x=tdf["date"], y=tdf["cumulative_stockout_probability"], name="Cumulative P(stockout)",
-            mode="lines", fill="tozeroy", line=dict(color=COLORS["red"], width=2.5),
-            hovertemplate="%{x|%Y-%m-%d}<br>P(stockout): %{y:.0%}<extra></extra>"))
-        for thr, lab in ((0.5, "50%"), (0.8, "80%"), (0.95, "95%")):
-            pf.add_hline(y=thr, line_dash="dot", line_color=COLORS["slate"], line_width=1,
-                         annotation_text=lab, annotation_position="right")
-        pf.update_layout(**plotly_layout(height=300, legend=False))
-        style_axes(pf)
-        pf.update_yaxes(range=[0, 1.03], tickformat=".0%", title_text="P(stockout)")
-        render_chart(pf, "Cumulative stockout probability",
-                     "Probability of running out by each day, with 50 / 80 / 95% reference thresholds.")
-
-        tcols = ["date", "daily_demand_mean", "demand_p50", "demand_p80", "demand_p95",
-                 "projected_p50_inventory", "cumulative_stockout_probability"]
-        tbl = tdf[[c for c in tcols if c in tdf.columns]].copy()
-        tbl["date"] = pd.to_datetime(tbl["date"]).dt.strftime("%Y-%m-%d")
-        for c in ("daily_demand_mean", "demand_p50", "demand_p80", "demand_p95",
-                  "projected_p50_inventory"):
-            if c in tbl.columns:
-                tbl[c] = pd.to_numeric(tbl[c], errors="coerce").round(1)
-        if "cumulative_stockout_probability" in tbl.columns:
-            tbl["cumulative_stockout_probability"] = pd.to_numeric(
-                tbl["cumulative_stockout_probability"], errors="coerce").map(format_percentage)
-        tbl = tbl.rename(columns={
-            "date": "Date", "daily_demand_mean": "Daily Forecast",
-            "demand_p50": "Cumulative Demand P50", "demand_p80": "Cumulative Demand P80",
-            "demand_p95": "Cumulative Demand P95", "projected_p50_inventory": "Projected P50 Inventory",
-            "cumulative_stockout_probability": "Cumulative Stockout Probability"})
-        with st.expander("Daily forecast & inventory table (active horizon)", expanded=False):
-            st.dataframe(tbl, use_container_width=True, hide_index=True)
-
-    # ==================================================================
-    # SECTION 5 — Why this SKU is flagged (full reason trace)
-    # ==================================================================
-    section_title("Why this SKU is flagged", None)
-    reason = r.get("reason_trace")
-    reason_txt = "" if (reason is None or (isinstance(reason, float) and pd.isna(reason))) else str(reason)
-    st.markdown(
-        f'<div class="ipa-reason"><div class="h">{icon_svg("file-text", 16)} Decision rationale</div>'
-        f'{_esc(reason_txt) if reason_txt else "No reason trace was recorded for this SKU."}</div>',
-        unsafe_allow_html=True)
-
-    # ==================================================================
-    # SECTION 6 — Assumptions, uncertainty and data limitations
-    # ==================================================================
-    with st.expander("Assumptions, uncertainty and data limitations", expanded=False):
-        flag_items = _flags_to_list(r.get("assumption_flags"))
-        flags_l = [f.lower() for f in flag_items]
-
-        def _num1(x):
-            return pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0]
-
-        def _yn(b):
-            return "Yes" if b else "No"
-
-        lt_src = _meta_val(r.get("lead_time_source"))
-        usable = _num1(r.get("usable_on_order_quantity"))
-        reported = _num1(r.get("reported_on_order_quantity"))
-        conditions = [
-            f"Stock synthetically reconstructed: {_yn(bool(r.get('stock_on_hand_is_synthetic')))}",
-            f"Lead time assumed: {_yn(lt_src is None or lt_src.lower() not in ('actual', 'supplier', 'confirmed'))}"
-            + (f" (source: {lt_src})" if lt_src else ""),
-            f"Service level defaulted: {_yn(any('service' in f for f in flags_l))} "
-            f"(target {format_percentage(r.get('service_level'))})",
-            f"Catalog price missing: {_yn(pd.isna(_num1(r.get('estimated_revenue_at_risk'))) or any('price' in f for f in flags_l))}",
-            f"Forecast horizon shorter than lead time: "
-            f"{_yn(r.get('lead_time_horizon_sufficient') is not None and not bool(r.get('lead_time_horizon_sufficient')))}",
-            f"On-order stock excluded from position: "
-            f"{_yn((not bool(r.get('on_order_available'))) or (pd.notna(usable) and usable == 0 and pd.notna(reported) and reported > 0))}",
-            f"Manual review required: {_yn(bool(r.get('manual_review_required')))}",
-            f"Uncertainty method: {_meta_val(r.get('uncertainty_method')) or '—'}",
+        dd = [
+            {"label": "Overall risk tier",
+             "value": (str(r.get("overall_risk_tier") or "—").capitalize()),
+             "icon": "alert-triangle", "tone": rs.risk_tier_tone(r.get("overall_risk_tier")),
+             "sub": "Worse of the probability & cover tiers"},
+            {"label": "P(stockout) in lead time", "value": format_percentage(r.get("stockout_probability")),
+             "icon": "percent", "tone": "amber",
+             "sub": f"Service level {format_percentage(r.get('service_level'))}"},
+            {"label": "Forecast days of cover", "value": format_number(r.get("forecast_days_of_cover"), 1),
+             "icon": "clock", "tone": "blue",
+             "sub": f"Lead time {format_number(r.get('lead_time_days'), 0)} d"},
+            {"label": "Projected stockout date", "value": _date_str(r.get("projected_stockout_date")),
+             "icon": "calendar", "tone": "amber",
+             "sub": (f"In {format_number(r.get('days_until_projected_stockout'), 0)} days"
+                     if pd.notna(r.get("days_until_projected_stockout"))
+                     else "No stockout projected in horizon")},
         ]
-        st.markdown("**Conditions detected for this SKU**")
-        st.markdown("\n".join(f"- {c}" for c in conditions))
-        if flag_items:
-            st.markdown("**Assumption flags recorded in the artifact**")
-            st.markdown("\n".join(f"- {_flag_pretty(f)}" for f in flag_items))
-        st.markdown("**Known limitations**")
-        for d in (
-            "Usable on-order quantity may be zero when there are no dated inbound arrivals.",
-            "The stockout probability is a Normal-distribution approximation.",
-            "Independent daily forecast errors are combined via RSS (root-sum-of-squares).",
-            "Lead time, MOQ and pack size may be pilot assumptions, not supplier-confirmed.",
-            "Catalog price may not be the confirmed revenue basis.",
-            "Figures are a forecast-driven estimate, not observed historical stockouts; "
-            "no purchase order or replenishment is created by this dashboard.",
-        ):
-            st.markdown(f"- {d}")
-        with st.expander("Advanced decision fields", expanded=False):
-            adv_fields = ["uncertainty_method", "confidence_label", "service_level",
-                          "lead_time_source", "stock_source", "on_order_available",
-                          "reported_on_order_quantity", "forecast_horizon_available",
-                          "lead_time_horizon_sufficient", "survives_forecast_horizon",
-                          "probability_risk_tier", "cover_risk_tier", "manual_review_required"]
-            adv_rows = []
-            for f in adv_fields:
-                v = r.get(f)
-                disp = "—" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)
-                adv_rows.append({"field": f, "value": disp})
-            st.dataframe(pd.DataFrame(adv_rows), use_container_width=True, hide_index=True)
+        render_kpi_row(dd, n_cols=4)
+
+        # Tabs keep the modal short: Summary is the answer, the rest is on demand.
+        _t_sum, _t_traj, _t_why, _t_data = st.tabs(
+            ["Summary", "Trajectory", "Why flagged", "Data"])
+
+        stock_disp = format_number(r.get("stock_on_hand"), 0)
+        if bool(r.get("stock_on_hand_is_synthetic")):
+            stock_disp += " (synthetic)"
+        ltd_p50 = pd.to_numeric(pd.Series([r.get("lead_time_demand_p50")]), errors="coerce").iloc[0]
+        lt_days = pd.to_numeric(pd.Series([r.get("lead_time_days")]), errors="coerce").iloc[0]
+        mean_daily = (ltd_p50 / lt_days) if (pd.notna(ltd_p50) and pd.notna(lt_days) and lt_days > 0) else None
+        short_disp = format_number(r.get("expected_shortage_units"), 0)
+        short_disp = f"{short_disp} u" if short_disp != "—" else "—"
+        rows = [
+            ("Current stock on hand", stock_disp),
+            ("Stock source", _meta_val(r.get("stock_source")) or "—"),
+            ("Reported on-order qty", format_number(r.get("reported_on_order_quantity"), 0)),
+            ("Usable on-order qty", format_number(r.get("usable_on_order_quantity"), 0)),
+            ("Inventory position (for risk)", format_number(r.get("inventory_position_for_risk"), 0)),
+            ("Mean daily forecast", format_number(mean_daily, 1)),
+            ("Lead-time days",
+             f"{format_number(r.get('lead_time_days'), 0)} ({_meta_val(r.get('lead_time_source')) or '—'})"),
+            ("Lead-time demand (mean / P80 / P95)",
+             f"{format_number(r.get('lead_time_demand_p50'), 0)} / "
+             f"{format_number(r.get('lead_time_demand_p80'), 0)} / "
+             f"{format_number(r.get('lead_time_demand_p95'), 0)}"),
+            ("Lead-time demand σ", format_number(r.get("lead_time_sigma"), 1)),
+            ("Safety stock", format_number(r.get("safety_stock"), 0)),
+            ("Reorder point", format_number(r.get("reorder_point"), 0)),
+            ("Expected shortage", short_disp),
+            ("Estimated revenue at risk", format_currency(r.get("estimated_revenue_at_risk"))),
+            ("Service-level target", format_percentage(r.get("service_level"))),
+            ("Operational model", _esc(op_model)),
+            ("Uncertainty method", _meta_val(r.get("uncertainty_method")) or "—"),
+            ("Confidence", _meta_val(r.get("confidence_label")) or "—"),
+        ]
+
+        traj_ok = bool(CTX.get("has_stockout_trajectory")) and traj_raw is not None
+        tdf, twarn = (rs.trajectory_for_sku(traj_raw, cur, horizon=op_h)
+                      if traj_ok else (pd.DataFrame(), []))
+        for w in twarn:
+            info_banner(w, kind="info")
+        has_traj = traj_ok and tdf is not None and not tdf.empty
+
+        with _t_sum, st.container(height=460):
+
+            metric_panel("Inventory & demand inputs", rows,
+                         sub="“—” means the value is not available — it is never shown as zero.")
+        with _t_traj, st.container(height=460):
+            if has_traj:
+                inv = go.Figure()
+                # cumulative demand P50–P95 uncertainty band (upper first, then fill down to P50)
+                if {"demand_p95", "demand_p50"}.issubset(tdf.columns):
+                    inv.add_trace(go.Scatter(
+                        x=tdf["date"], y=tdf["demand_p95"], mode="lines", line=dict(width=0),
+                        hoverinfo="skip", showlegend=False, name="P95"))
+                    inv.add_trace(go.Scatter(
+                        x=tdf["date"], y=tdf["demand_p50"], mode="lines", line=dict(width=0),
+                        fill="tonexty", fillcolor="rgba(14,124,123,0.12)", hoverinfo="skip",
+                        name="Demand P50–P95 band"))
+                inv.add_trace(go.Scatter(
+                    x=tdf["date"], y=tdf["cumulative_demand_mean"], name="Cumulative demand (P50)",
+                    mode="lines", line=dict(color=COLORS["teal"], width=2, dash="dash"),
+                    hovertemplate="%{x|%Y-%m-%d}<br>Cumulative demand: %{y:.0f} u<extra></extra>"))
+                inv.add_trace(go.Scatter(
+                    x=tdf["date"], y=tdf["projected_p50_inventory"], name="Projected inventory (P50)",
+                    mode="lines+markers", line=dict(color=COLORS["navy"], width=2.5),
+                    hovertemplate="%{x|%Y-%m-%d}<br>Projected inventory: %{y:.0f} u<extra></extra>"))
+                inv.add_hline(y=0, line_dash="dot", line_color=COLORS["red"], line_width=1.5,
+                              annotation_text="Zero stock", annotation_position="bottom right")
+                rop = r.get("reorder_point")
+                if pd.notna(rop):
+                    inv.add_hline(y=float(rop), line_dash="dash", line_color=COLORS["amber"], line_width=1,
+                                  annotation_text="Reorder point", annotation_position="top right")
+                # lead-time window shading (the decision-relevant horizon)
+                if pd.notna(lt_days) and float(lt_days) > 0:
+                    start = pd.to_datetime(tdf["date"].iloc[0])
+                    # annotations are vertically offset so the two labels never collide
+                    inv.add_vrect(x0=start, x1=start + pd.Timedelta(days=int(lt_days)),
+                                  fillcolor=COLORS["navy"], opacity=0.05, line_width=0,
+                                  annotation_text="Lead-time window",
+                                  annotation_position="bottom left",
+                                  annotation_font_size=10,
+                                  annotation_font_color=COLORS["slate"])
+                # projected stockout date marker (label sits above the lead-time label)
+                psd = r.get("projected_stockout_date")
+                if pd.notna(psd):
+                    inv.add_vline(x=pd.to_datetime(psd), line_dash="dash", line_color=COLORS["red"],
+                                  line_width=1.2, annotation_text="Projected stockout",
+                                  annotation_position="top right",
+                                  annotation_font_size=10,
+                                  annotation_font_color=COLORS["red"])
+                inv.update_layout(**plotly_layout(height=340, legend=True))
+                style_axes(inv)
+                inv.update_yaxes(title_text="Units")
+                render_chart(inv, f"Inventory trajectory — {_esc(full)}",
+                             "Forecast-driven; zero-stock line marks the projected stockout, shaded = lead-time "
+                             "window, band = cumulative demand P50–P95.")
+            else:
+                with st.container(border=True):
+                    empty_state("Daily trajectory unavailable",
+                                "This run did not persist a daily stockout trajectory for this SKU.",
+                                "circle-dashed")
+
+        if has_traj:
+            pf = go.Figure()
+            pf.add_trace(go.Scatter(
+                x=tdf["date"], y=tdf["cumulative_stockout_probability"], name="Cumulative P(stockout)",
+                mode="lines", fill="tozeroy", line=dict(color=COLORS["red"], width=2.5),
+                hovertemplate="%{x|%Y-%m-%d}<br>P(stockout): %{y:.0%}<extra></extra>"))
+            for thr, lab in ((0.5, "50%"), (0.8, "80%"), (0.95, "95%")):
+                pf.add_hline(y=thr, line_dash="dot", line_color=COLORS["slate"], line_width=1,
+                             annotation_text=lab, annotation_position="right")
+            pf.update_layout(**plotly_layout(height=300, legend=False))
+            style_axes(pf)
+            pf.update_yaxes(range=[0, 1.03], tickformat=".0%", title_text="P(stockout)")
+            render_chart(pf, "Cumulative stockout probability",
+                         "Probability of running out by each day, with 50 / 80 / 95% reference thresholds.")
+
+            tcols = ["date", "daily_demand_mean", "demand_p50", "demand_p80", "demand_p95",
+                     "projected_p50_inventory", "cumulative_stockout_probability"]
+            tbl = tdf[[c for c in tcols if c in tdf.columns]].copy()
+            tbl["date"] = pd.to_datetime(tbl["date"]).dt.strftime("%Y-%m-%d")
+            for c in ("daily_demand_mean", "demand_p50", "demand_p80", "demand_p95",
+                      "projected_p50_inventory"):
+                if c in tbl.columns:
+                    tbl[c] = pd.to_numeric(tbl[c], errors="coerce").round(1)
+            if "cumulative_stockout_probability" in tbl.columns:
+                tbl["cumulative_stockout_probability"] = pd.to_numeric(
+                    tbl["cumulative_stockout_probability"], errors="coerce").map(format_percentage)
+            tbl = tbl.rename(columns={
+                "date": "Date", "daily_demand_mean": "Daily Forecast",
+                "demand_p50": "Cumulative Demand P50", "demand_p80": "Cumulative Demand P80",
+                "demand_p95": "Cumulative Demand P95", "projected_p50_inventory": "Projected P50 Inventory",
+                "cumulative_stockout_probability": "Cumulative Stockout Probability"})
+            _daily_tbl = tbl          # exposed to the Data tab below
+
+
+        # ==================================================================
+        # SECTION 5 — Why this SKU is flagged (full reason trace)
+        # ==================================================================
+        with _t_why:
+            reason = r.get("reason_trace")
+            reason_txt = "" if (reason is None or (isinstance(reason, float) and pd.isna(reason))) else str(reason)
+            st.markdown(
+                f'<div class="ipa-reason"><div class="h">{icon_svg("file-text", 16)} Decision rationale</div>'
+                f'{_esc(reason_txt) if reason_txt else "No reason trace was recorded for this SKU."}</div>',
+                unsafe_allow_html=True)
+
+        # ==================================================================
+        # SECTION 6 — Assumptions, uncertainty and data limitations
+        # ==================================================================
+        with _t_data, st.container(height=460):
+            try:
+                st.markdown('<div class="ipa-card-title">Daily forecast & inventory</div>',
+                            unsafe_allow_html=True)
+                st.dataframe(_daily_tbl, use_container_width=True, hide_index=True)
+                with st.container(key="ipa-export-riskdaily"):
+                    eu.render_table_export_menu(
+                        _daily_tbl, filename_stem=f"trajectory_{cur}",
+                        title=f"Daily forecast & inventory — {full}",
+                        metadata={"SKU": cur}, key=f"exp_traj_{_safe_key(cur)}")
+            except NameError:
+                st.caption("No daily trajectory is available for this product.")
+        with _t_why, st.container(height=460):
+            with st.expander("Assumptions, uncertainty and data limitations", expanded=False):
+                flag_items = _flags_to_list(r.get("assumption_flags"))
+                flags_l = [f.lower() for f in flag_items]
+
+                def _num1(x):
+                    return pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0]
+
+                def _yn(b):
+                    return "Yes" if b else "No"
+
+                lt_src = _meta_val(r.get("lead_time_source"))
+                usable = _num1(r.get("usable_on_order_quantity"))
+                reported = _num1(r.get("reported_on_order_quantity"))
+                conditions = [
+                    f"Stock synthetically reconstructed: {_yn(bool(r.get('stock_on_hand_is_synthetic')))}",
+                    f"Lead time assumed: {_yn(lt_src is None or lt_src.lower() not in ('actual', 'supplier', 'confirmed'))}"
+                    + (f" (source: {lt_src})" if lt_src else ""),
+                    f"Service level defaulted: {_yn(any('service' in f for f in flags_l))} "
+                    f"(target {format_percentage(r.get('service_level'))})",
+                    f"Catalog price missing: {_yn(pd.isna(_num1(r.get('estimated_revenue_at_risk'))) or any('price' in f for f in flags_l))}",
+                    f"Forecast horizon shorter than lead time: "
+                    f"{_yn(r.get('lead_time_horizon_sufficient') is not None and not bool(r.get('lead_time_horizon_sufficient')))}",
+                    f"On-order stock excluded from position: "
+                    f"{_yn((not bool(r.get('on_order_available'))) or (pd.notna(usable) and usable == 0 and pd.notna(reported) and reported > 0))}",
+                    f"Manual review required: {_yn(bool(r.get('manual_review_required')))}",
+                    f"Uncertainty method: {_meta_val(r.get('uncertainty_method')) or '—'}",
+                ]
+                st.markdown("**Conditions detected for this SKU**")
+                st.markdown("\n".join(f"- {c}" for c in conditions))
+                if flag_items:
+                    st.markdown("**Assumption flags recorded in the artifact**")
+                    st.markdown("\n".join(f"- {_flag_pretty(f)}" for f in flag_items))
+                st.markdown("**Known limitations**")
+                for d in (
+                    "Usable on-order quantity may be zero when there are no dated inbound arrivals.",
+                    "The stockout probability is a Normal-distribution approximation.",
+                    "Independent daily forecast errors are combined via RSS (root-sum-of-squares).",
+                    "Lead time, MOQ and pack size may be pilot assumptions, not supplier-confirmed.",
+                    "Catalog price may not be the confirmed revenue basis.",
+                    "Figures are a forecast-driven estimate, not observed historical stockouts; "
+                    "no purchase order or replenishment is created by this dashboard.",
+                ):
+                    st.markdown(f"- {d}")
+                with st.expander("Advanced decision fields", expanded=False):
+                    adv_fields = ["uncertainty_method", "confidence_label", "service_level",
+                                  "lead_time_source", "stock_source", "on_order_available",
+                                  "reported_on_order_quantity", "forecast_horizon_available",
+                                  "lead_time_horizon_sufficient", "survives_forecast_horizon",
+                                  "probability_risk_tier", "cover_risk_tier", "manual_review_required"]
+                    adv_rows = []
+                    for f in adv_fields:
+                        v = r.get(f)
+                        disp = "—" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)
+                        adv_rows.append({"field": f, "value": disp})
+                    st.dataframe(pd.DataFrame(adv_rows), use_container_width=True, hide_index=True)
+
+
+    # ---- product details: modal dialog when supported, compact inline panel otherwise ----
+    _sel_row = risk[risk["sku"].astype(str) == str(cur)]
+    _sel_full = (rs.full_product_label(_sel_row.iloc[0].get("sku_name"), _sel_row.iloc[0]["sku"])
+                 if not _sel_row.empty else str(cur))
+    if hasattr(st, "dialog"):
+        @st.dialog(f"{_sel_full}", width="large")
+        def _detail_dialog():
+            _render_selected_detail(cur)
+            if st.button("Close", key="risk_dialog_close", type="primary"):
+                st.session_state["risk_open_dialog"] = False
+                st.rerun()
+
+        if st.session_state.get("risk_open_dialog"):
+            st.session_state["risk_open_dialog"] = False   # one-shot: reopened by a Details click
+            _detail_dialog()
+    else:
+        st.markdown('<div id="risk-details-anchor"></div>', unsafe_allow_html=True)
+        with st.expander(f"Product details — {_sel_full}", expanded=True):
+            _render_selected_detail(cur)
+        scroll_into_view("risk-details-anchor")
 
     # ==================================================================
     # SECTION 7 — Complete risk dataset
@@ -2670,13 +2962,106 @@ def page_stockout_risk():
         if "overall_risk_tier" in disp.columns:
             disp["overall_risk_tier"] = disp["overall_risk_tier"].map(lambda t: str(t).capitalize())
         disp = disp.rename(columns=dict(colmap))
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+        _sty = disp.style
+        if "Risk" in disp.columns:
+            _sty = _sty.map(_risk_tier_cell_css, subset=["Risk"])
+        st.dataframe(_sty, use_container_width=True, hide_index=True)
+        with st.container(key="ipa-export-6"):
+            eu.render_table_export_menu(
+                disp, filename_stem="stockout_risk_complete",
+                title="Stockout Risk — Complete Dataset",
+                metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"),
+                          "Rows": len(disp)}, key="exp_risk_full")
         st.caption("One row per SKU/channel, read directly from the run's validated decision artifact.")
         with st.expander("Advanced: technical & model contract fields", expanded=False):
             tech = [c for c in risk.columns if c not in src_cols and c != "reason_trace"]
             if "reason_trace" in risk.columns:
                 tech = tech + ["reason_trace"]
             st.dataframe(risk[tech], use_container_width=True, hide_index=True)
+
+
+# --------------------------------------------------------------------------
+# Column dictionaries for the Data Quality page (restored — referenced by the
+# Feature Dictionary tab in page_data_quality).
+# --------------------------------------------------------------------------
+MODEL_PANEL_DICT = {
+    "sku": "Unique SKU identifier used across all pilot datasets.",
+    "product_id": "Internal Naheed product identifier linked to the SKU.",
+    "channel": "Sales channel for the row. Pilot scope is naheed_web only.",
+    "date": "Calendar date of the observation (daily grain).",
+    "category": "Merchandise category (e.g. Health & Beauty, Groceries & Pets).",
+    "sub_category": "Merchandise sub-category. Not populated for this pilot slice.",
+    "brand": "Product brand.",
+    "units_observed": "REAL target variable — units sold that day on naheed_web.",
+    "effective_unit_price": "REAL historical selling price per unit after any discount.",
+    "discount_amount": "REAL discount amount applied per unit.",
+    "discount_pct": "REAL discount as a percentage of list price.",
+    "on_promo": "REAL flag — 1 if the SKU was on an active promotion that day.",
+    "promo_known_in_advance": "REAL flag — 1 if the promotion was scheduled/known ahead of the date.",
+    "is_public_holiday": "REAL calendar flag — 1 if the date is a Pakistan public holiday.",
+    "holiday_name": "Name of the public holiday, when applicable.",
+    "is_payday_window": "REAL calendar flag — 1 if the date falls in a typical monthly payday window.",
+    "day_of_week": "Day of week, 0 = Monday … 6 = Sunday.",
+    "is_weekend": "REAL flag — 1 if Saturday or Sunday.",
+    "week_of_year": "ISO week number.",
+    "month": "Calendar month number.",
+    "units_lag_1": "Units observed 1 day earlier — engineered demand feature.",
+    "units_lag_7": "Units observed 7 days earlier — engineered demand feature.",
+    "units_lag_14": "Units observed 14 days earlier — engineered demand feature.",
+    "units_roll_mean_7": "Trailing 7-day rolling mean of units observed.",
+    "units_roll_mean_28": "Trailing 28-day rolling mean of units observed.",
+    "units_roll_std_7": "Trailing 7-day rolling standard deviation — a proxy for demand volatility.",
+    "stock_on_hand": "SYNTHETIC daily stock reconstruction — not an observed inventory record.",
+    "stock_on_hand_is_synthetic": "Flag confirming the stock_on_hand value is synthetic.",
+    "stock_source": "Source method used to derive stock_on_hand.",
+    "stock_generation_version": "Version tag of the synthetic stock reconstruction logic.",
+    "product_active": "Whether the SKU was considered active/listed on that date.",
+    "forecast_training_eligible": "Whether the row passes minimum-history rules for model training.",
+    "data_quality_flag": "Data-quality notes for the row (e.g. insufficient history at activation).",
+}
+
+
+INVENTORY_CONTEXT_DICT = {
+    "as_of_date": "Snapshot date the inventory context was generated for.",
+    "sku": "Unique SKU identifier.",
+    "product_id": "Internal Naheed product identifier.",
+    "location_id": "Stock location scope (ALL = network-wide, not store-level).",
+    "stock_on_hand": "SYNTHETIC baseline stock quantity for the SKU as of the snapshot date.",
+    "stock_on_hand_is_synthetic": "Confirms the stock figure is a synthetic reconstruction.",
+    "stock_source": "Method used to derive the synthetic stock figure.",
+    "stock_snapshot_date": "Date the synthetic snapshot represents.",
+    "stock_generation_method": "Algorithm used for stock reconstruction.",
+    "stock_generation_version": "Version tag of the reconstruction logic.",
+    "on_order_quantity": "Units already on order (currently unavailable/assumed 0 for this pilot).",
+    "on_order_is_available": "Whether real on-order data was available (False = assumed).",
+    "expected_daily_demand": "Forecast-derived expected daily demand used to size reorder policy.",
+    "lead_time_days": "Assumed supplier lead time in days.",
+    "lead_time_source": "Where the lead-time assumption came from.",
+    "moq": "Assumed minimum order quantity.",
+    "moq_source": "Source of the MOQ assumption.",
+    "pack_size": "Assumed order pack/case size.",
+    "pack_size_source": "Source of the pack-size assumption.",
+    "safety_stock": "Buffer stock computed from demand and lead-time assumptions.",
+    "reorder_point": "Stock level that should trigger a new purchase order.",
+    "target_stock": "Target stock level after replenishment.",
+    "days_of_cover": "Estimated days of stock remaining at current demand.",
+    "is_perishable": "Whether the SKU is flagged as perishable.",
+    "shelf_life_days": "Shelf life in days, when applicable.",
+    "price": "Current selling price.",
+    "unit_cost_observed": "Observed unit cost from source systems, when available.",
+    "unit_cost_effective": "Unit cost actually used in value calculations (observed or imputed).",
+    "cost_source": "Precedence source used to resolve unit cost.",
+    "cost_is_valid": "Whether the observed cost passed validity checks.",
+    "cost_is_imputed": "Whether the effective cost was imputed (fallback) rather than observed.",
+    "cost_quality_flag": "Data-quality flags related to unit cost.",
+    "cost_currency": "Currency of all cost/value figures (PKR).",
+    "cost_basis": "Cost basis assumption (unit/pack, unconfirmed for this pilot).",
+    "recommended_order_quantity": "Simulated purchase recommendation under baseline assumptions.",
+    "recommended_purchase_value": "Recommended order quantity × effective unit cost.",
+    "inventory_value": "Synthetic stock on hand × effective unit cost.",
+    "is_dropship": "Whether the SKU is fulfilled via dropship.",
+    "assumption_notes": "Free-text notes on assumptions applied for this SKU.",
+}
 
 
 def page_data_quality():
@@ -2846,33 +3231,49 @@ def _render_active_run_status(run_id):
         st.info("Waiting for the run to initialise…")
         return None
     status = rec.get("status", "unknown")
-    st.markdown(f'<div class="ipa-run-card">', unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Run", rec.get("run_id", "—")[:24] + "…")
-    c2.metric("Category", rec.get("category") or "—")
-    c3.metric("Requested Top N", rec.get("top_n") or "—")
-    st.progress(min(int(rec.get("progress_pct") or 0), 100) / 100.0,
-                text=f"{_friendly_status(rec.get('current_step', status))}  ·  {rec.get('progress_pct', 0)}%")
-    # per-model status from status.json
     status_json = rs._read_json(Path(rec["run_dir"]) / "status.json")
     stj = status_json.get("model_status", {})
-    m1, m2, m3 = st.columns(3)
-    for col, mdl, label in ((m1, "baseline", "Baseline"), (m2, "holtwinters", "Holt-Winters"),
-                            (m3, "lightgbm", "LightGBM")):
-        s = (stj.get(mdl) or {}).get("status", "—")
-        col.markdown(f'<div class="ipa-model-chip ipa-ms-{s}">{label}: {s}</div>', unsafe_allow_html=True)
-    # event timestamps — stored UTC, displayed in Pakistan time
-    ts_rows = [("Created", rec.get("created_at")), ("Started", status_json.get("started_at")),
-               ("Updated", status_json.get("updated_at"))]
-    if rec.get("completed_at"):
-        ts_rows.append(("Completed", rec.get("completed_at")))
-    if rec.get("failed_at"):
-        ts_rows.append(("Failed", rec.get("failed_at")))
-    st.caption(" · ".join(f"{lbl}: {rs.format_local_datetime(v)}" for lbl, v in ts_rows))
-    st.markdown('</div>', unsafe_allow_html=True)
+    pct = min(int(rec.get("progress_pct") or 0), 100)
+    tone = ("done" if rec.get("is_completed") else "fail" if rec.get("is_failed") else "live")
+    icon = {"done": "✓", "fail": "✕", "live": "◐"}[tone]
+    updated = rs.format_local_datetime(status_json.get("updated_at") or rec.get("created_at"),
+                                       include_date=False)
+    sel = rec.get("selected_sku_count")
+    sel_txt = f"{sel} selected" if sel is not None else "selecting…"
+
+    # ONE compact status strip: state (left) · context (center) · updated (right).
+    # The run id is small text here; the full id lives in Run details.
+    with st.container(key="ipa-active-run"):
+        st.markdown(
+            f'<div class="ipa-runbar ipa-rb-{tone}">'
+            f'<div class="rb-state"><span class="rb-ico">{icon}</span>'
+            f'<span class="rb-label">{_friendly_status(rec.get("current_step", status))}</span></div>'
+            f'<div class="rb-ctx">{rec.get("category") or "—"} · Top {rec.get("top_n") or "—"} · {sel_txt}</div>'
+            f'<div class="rb-time">Updated {updated}<span class="rb-run" title="{rec.get("run_id")}">'
+            f'Run …{str(rec.get("run_id") or "")[-6:]}</span></div></div>',
+            unsafe_allow_html=True)
+        st.progress(pct / 100.0, text=f"{pct}%")
+        chips = "".join(
+            f'<span class="ipa-mchip ipa-ms-{(stj.get(m) or {}).get("status", "pending")}">'
+            f'{lbl} · {(stj.get(m) or {}).get("status", "pending")}</span>'
+            for m, lbl in (("baseline", "Baseline"), ("holtwinters", "Holt-Winters"),
+                           ("lightgbm", "LightGBM")))
+        st.markdown(f'<div class="ipa-mchips">{chips}</div>', unsafe_allow_html=True)
+
+        with st.expander("Run details", expanded=False):
+            st.caption(f"**Run ID** `{rec.get('run_id')}`")
+            ts_rows = [("Created", rec.get("created_at")), ("Started", status_json.get("started_at")),
+                       ("Updated", status_json.get("updated_at"))]
+            if rec.get("completed_at"):
+                ts_rows.append(("Completed", rec.get("completed_at")))
+            if rec.get("failed_at"):
+                ts_rows.append(("Failed", rec.get("failed_at")))
+            for lbl, v in ts_rows:
+                st.caption(f"**{lbl}** {rs.format_local_datetime(v)}")
+            st.caption(f"Pipeline log: `runs/{rec['run_id']}/pipeline.log`")
+
     if rec.get("is_failed"):
-        st.error(f"Run failed: {rec.get('error_message') or 'see pipeline log'}")
-        st.caption(f"pipeline log: runs/{rec['run_id']}/pipeline.log")
+        st.error(f"Run failed: {rec.get('error_message') or 'see the pipeline log in Run details'}")
     return rec
 
 
@@ -2975,7 +3376,7 @@ def page_forecast_runs():
                 rec = _render_active_run_status(active_id)
                 if rec and rec.get("is_completed"):
                     if st.button("Activate this run as the dashboard data source", key="activate_active"):
-                        st.session_state["_pending_data_source"] = rs.format_run_label(rec)
+                        st.session_state["_pending_data_source"] = _short_by_id.get(rec["run_id"], rs.format_run_label_short(rec))
                         st.rerun()
             _live()
         else:
@@ -3000,7 +3401,13 @@ def page_forecast_runs():
             "Operational": r.get("operational_model"),
             "Duration (s)": r.get("duration_seconds"), "Run ID": r.get("run_id"),
         })
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=280)
+    _hist_df = pd.DataFrame(rows)
+    st.dataframe(_hist_df, width="stretch", hide_index=True, height=280)
+    with st.container(key="ipa-export-7"):
+        eu.render_table_export_menu(_hist_df, filename_stem="run_history",
+                                    title="Forecast Run History",
+                                    metadata={"Runs": len(_hist_df)},
+                                    key="exp_runhistory")
 
     completed_ids = [r["run_id"] for r in RUNS_ALL if r["is_completed"]]
     if completed_ids:
@@ -3008,7 +3415,7 @@ def page_forecast_runs():
         pick = ac1.selectbox("Activate a completed run", options=completed_ids, key="activate_pick")
         if ac2.button("Activate", key="activate_history"):
             rec = next(r for r in RUNS_ALL if r["run_id"] == pick)
-            st.session_state["_pending_data_source"] = rs.format_run_label(rec)
+            st.session_state["_pending_data_source"] = _short_by_id.get(rec["run_id"], rs.format_run_label_short(rec))
             st.rerun()
 
     insp = st.selectbox("Inspect pipeline log (any run)", options=[r["run_id"] for r in RUNS_ALL],

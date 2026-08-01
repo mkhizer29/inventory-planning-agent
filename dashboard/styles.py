@@ -308,7 +308,13 @@ CUSTOM_CSS = f"""
         padding: 16px 18px; min-height: 104px; height: 100%; box-shadow: 0 1px 3px rgba(11,31,51,0.05);
         display: flex; gap: 14px; align-items: center; font-size: 0.9rem; color: {COLORS["text"]}; line-height: 1.45;
     }}
-    .ipa-insight .txt {{ flex: 1; }}
+    .ipa-insight .txt {{ flex: 1; align-self: center; }}
+    /* Propagate height through the intermediate Streamlit wrappers so all three cards in
+       a row match height even when one has more text lines than its neighbours. */
+    [data-testid="stColumn"]:has(> [data-testid="stVerticalBlock"] .ipa-insight) > [data-testid="stVerticalBlock"],
+    [data-testid="stColumn"]:has(.ipa-insight) [data-testid="stElementContainer"],
+    [data-testid="stColumn"]:has(.ipa-insight) [data-testid="stMarkdown"],
+    [data-testid="stColumn"]:has(.ipa-insight) [data-testid="stMarkdownContainer"] {{ height: 100%; }}
     /* Larger icon badge so attention lands on it first. */
     .ipa-insight .ico {{
         width: 44px; height: 44px; min-width: 44px; border-radius: 11px; background: #E3F3F1;
@@ -688,5 +694,164 @@ CUSTOM_CSS = f"""
     .ipa-recometrics {{ display: flex; flex-wrap: wrap; gap: 3px 16px; margin-top: 6px; }}
     .ipa-recometrics .m {{ font-size: 0.75rem; color: {COLORS["subtext"]}; }}
     .ipa-recometrics .m b {{ color: {COLORS["navy"]}; font-weight: 700; }}
+
+    /* ════════════════════════════════════════════════════════════════════════════
+       UX pass — shared design system. Spacing scale 8/12/16/24/32; scoped selectors
+       only (no global Streamlit button/container restyling).
+       ════════════════════════════════════════════════════════════════════════════ */
+    /* Comfortable max content width so cards/charts don't stretch on wide screens */
+    div.block-container {{ max-width: 1340px; }}
+
+    /* --- sidebar active-source summary (compact chips, two short lines) --- */
+    .ipa-src {{ margin: 8px 0 2px 0; }}
+    .ipa-src-row {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 4px; }}
+    .ipa-src-chip {{ background: rgba(255,255,255,0.10); border: 1px solid rgba(255,255,255,0.18);
+        color: #E8EEF6; border-radius: 999px; padding: 2px 9px; font-size: 0.7rem; font-weight: 700;
+        max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .ipa-src-meta {{ color: #93A5BC; font-size: 0.69rem; line-height: 1.35;
+        display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    /* keep the sidebar selectbox from stretching: ellipsis instead of clipping */
+    .st-key-ipa-datasource div[data-baseweb="select"] div {{ white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; }}
+
+    /* --- compact active-run status strip (replaces giant st.metric values) --- */
+    .ipa-runbar {{ display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        flex-wrap: wrap; background: {COLORS["card"]}; border: 1px solid {COLORS["border"]};
+        border-left: 4px solid {COLORS["slate"]}; border-radius: 12px; padding: 10px 14px; }}
+    .ipa-rb-live {{ border-left-color: {COLORS["blue"]}; }}
+    .ipa-rb-done {{ border-left-color: {COLORS["teal"]}; }}
+    .ipa-rb-fail {{ border-left-color: {COLORS["red"]}; }}
+    .ipa-runbar .rb-state {{ display: flex; align-items: center; gap: 8px; min-width: 0; }}
+    .ipa-runbar .rb-ico {{ font-size: 1rem; line-height: 1; }}
+    .ipa-rb-live .rb-ico {{ color: {COLORS["blue"]}; }}
+    .ipa-rb-done .rb-ico {{ color: {COLORS["teal"]}; }}
+    .ipa-rb-fail .rb-ico {{ color: {COLORS["red"]}; }}
+    .ipa-runbar .rb-label {{ font-size: 0.95rem; font-weight: 800; color: {COLORS["navy"]}; }}
+    .ipa-runbar .rb-ctx {{ font-size: 0.82rem; color: {COLORS["subtext"]}; flex: 1 1 auto;
+        text-align: center; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .ipa-runbar .rb-time {{ font-size: 0.74rem; color: {COLORS["subtext"]}; text-align: right; }}
+    .ipa-runbar .rb-run {{ display: block; font-size: 0.68rem; color: #93A5BC; }}
+    .ipa-mchips {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 4px 0; }}
+    .ipa-mchip {{ flex: 1 1 140px; text-align: center; padding: 6px 10px; border-radius: 999px;
+        font-size: 0.75rem; font-weight: 700; border: 1px solid {COLORS["border"]};
+        background: #EAEEF3; color: {COLORS["slate"]}; }}
+    .ipa-mchip.ipa-ms-completed {{ background: #E4F5EC; color: {COLORS["success"]}; }}
+    .ipa-mchip.ipa-ms-running {{ background: #E5EDFD; color: {COLORS["blue"]}; }}
+    .ipa-mchip.ipa-ms-failed {{ background: #FAE7E9; color: {COLORS["red"]}; }}
+    .ipa-mchip.ipa-ms-skipped {{ background: #F2F4F7; color: {COLORS["slate"]}; }}
+
+    /* --- equal-height KPI rows: labels clamp to 2 lines, values align --- */
+    .st-key-ipa-kpirow .ipa-card {{ height: 100%; min-height: 132px; }}
+    .ipa-kpi-label {{ display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+        overflow: hidden; }}
+
+    /* --- dense risk queue rows (fixed height, semantic left border, no bright fills) --- */
+    .ipa-qrow {{ display: flex; align-items: center; gap: 12px; background: {COLORS["card"]};
+        border: 1px solid {COLORS["border"]}; border-left: 4px solid {COLORS["slate"]};
+        border-radius: 10px; padding: 8px 12px; min-height: 52px; }}
+    .ipa-qrow .q-name {{ font-size: 0.86rem; font-weight: 700; color: {COLORS["navy"]};
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .ipa-qrow .q-sub {{ font-size: 0.72rem; color: {COLORS["subtext"]}; }}
+    .ipa-q-critical {{ border-left-color: {COLORS["red"]}; }}
+    .ipa-q-high {{ border-left-color: {COLORS["amber"]}; }}
+    .ipa-q-medium, .ipa-q-watch {{ border-left-color: {COLORS["blue"]}; }}
+    .ipa-q-low, .ipa-q-healthy {{ border-left-color: {COLORS["teal"]}; }}
+    .ipa-q-unknown {{ border-left-color: {COLORS["slate"]}; }}
+    .ipa-qcell {{ min-height: 52px; display: flex; flex-direction: column; justify-content: center;
+        align-items: center; text-align: center; font-size: 0.85rem; color: {COLORS["navy"]}; }}
+    .ipa-qcell .q-sub {{ font-size: 0.66rem; color: {COLORS["subtext"]}; font-weight: 600; }}
+    /* risk tier chip — text + colour (never colour alone) */
+    .ipa-tier {{ display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 0.68rem;
+        font-weight: 800; letter-spacing: 0.3px; text-transform: uppercase; white-space: nowrap; }}
+    .ipa-tier-critical {{ background: #FAE7E9; color: {COLORS["red"]}; }}
+    .ipa-tier-high {{ background: #FBF0DC; color: {COLORS["amber"]}; }}
+    .ipa-tier-medium, .ipa-tier-watch {{ background: #E5EDFD; color: {COLORS["blue"]}; }}
+    .ipa-tier-low, .ipa-tier-healthy {{ background: #E3F3F1; color: {COLORS["teal"]}; }}
+    .ipa-tier-unknown {{ background: #EAEEF3; color: {COLORS["slate"]}; }}
+
+    /* --- compact toolbar above tables/queues --- */
+    .st-key-ipa-toolbar [data-testid="stHorizontalBlock"] {{ align-items: end; gap: 8px; }}
+    .st-key-ipa-toolbar [data-testid="stTextInput"] input {{ font-size: 0.85rem; }}
+
+    /* --- export popover stays small and out of the way --- */
+    [class*="st-key-ipa-export"] button {{ font-size: 0.78rem !important; padding: 2px 10px !important; }}
+
+    /* --- section rhythm: tighter, consistent vertical spacing --- */
+    .ipa-section-title {{ margin: 24px 0 4px 0; }}
+    [data-testid="stExpander"] {{ margin-top: 8px; }}
+
+    /* --- details dialog: keep it inside the white content area, never under the sidebar --- */
+    div[data-testid="stDialog"] div[role="dialog"] {{
+        max-width: min(1080px, calc(100vw - 22rem)) !important;
+        width: min(1080px, calc(100vw - 22rem)) !important;
+        margin-left: auto !important; margin-right: auto !important;
+        border-radius: 16px !important;
+    }}
+    div[data-testid="stDialog"] div[role="dialog"] {{ max-height: 88vh !important; }}
+    div[data-testid="stDialog"] div[role="dialog"] > div {{
+        padding: 8px 24px 20px 24px;
+        max-height: 82vh; overflow-y: auto;      /* keep the modal inside the viewport */
+        scrollbar-gutter: stable;
+    }}
+    /* ALWAYS-visible scrollbar so it never looks like the content is cut off */
+    div[data-testid="stDialog"] div[role="dialog"] > div::-webkit-scrollbar {{ width: 10px; }}
+    div[data-testid="stDialog"] div[role="dialog"] > div::-webkit-scrollbar-track {{
+        background: #EEF2F7; border-radius: 8px; }}
+    div[data-testid="stDialog"] div[role="dialog"] > div::-webkit-scrollbar-thumb {{
+        background: #B9C5D4; border-radius: 8px; border: 2px solid #EEF2F7; }}
+    div[data-testid="stDialog"] div[role="dialog"] > div::-webkit-scrollbar-thumb:hover {{
+        background: {COLORS["slate"]}; }}
+    div[data-testid="stDialog"] div[role="dialog"] > div {{
+        scrollbar-width: thin; scrollbar-color: #B9C5D4 #EEF2F7; }}
+    /* tab strip inside the dialog stays put while the panel scrolls */
+    div[data-testid="stDialog"] div[data-baseweb="tab-list"] {{
+        position: sticky; top: 0; z-index: 5; background: {COLORS["bg"]}; padding-top: 4px; }}
+    /* each tab PANEL scrolls on its own, with the same always-on scrollbar, so long
+       content never looks like a cut-off page */
+    div[data-testid="stDialog"] div[data-baseweb="tab-panel"] {{
+        max-height: 66vh; overflow-y: auto; overflow-x: hidden;
+        scrollbar-gutter: stable; padding-right: 6px;
+        scrollbar-width: thin; scrollbar-color: #B9C5D4 #EEF2F7; }}
+    div[data-testid="stDialog"] div[data-baseweb="tab-panel"]::-webkit-scrollbar {{ width: 10px; }}
+    div[data-testid="stDialog"] div[data-baseweb="tab-panel"]::-webkit-scrollbar-track {{
+        background: #EEF2F7; border-radius: 8px; }}
+    div[data-testid="stDialog"] div[data-baseweb="tab-panel"]::-webkit-scrollbar-thumb {{
+        background: #B9C5D4; border-radius: 8px; border: 2px solid #EEF2F7; }}
+    div[data-testid="stDialog"] div[data-baseweb="tab-panel"]::-webkit-scrollbar-thumb:hover {{
+        background: {COLORS["slate"]}; }}
+    /* st.container(height=…) inside the dialog scrolls natively — make its bar obvious */
+    div[data-testid="stDialog"] div[data-testid="stVerticalBlockBorderWrapper"] {{
+        scrollbar-width: thin; scrollbar-color: #9FB0C4 #EEF2F7; }}
+    div[data-testid="stDialog"] div[data-testid="stVerticalBlockBorderWrapper"]::-webkit-scrollbar {{
+        width: 12px; }}
+    div[data-testid="stDialog"] div[data-testid="stVerticalBlockBorderWrapper"]::-webkit-scrollbar-track {{
+        background: #EEF2F7; border-radius: 8px; }}
+    div[data-testid="stDialog"] div[data-testid="stVerticalBlockBorderWrapper"]::-webkit-scrollbar-thumb {{
+        background: #9FB0C4; border-radius: 8px; border: 2px solid #EEF2F7; }}
+    div[data-testid="stDialog"] div[data-testid="stVerticalBlockBorderWrapper"]::-webkit-scrollbar-thumb:hover {{
+        background: {COLORS["slate"]}; }}
+    /* dialog heading: wrap long product names instead of clipping them */
+    div[data-testid="stDialog"] h2, div[data-testid="stDialog"] h1 {{
+        font-size: 1.15rem !important; line-height: 1.35 !important; font-weight: 800;
+        color: {COLORS["navy"]}; white-space: normal !important; overflow-wrap: anywhere;
+        padding-right: 40px;   /* clear of the × close button */
+    }}
+
+    /* --- sidebar data-source dropdown: readable, not clipped --- */
+    .st-key-ipa-datasource div[data-baseweb="select"] > div {{ min-height: 38px; }}
+    .st-key-ipa-datasource div[data-baseweb="select"] span,
+    .st-key-ipa-datasource div[data-baseweb="select"] div {{ font-size: 0.78rem; }}
+    /* the popup menu is portalled to the body — let it size to its content */
+    div[data-baseweb="popover"] ul[role="listbox"] {{ max-width: 460px; }}
+    div[data-baseweb="popover"] li {{ font-size: 0.82rem; white-space: normal;
+        line-height: 1.35; padding-top: 6px; padding-bottom: 6px; }}
+
+    @media (max-width: 900px) {{
+        .ipa-runbar {{ flex-direction: column; align-items: flex-start; }}
+        .ipa-runbar .rb-ctx, .ipa-runbar .rb-time {{ text-align: left; }}
+        .ipa-mchip {{ flex: 1 1 100%; }}
+        div[data-testid="stDialog"] div[role="dialog"] {{
+            max-width: calc(100vw - 2rem) !important; width: calc(100vw - 2rem) !important; }}
+    }}
 </style>
 """
