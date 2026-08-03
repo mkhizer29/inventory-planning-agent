@@ -769,6 +769,18 @@ CUSTOM_CSS = f"""
     .ipa-tier-low, .ipa-tier-healthy {{ background: #E3F3F1; color: {COLORS["teal"]}; }}
     .ipa-tier-unknown {{ background: #EAEEF3; color: {COLORS["slate"]}; }}
 
+    /* --- historical From/To date window + quick presets --- */
+    [class*="st-key-ipa-daterange"] {{
+        background: {COLORS["card"]}; border: 1px solid {COLORS["border"]};
+        border-radius: 12px; padding: 10px 14px 6px 14px; margin-top: 8px; }}
+    .ipa-daterange-label {{ font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+        letter-spacing: 0.6px; color: {COLORS["subtext"]}; margin-bottom: 2px; }}
+    [class*="st-key-ipa-daterange"] [data-testid="stHorizontalBlock"] {{ align-items: end; gap: 8px; }}
+    /* preset chips: small, quiet, equal width */
+    [class*="st-key-ipa-daterange"] button {{
+        font-size: 0.74rem !important; padding: 3px 6px !important; min-height: 30px; }}
+    [class*="st-key-ipa-daterange"] [data-testid="stCaptionContainer"] {{ margin-top: 2px; }}
+
     /* --- compact toolbar above tables/queues --- */
     .st-key-ipa-toolbar [data-testid="stHorizontalBlock"] {{ align-items: end; gap: 8px; }}
     .st-key-ipa-toolbar [data-testid="stTextInput"] input {{ font-size: 0.85rem; }}

@@ -813,8 +813,15 @@ page = st.session_state["nav_page"]
 # per page by render_filter_bar() so controls sit next to the data they affect.
 # Shadow copies keep values alive on pages that don't render a given control.
 # --------------------------------------------------------------------------
-FILTER_KEYS = ["flt_skus", "flt_category", "flt_brands", "flt_daterange",
-               "flt_horizon", "flt_focus_sku", "flt_cmp_labels"]
+FILTER_KEYS = ["flt_skus", "flt_category", "flt_brands", "flt_date_from", "flt_date_to",
+               "flt_date_preset", "flt_horizon", "flt_focus_sku", "flt_cmp_labels"]
+
+# The retired single-widget date range: drop any stale value so an old tuple/one-date
+# payload can never reach the new From/To controls.
+for _legacy in ("flt_daterange", "_shadow_flt_daterange"):
+    st.session_state.pop(_legacy, None)
+
+DATE_PRESETS = ("All history", "Last 7 days", "Last 14 days", "Last 30 days")
 
 
 def _flt(key, default):
@@ -824,6 +831,49 @@ def _flt(key, default):
         st.session_state[shadow] = st.session_state[key]
         return st.session_state[key]
     return st.session_state.get(shadow, default)
+
+
+def _as_date(value):
+    """Coerce a session value to a plain date, or None when unusable/stale."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (tuple, list)):           # stale single-widget range payload
+        return None
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(ts) else ts.date()
+
+
+def preset_range(preset, min_d, max_d):
+    """Start/end for a quick preset. 'Last N days' ENDS at the latest available historical
+    date and the start is clamped to the earliest available date."""
+    if preset in (None, "", "All history") or min_d is None or max_d is None:
+        return min_d, max_d
+    days = {"Last 7 days": 7, "Last 14 days": 14, "Last 30 days": 30}.get(preset)
+    if not days:
+        return min_d, max_d
+    start = max_d - pd.Timedelta(days=days - 1).to_pytimedelta()
+    return (max(start, min_d), max_d)
+
+
+def resolve_date_range(min_d, max_d, raw_from, raw_to):
+    """Clamp the From/To session values into the dataset window.
+
+    Returns (from_date, to_date, error). `error` is set only when the user picked
+    From > To — in that case the caller keeps the last valid range and shows a notice.
+    Display-only: it never touches the run, its as-of date, horizons or any artifact.
+    """
+    if min_d is None or max_d is None:
+        return None, None, None
+    d_from = _as_date(raw_from) or min_d
+    d_to = _as_date(raw_to) or max_d
+    d_from = min(max(d_from, min_d), max_d)        # keep inside the available window
+    d_to = min(max(d_to, min_d), max_d)
+    if d_from > d_to:
+        return min_d, max_d, "“From” is after “To” — showing the full available period instead."
+    return d_from, d_to, None
 
 
 if mp_raw is not None:
@@ -845,8 +895,21 @@ if mp_raw is not None:
     _focus = [s for s in _flt("flt_focus_sku", []) if s in all_skus]
     focus_skus = _focus if _focus else ([all_skus[0]] if all_skus else [])
 
-    _dr = _flt("flt_daterange", (min_date, max_date))
-    date_range = _dr if isinstance(_dr, (tuple, list)) and len(_dr) == 2 else (min_date, max_date)
+    # A preset button writes _pending_date_* (a NON-widget key) and reruns; we apply it
+    # here, BEFORE the From/To widgets are instantiated — a widget-keyed value cannot be
+    # assigned after its widget exists.
+    for _side in ("from", "to"):
+        _pend = st.session_state.pop(f"_pending_date_{_side}", None)
+        if _pend is not None:
+            st.session_state[f"flt_date_{_side}"] = _pend
+            st.session_state[f"_shadow_flt_date_{_side}"] = _pend
+
+    # Historical display window — two explicit From/To values, clamped to what the
+    # active model_panel actually contains. Changing the active run therefore resets a
+    # stale out-of-range selection automatically.
+    date_from, date_to, DATE_RANGE_ERROR = resolve_date_range(
+        min_date, max_date, _flt("flt_date_from", min_date), _flt("flt_date_to", max_date))
+    date_range = (date_from, date_to)
 
     horizon = _flt("flt_horizon", 14)
     horizon = horizon if horizon in (7, 14) else 14
@@ -859,9 +922,53 @@ else:
     SKU_NAMES = {}
     cmp_label_mode = CMP_LABEL_MODES[0]
     date_range = None
+    min_date = max_date = date_from = date_to = None
+    DATE_RANGE_ERROR = None
     focus_skus = []
     horizon = 14
     sel_scenario = SCENARIO_NAMES[0]
+
+
+def render_history_date_controls(key_prefix="page"):
+    """Explicit From / To pickers plus quick presets for the HISTORICAL display window.
+
+    Display-only: it filters the historical rows behind the visible KPIs, charts and
+    tables. It never retrains a model, changes the active run, its as-of date or the
+    forecast horizons, and it never filters future forecasts or decision artifacts.
+    """
+    if mp_raw is None or min_date is None or max_date is None:
+        return
+    with st.container(key=f"ipa-daterange-{key_prefix}"):
+        st.markdown('<div class="ipa-daterange-label">Historical display period</div>',
+                    unsafe_allow_html=True)
+        dc = st.columns([1.1, 1.1, 1.5])
+        with dc[0]:
+            st.date_input("From", value=date_from or min_date,
+                          min_value=min_date, max_value=max_date, key="flt_date_from",
+                          format="DD/MM/YYYY")
+        with dc[1]:
+            st.date_input("To", value=date_to or max_date,
+                          min_value=min_date, max_value=max_date, key="flt_date_to",
+                          format="DD/MM/YYYY")
+        with dc[2]:
+            st.write("")
+            pcols = st.columns(len(DATE_PRESETS))
+            for pc, preset in zip(pcols, DATE_PRESETS):
+                with pc:
+                    short = preset.replace("Last ", "").replace(" days", "d").replace("All history", "All")
+                    if st.button(short, key=f"preset_{key_prefix}_{short}", width="stretch",
+                                 help=preset):
+                        pf, pt = preset_range(preset, min_date, max_date)
+                        # staged as pending: applied at the top of the next run, before the
+                        # From/To widgets exist (they cannot be reassigned once instantiated)
+                        st.session_state["_pending_date_from"] = pf
+                        st.session_state["_pending_date_to"] = pt
+                        st.rerun()
+        if DATE_RANGE_ERROR:
+            st.error(DATE_RANGE_ERROR, icon=":material/event_busy:")
+        st.caption(f"Historical display period · available data: "
+                   f"{_pretty_date(min_date)} to {_pretty_date(max_date)}"
+                   f"  ·  showing {_pretty_date(date_from)} to {_pretty_date(date_to)}")
 
 
 def render_filter_bar(*, products=True, category=True, dates=False, horizon_ctl=False,
@@ -883,10 +990,6 @@ def render_filter_bar(*, products=True, category=True, dates=False, horizon_ctl=
                                placeholder="Search by product name, brand or SKU…",
                                help="Narrows every page: totals, charts, risk and reorder queues.",
                                key="flt_skus")
-        if dates:
-            with cols[2]:
-                st.date_input("Date range", min_value=min_date, max_value=max_date,
-                              key="flt_daterange")
         if horizon_ctl:
             with cols[3]:
                 st.radio("Horizon", options=[7, 14], format_func=lambda x: f"{x} days",
@@ -894,11 +997,13 @@ def render_filter_bar(*, products=True, category=True, dates=False, horizon_ctl=
         with cols[4]:
             st.write("")
             if st.button("Reset", key=f"reset_{key_prefix}", width="stretch",
-                         help="Clear all product/category filters"):
+                         help="Clear all product/category/date filters"):
                 for k in FILTER_KEYS:
                     st.session_state.pop(k, None)
                     st.session_state.pop(f"_shadow_{k}", None)
                 st.rerun()
+        if dates:
+            render_history_date_controls(key_prefix)
         if compare:
             c1, c2 = st.columns([3, 1.4])
             with c1:
@@ -1376,7 +1481,8 @@ def _render_run_ranking_panel():
 def page_forecast_explorer():
     render_page_header("Forecast Explorer", "7–14 day demand forecast · historical backtest vs real future",
                        badges=ACTIVE_BADGES)
-    render_filter_bar(products=True, category=True, horizon_ctl=True, compare=True, key_prefix="forecast")
+    render_filter_bar(products=True, category=True, dates=True, horizon_ctl=True,
+                      compare=True, key_prefix="forecast")
     if mp_raw is None:
         empty_state("Historical demand data not found", "data/processed/model_panel.parquet is missing or unreadable.", "mail")
         return
@@ -1419,8 +1525,13 @@ def page_forecast_explorer():
     fc_df["date"] = pd.to_datetime(fc_df["date"])
     for focus_sku in focus_skus:
         fc_sku = fc_df[fc_df["sku"] == focus_sku].sort_values("date").head(horizon)
-        hist_sku = mp_raw[mp_raw["sku"] == focus_sku].sort_values("date")
-        hist_recent = hist_sku.tail(28)
+        # Historical series honours the From/To display window (display-only — the forecast
+        # rows below are NEVER date-filtered). With the full range selected we still cap the
+        # view at the most recent 28 days so the chart stays readable next to the forecast.
+        hist_sku = mp_f[mp_f["sku"] == focus_sku].sort_values("date")
+        _narrowed = bool(date_from and date_to and min_date and max_date
+                         and (date_from > min_date or date_to < max_date))
+        hist_recent = hist_sku if _narrowed else hist_sku.tail(28)
     
         # --- One large historical + forecast chart ---
         if hist_recent.empty and fc_sku.empty:
@@ -1440,7 +1551,8 @@ def page_forecast_explorer():
             fig.update_layout(**plotly_layout(height=360))
             style_axes(fig)
             render_chart(fig, f"Historical vs Forecast — {comparison_display_label(focus_sku, cmp_label_mode, focus_skus)}",
-                         f"Last 28 historical days (solid) + next {horizon} forecast days (dashed)")
+                         (f"{_pretty_date(date_from)} – {_pretty_date(date_to)} (solid) + next {horizon} forecast days (dashed)" if _narrowed else
+                          f"Last 28 historical days (solid) + next {horizon} forecast days (dashed)"))
     
         # --- 4 forecast summary cards ---
         if not fc_sku.empty:

@@ -954,3 +954,162 @@ def test_77_active_run_never_shows_full_id_as_giant_metric():
     short_id = str(rec["run_id"])[-6:]
     assert short_id == "a4c921" and len(short_id) == 6
     assert rs.format_run_label_short(rec).count(rec["run_id"]) == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Historical Date Range control (From / To + presets).
+# Driven through Streamlit's AppTest harness: the control is display-only, so these
+# assert UI state and rendered KPIs — never model or artifact behaviour.
+# ══════════════════════════════════════════════════════════════════════════════════
+import datetime as _dt        # noqa: E402
+import re as _re              # noqa: E402
+
+APP_PY = REPO_ROOT / "dashboard" / "app.py"
+
+
+def _app(page="Executive Overview"):
+    from streamlit.testing.v1 import AppTest
+    at = AppTest.from_file(str(APP_PY), default_timeout=300).run()
+    at.session_state["nav_page"] = page
+    at.run()
+    return at
+
+
+def _sv(at, key, default=None):
+    try:
+        return at.session_state[key]
+    except Exception:
+        return default
+
+
+def _bounds(at):
+    return at.date_input(key="flt_date_from").value, at.date_input(key="flt_date_to").value
+
+
+def _kpis(at):
+    md = " ".join(str(m.value) for m in at.markdown)
+    pairs = _re.findall(r'ipa-kpi-label">([^<]+)</div>.*?ipa-kpi-value">([^<]+)<', md, _re.S)
+    return {k.strip(): v.strip() for k, v in pairs}
+
+
+@pytest.mark.slow
+def test_80_default_from_to_use_dataset_min_max():
+    at = _app()
+    f, t = _bounds(at)
+    assert f <= t
+    # both defaults must sit inside the widget's own allowed window
+    w_from = at.date_input(key="flt_date_from")
+    assert w_from.value == f and not at.exception
+
+
+@pytest.mark.slow
+def test_81_valid_range_filters_rows_inclusively():
+    at = _app()
+    _, mx = _bounds(at)
+    before = _kpis(at).get("Historical Sales Rows")
+    at.session_state["flt_date_from"] = mx - _dt.timedelta(days=6)
+    at.session_state["flt_date_to"] = mx
+    at.run()
+    after = _kpis(at).get("Historical Sales Rows")
+    assert before and after and before != after and not at.exception
+
+
+@pytest.mark.slow
+def test_82_from_after_to_is_rejected():
+    at = _app()
+    mn, mx = _bounds(at)
+    at.session_state["flt_date_from"] = mx
+    at.session_state["flt_date_to"] = mn
+    at.run()
+    assert any("after" in str(e.value).lower() for e in at.error)     # inline notice shown
+    assert not at.exception                                          # and the page still renders
+
+
+def _click_preset(at, label):
+    btn = {b.label: b for b in at.button}.get(label)
+    assert btn is not None, f"preset {label} not rendered"
+    btn.click()
+    at.run()
+    return _sv(at, "flt_date_from"), _sv(at, "flt_date_to")
+
+
+@pytest.mark.slow
+def test_83_last_7_days_ends_at_latest_available_date():
+    at = _app()
+    _, mx = _bounds(at)
+    f, t = _click_preset(at, "7d")
+    assert t == mx and (t - f).days + 1 <= 7
+
+
+@pytest.mark.slow
+def test_84_last_30_days_is_clamped_to_minimum():
+    at = _app()
+    mn, mx = _bounds(at)
+    f, t = _click_preset(at, "30d")
+    assert f >= mn and t == mx and (t - f).days + 1 <= 30
+
+
+@pytest.mark.slow
+def test_85_all_history_resets_to_full_range():
+    at = _app()
+    mn, mx = _bounds(at)
+    _click_preset(at, "7d")
+    f, t = _click_preset(at, "All")
+    assert (f, t) == (mn, mx)
+
+
+@pytest.mark.slow
+def test_86_range_persists_across_history_pages():
+    at = _app()
+    _, mx = _bounds(at)
+    keep = (mx - _dt.timedelta(days=3), mx)
+    at.session_state["flt_date_from"], at.session_state["flt_date_to"] = keep
+    at.run()
+    for page in ("Demand Analytics", "Forecast Explorer", "Stockout Risk", "Executive Overview"):
+        at.session_state["nav_page"] = page
+        at.run()
+        assert not at.exception, page
+    assert (_sv(at, "flt_date_from"), _sv(at, "flt_date_to")) == keep
+
+
+@pytest.mark.slow
+def test_87_stale_single_date_flt_daterange_is_ignored():
+    at = _app()
+    _, mx = _bounds(at)
+    at.session_state["flt_daterange"] = mx          # retired single-widget payload
+    at.run()
+    assert not at.exception
+    f, t = _bounds(at)
+    assert f <= t                                   # new controls still coherent
+
+
+@pytest.mark.slow
+def test_88_future_forecast_rows_are_not_date_filtered():
+    at = _app("Forecast Explorer")
+    mn, mx = _bounds(at)
+    at.session_state["flt_date_from"], at.session_state["flt_date_to"] = mn, mx
+    at.run()
+    full = {k: v for k, v in _kpis(at).items() if k.startswith("Forecasted")}
+    at.session_state["flt_date_from"] = mx - _dt.timedelta(days=6)
+    at.session_state["flt_date_to"] = mx
+    at.run()
+    narrowed = {k: v for k, v in _kpis(at).items() if k.startswith("Forecasted")}
+    assert full and full == narrowed, "forecast KPIs must ignore the historical date window"
+
+
+@pytest.mark.slow
+def test_89_date_controls_only_on_historical_pages():
+    at = _app()
+    for page, expected in (("Executive Overview", True), ("Demand Analytics", True),
+                           ("Forecast Explorer", True), ("Stockout Risk", False),
+                           ("Inventory & Reorder", False), ("Data Quality & Assumptions", False)):
+        at.session_state["nav_page"] = page
+        at.run()
+        labels = {d.label for d in at.date_input}
+        assert ({"From", "To"} <= labels) is expected, f"{page}: {labels}"
+
+
+def test_90_dashboard_modules_compile():
+    import py_compile
+    for mod in ("app.py", "styles.py"):
+        py_compile.compile(str(REPO_ROOT / "dashboard" / mod), doraise=True)
