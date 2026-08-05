@@ -992,7 +992,6 @@ def _kpis(at):
     return {k.strip(): v.strip() for k, v in pairs}
 
 
-@pytest.mark.slow
 def test_80_default_from_to_use_dataset_min_max():
     at = _app()
     f, t = _bounds(at)
@@ -1002,7 +1001,6 @@ def test_80_default_from_to_use_dataset_min_max():
     assert w_from.value == f and not at.exception
 
 
-@pytest.mark.slow
 def test_81_valid_range_filters_rows_inclusively():
     at = _app()
     _, mx = _bounds(at)
@@ -1014,7 +1012,6 @@ def test_81_valid_range_filters_rows_inclusively():
     assert before and after and before != after and not at.exception
 
 
-@pytest.mark.slow
 def test_82_from_after_to_is_rejected():
     at = _app()
     mn, mx = _bounds(at)
@@ -1033,7 +1030,6 @@ def _click_preset(at, label):
     return _sv(at, "flt_date_from"), _sv(at, "flt_date_to")
 
 
-@pytest.mark.slow
 def test_83_last_7_days_ends_at_latest_available_date():
     at = _app()
     _, mx = _bounds(at)
@@ -1041,7 +1037,6 @@ def test_83_last_7_days_ends_at_latest_available_date():
     assert t == mx and (t - f).days + 1 <= 7
 
 
-@pytest.mark.slow
 def test_84_last_30_days_is_clamped_to_minimum():
     at = _app()
     mn, mx = _bounds(at)
@@ -1049,7 +1044,6 @@ def test_84_last_30_days_is_clamped_to_minimum():
     assert f >= mn and t == mx and (t - f).days + 1 <= 30
 
 
-@pytest.mark.slow
 def test_85_all_history_resets_to_full_range():
     at = _app()
     mn, mx = _bounds(at)
@@ -1058,7 +1052,6 @@ def test_85_all_history_resets_to_full_range():
     assert (f, t) == (mn, mx)
 
 
-@pytest.mark.slow
 def test_86_range_persists_across_history_pages():
     at = _app()
     _, mx = _bounds(at)
@@ -1072,7 +1065,6 @@ def test_86_range_persists_across_history_pages():
     assert (_sv(at, "flt_date_from"), _sv(at, "flt_date_to")) == keep
 
 
-@pytest.mark.slow
 def test_87_stale_single_date_flt_daterange_is_ignored():
     at = _app()
     _, mx = _bounds(at)
@@ -1083,7 +1075,6 @@ def test_87_stale_single_date_flt_daterange_is_ignored():
     assert f <= t                                   # new controls still coherent
 
 
-@pytest.mark.slow
 def test_88_future_forecast_rows_are_not_date_filtered():
     at = _app("Forecast Explorer")
     mn, mx = _bounds(at)
@@ -1097,7 +1088,6 @@ def test_88_future_forecast_rows_are_not_date_filtered():
     assert full and full == narrowed, "forecast KPIs must ignore the historical date window"
 
 
-@pytest.mark.slow
 def test_89_date_controls_only_on_historical_pages():
     at = _app()
     for page, expected in (("Executive Overview", True), ("Demand Analytics", True),
@@ -1113,3 +1103,138 @@ def test_90_dashboard_modules_compile():
     import py_compile
     for mod in ("app.py", "styles.py"):
         py_compile.compile(str(REPO_ROOT / "dashboard" / mod), doraise=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Production historical-window helpers (rs.normalize_history_window /
+# rs.filter_historical_frame) — the exact functions the dashboard pages call.
+# ══════════════════════════════════════════════════════════════════════════════════
+MN = _dt.date(2026, 1, 15)
+MX = _dt.date(2026, 7, 15)
+
+
+def _hist_frame(start="2026-01-15", periods=182, skus=("A", "B")):
+    days = pd.date_range(start, periods=periods, freq="D")
+    return pd.DataFrame({"sku": [s for s in skus for _ in days],
+                         "channel": "naheed_web",
+                         "date": [d for _ in skus for d in days],
+                         "units_observed": 5.0,
+                         "category": "Cat1"})
+
+
+def test_91_full_range_returns_every_row():
+    df = _hist_frame()
+    out = rs.filter_historical_frame(df, date_from=MN, date_to=MX)
+    assert len(out) == len(df)
+
+
+def test_92_single_day_range_returns_only_that_date():
+    df = _hist_frame()
+    out = rs.filter_historical_frame(df, date_from=MX, date_to=MX)
+    assert len(out) == 2                                    # one row per SKU on that date
+    assert set(pd.to_datetime(out["date"]).dt.date) == {MX}
+
+
+def test_93_filtering_is_inclusive_on_both_ends():
+    df = _hist_frame()
+    a, b = _dt.date(2026, 2, 1), _dt.date(2026, 2, 3)
+    out = rs.filter_historical_frame(df, date_from=a, date_to=b)
+    got = sorted(set(pd.to_datetime(out["date"]).dt.date))
+    assert got == [a, _dt.date(2026, 2, 2), b]              # both endpoints kept
+
+
+def test_94_from_after_to_is_rejected_by_normalizer():
+    d_from, d_to, err = rs.normalize_history_window(MN, MX, MX, MN)
+    assert (d_from, d_to) == (MN, MX) and err and "after" in err.lower()
+
+
+def test_95_dates_outside_dataset_are_clamped():
+    d_from, d_to, err = rs.normalize_history_window(
+        MN, MX, _dt.date(2020, 1, 1), _dt.date(2099, 12, 31))
+    assert (d_from, d_to) == (MN, MX) and err is None
+
+
+def test_96_last_7_days_ends_at_latest_available_date():
+    d_from, d_to = MX - _dt.timedelta(days=6), MX
+    out = rs.filter_historical_frame(_hist_frame(), date_from=d_from, date_to=d_to)
+    assert pd.to_datetime(out["date"]).max().date() == MX
+    assert len(set(pd.to_datetime(out["date"]).dt.date)) == 7
+
+
+def test_97_stale_single_date_payload_is_ignored():
+    # the retired flt_daterange stored a tuple/list — it must not break the window
+    for stale in ((MN, MX), [MN, MX], None, True):
+        d_from, d_to, err = rs.normalize_history_window(MN, MX, stale, stale)
+        assert (d_from, d_to) == (MN, MX) and err is None
+
+
+def test_98_helper_does_not_mutate_input_and_handles_empty():
+    df = _hist_frame()
+    before = df.copy()
+    out = rs.filter_historical_frame(df, date_from=_dt.date(2030, 1, 1), date_to=_dt.date(2030, 1, 2))
+    pd.testing.assert_frame_equal(df, before)               # original untouched
+    assert out.empty and list(out.columns) == list(df.columns)
+    assert rs.filter_historical_frame(pd.DataFrame(), date_from=MN, date_to=MX).empty
+
+
+def test_99_frames_without_a_date_column_pass_through():
+    inv = pd.DataFrame({"sku": ["A", "B"], "stock_on_hand": [1, 2]})
+    out = rs.filter_historical_frame(inv, date_from=MX, date_to=MX)
+    assert len(out) == 2                                    # decision artifacts are never cut
+
+
+def test_100_executive_overview_row_count_changes():
+    at = _app("Executive Overview")
+    mn, mx = _bounds(at)
+    full = _kpis(at).get("Historical Sales Rows")
+    at.date_input(key="flt_date_from").set_value(mx)        # real widget interaction
+    at.date_input(key="flt_date_to").set_value(mx)
+    at.run()
+    single = _kpis(at).get("Historical Sales Rows")
+    assert full and single and full != single, f"{full} -> {single}"
+    assert int(single.replace(",", "")) < int(full.replace(",", ""))
+
+
+def test_101_demand_analytics_reacts_to_the_window():
+    at = _app("Demand Analytics")
+    mn, mx = _bounds(at)
+    at.date_input(key="flt_date_from").set_value(mn)
+    at.date_input(key="flt_date_to").set_value(mx)
+    at.run()
+    wide = " ".join(str(m.value) for m in at.markdown)
+    at.date_input(key="flt_date_from").set_value(mx)
+    at.date_input(key="flt_date_to").set_value(mx)
+    at.run()
+    narrow = " ".join(str(m.value) for m in at.markdown)
+    assert wide != narrow and not at.exception
+
+
+def test_102_result_caption_reports_the_window():
+    at = _app("Executive Overview")
+    _, mx = _bounds(at)
+    at.date_input(key="flt_date_from").set_value(mx)
+    at.date_input(key="flt_date_to").set_value(mx)
+    at.run()
+    md = " ".join(str(m.value) for m in at.markdown)
+    assert "historical rows" in md and "ipa-daterange-result" in md
+
+
+def test_103_reset_restores_full_history():
+    at = _app("Executive Overview")
+    mn, mx = _bounds(at)
+    at.date_input(key="flt_date_from").set_value(mx)
+    at.run()
+    btn = {b.label: b for b in at.button}.get("Reset")
+    assert btn is not None
+    btn.click(); at.run()
+    assert _bounds(at) == (mn, mx) and not at.exception
+
+
+def test_104_decision_artifacts_unaffected_by_the_window():
+    at = _app("Stockout Risk")
+    before = len([b for b in at.button if b.label == "Details"])
+    at.session_state["flt_date_from"] = MX
+    at.session_state["flt_date_to"] = MX
+    at.run()
+    after = len([b for b in at.button if b.label == "Details"])
+    assert before == after and not at.exception              # risk queue never date-filtered

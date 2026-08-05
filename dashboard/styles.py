@@ -780,6 +780,10 @@ CUSTOM_CSS = f"""
     [class*="st-key-ipa-daterange"] button {{
         font-size: 0.74rem !important; padding: 3px 6px !important; min-height: 30px; }}
     [class*="st-key-ipa-daterange"] [data-testid="stCaptionContainer"] {{ margin-top: 2px; }}
+    .ipa-daterange-result {{ font-size: 0.78rem; font-weight: 700; color: {COLORS["navy"]};
+        background: #EEF4F9; border: 1px solid {COLORS["border"]}; border-radius: 8px;
+        padding: 4px 10px; display: inline-block; margin-top: 4px; }}
+    .ipa-daterange-result b {{ color: {COLORS["teal"]}; }}
 
     /* --- compact toolbar above tables/queues --- */
     .st-key-ipa-toolbar [data-testid="stHorizontalBlock"] {{ align-items: end; gap: 8px; }}

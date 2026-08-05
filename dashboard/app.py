@@ -556,9 +556,9 @@ def apply_filters(df, skus=None, categories=None, brands=None, date_range=None):
         out = out[out["category"].isin(categories)]
     if brands and "brand" in out.columns:
         out = out[out["brand"].isin(brands)]
-    if date_range and "date" in out.columns and len(date_range) == 2:
-        start, end = date_range
-        out = out[(out["date"] >= pd.Timestamp(start)) & (out["date"] <= pd.Timestamp(end))]
+    if date_range and len(date_range) == 2:
+        # one production helper for every historical date filter (see run_service)
+        out = rs.filter_historical_frame(out, date_from=date_range[0], date_to=date_range[1])
     return out
 
 
@@ -833,19 +833,6 @@ def _flt(key, default):
     return st.session_state.get(shadow, default)
 
 
-def _as_date(value):
-    """Coerce a session value to a plain date, or None when unusable/stale."""
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (tuple, list)):           # stale single-widget range payload
-        return None
-    try:
-        ts = pd.to_datetime(value, errors="coerce")
-    except (TypeError, ValueError):
-        return None
-    return None if pd.isna(ts) else ts.date()
-
-
 def preset_range(preset, min_d, max_d):
     """Start/end for a quick preset. 'Last N days' ENDS at the latest available historical
     date and the start is clamped to the earliest available date."""
@@ -856,24 +843,6 @@ def preset_range(preset, min_d, max_d):
         return min_d, max_d
     start = max_d - pd.Timedelta(days=days - 1).to_pytimedelta()
     return (max(start, min_d), max_d)
-
-
-def resolve_date_range(min_d, max_d, raw_from, raw_to):
-    """Clamp the From/To session values into the dataset window.
-
-    Returns (from_date, to_date, error). `error` is set only when the user picked
-    From > To — in that case the caller keeps the last valid range and shows a notice.
-    Display-only: it never touches the run, its as-of date, horizons or any artifact.
-    """
-    if min_d is None or max_d is None:
-        return None, None, None
-    d_from = _as_date(raw_from) or min_d
-    d_to = _as_date(raw_to) or max_d
-    d_from = min(max(d_from, min_d), max_d)        # keep inside the available window
-    d_to = min(max(d_to, min_d), max_d)
-    if d_from > d_to:
-        return min_d, max_d, "“From” is after “To” — showing the full available period instead."
-    return d_from, d_to, None
 
 
 if mp_raw is not None:
@@ -907,9 +876,10 @@ if mp_raw is not None:
     # Historical display window — two explicit From/To values, clamped to what the
     # active model_panel actually contains. Changing the active run therefore resets a
     # stale out-of-range selection automatically.
-    date_from, date_to, DATE_RANGE_ERROR = resolve_date_range(
+    date_from, date_to, DATE_RANGE_ERROR = rs.normalize_history_window(
         min_date, max_date, _flt("flt_date_from", min_date), _flt("flt_date_to", max_date))
-    date_range = (date_from, date_to)
+    historical_date_range = (date_from, date_to)
+    date_range = historical_date_range        # kept: existing call sites use `date_range`
 
     horizon = _flt("flt_horizon", 14)
     horizon = horizon if horizon in (7, 14) else 14
@@ -967,8 +937,16 @@ def render_history_date_controls(key_prefix="page"):
         if DATE_RANGE_ERROR:
             st.error(DATE_RANGE_ERROR, icon=":material/event_busy:")
         st.caption(f"Historical display period · available data: "
-                   f"{_pretty_date(min_date)} to {_pretty_date(max_date)}"
-                   f"  ·  showing {_pretty_date(date_from)} to {_pretty_date(date_to)}")
+                   f"{_pretty_date(min_date)} to {_pretty_date(max_date)}")
+        # Live result feedback — proves the range actually took effect.
+        _n_rows = 0 if mp_f is None or mp_f.empty else len(mp_f)
+        st.markdown(
+            f'<div class="ipa-daterange-result">Showing <b>{_n_rows:,}</b> historical rows · '
+            f'{_pretty_date(date_from)} to {_pretty_date(date_to)}</div>',
+            unsafe_allow_html=True)
+        if _n_rows == 0:
+            st.warning("No historical rows in this period — widen the range or press **All**.",
+                       icon=":material/event_busy:")
 
 
 def render_filter_bar(*, products=True, category=True, dates=False, horizon_ctl=False,

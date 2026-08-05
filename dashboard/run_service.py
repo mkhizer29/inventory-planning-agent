@@ -397,6 +397,60 @@ def run_model_options(context: dict, run_record: dict) -> list[dict]:
 
 
 # ── forecast horizon filtering (run vs legacy) ───────────────────────────────────────────
+def normalize_history_window(min_date, max_date, raw_from, raw_to):
+    """Clamp a requested From/To into the dataset window.
+
+    Returns ``(date_from, date_to, error)`` as plain ``datetime.date`` values, both inside
+    [min_date, max_date] and satisfying ``date_from <= date_to``. Null / boolean / stale
+    payloads (e.g. the retired single-widget tuple) fall back to the full window. When the
+    user picks From after To, the full window is returned together with an error message so
+    the caller can show a notice instead of applying an invalid filter.
+    """
+    def _coerce(v):
+        if v is None or isinstance(v, bool) or isinstance(v, (tuple, list)):
+            return None
+        try:
+            ts = pd.to_datetime(v, errors="coerce")
+        except (TypeError, ValueError):
+            return None
+        return None if pd.isna(ts) else ts.date()
+
+    lo, hi = _coerce(min_date), _coerce(max_date)
+    if lo is None or hi is None:
+        return None, None, None
+    if lo > hi:
+        lo, hi = hi, lo
+    d_from = _coerce(raw_from) or lo
+    d_to = _coerce(raw_to) or hi
+    d_from = min(max(d_from, lo), hi)
+    d_to = min(max(d_to, lo), hi)
+    if d_from > d_to:
+        return lo, hi, "“From” is after “To” — showing the full available period instead."
+    return d_from, d_to, None
+
+
+def filter_historical_frame(df: pd.DataFrame, *, date_from, date_to) -> pd.DataFrame:
+    """Inclusively restrict a HISTORICAL frame to [date_from, date_to] on its ``date`` column.
+
+    Display-only: it never touches the run, its as-of date, the horizons or any artifact, and
+    it is only ever applied to historical frames (model_panel) — never to future forecasts,
+    stockout risk or reorder recommendations. Returns a new frame; the input is not mutated.
+    An empty result is returned as an empty frame with the original columns.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+    if "date" not in getattr(df, "columns", []) or date_from is None or date_to is None:
+        return df
+    out = df.copy()                                  # never mutate the caller's frame
+    dates = pd.to_datetime(out["date"], errors="coerce")
+    start, end = pd.Timestamp(date_from), pd.Timestamp(date_to)
+    if start > end:                                  # defensive: caller should have normalized
+        start, end = end, start
+    keep = dates.notna() & (dates >= start) & (dates <= end.normalize() + pd.Timedelta(days=1)
+                                               - pd.Timedelta(nanoseconds=1))
+    return out.loc[keep].reset_index(drop=True)
+
+
 def apply_horizon_filter(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     """Restrict a future-forecast frame to `horizon` days.
 
