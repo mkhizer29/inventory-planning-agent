@@ -30,6 +30,7 @@ from styles import (COLORS, CATEGORICAL, DONUT_COLORS, DONUT_HOVER, STATUS_COLOR
                     CUSTOM_CSS, plotly_layout, style_axes, icon_svg)
 import run_service as rs   # Phase 5 run-aware backend service (framework-free, testable)
 import export_utils as eu  # one reusable in-memory CSV/Excel/PDF export menu
+import deadstock_analysis as da  # standalone ecommerce deadstock (inventory-inactivity) scan
 
 # --------------------------------------------------------------------------
 # Paths
@@ -790,6 +791,7 @@ NAV_ITEMS = [
     ("Forecast Runs", "rocket_launch"),
     ("Forecast Explorer", "auto_graph"),
     ("Inventory & Reorder", "inventory_2"),
+    ("Deadstock", "hourglass_empty"),
     ("Stockout Risk", "crisis_alert"),
     ("Data Quality & Assumptions", "fact_check"),
 ]
@@ -3515,6 +3517,498 @@ def page_forecast_runs():
         st.text(rs.tail_log(log_path, 200) or "(no log yet)")
 
 
+def page_deadstock():
+    # Standalone ecommerce deadstock (inventory-inactivity) scan. INDEPENDENT of the active
+    # Forecast Run: it reads the real warehouse on demand and never launches a run or a model.
+    # This page only filters/sorts/formats/displays/exports the backend result — never reclassifies.
+    DEAD_HEX = {da.STATUS_CANDIDATE: COLORS["amber"], da.STATUS_NEVER_SOLD: COLORS["slate"],
+                da.STATUS_REVIEW: COLORS["blue"], da.STATUS_NOT: COLORS["success"]}
+    DEAD_CLS = {da.STATUS_CANDIDATE: "candidate", da.STATUS_NEVER_SOLD: "never",
+                da.STATUS_REVIEW: "review", da.STATUS_NOT: "not"}
+
+    def _short(s, n=42):
+        s = str(s)
+        return s if len(s) <= n else s[:n - 1] + "…"
+
+    def _esc(x):
+        return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _safe_key(x):
+        return "".join(c if c.isalnum() else "-" for c in str(x))
+
+    def _dash(v):
+        return "—" if (v is None or v is pd.NaT or (isinstance(v, float) and pd.isna(v))) else v
+
+    def _num(v):
+        try:
+            return None if v is None or pd.isna(v) else float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _dead_chip(status):
+        s = str(status)
+        return f'<span class="ipa-dead ipa-dead-{DEAD_CLS.get(s, "not")}">{_esc(s)}</span>'
+
+    def _full(name, sku):
+        return rs.full_product_label(name, sku)
+
+    def _inactivity_text(row):
+        s = str(row.get("deadstock_status"))
+        d = _num(row.get("days_since_last_sale"))
+        if s == da.STATUS_NEVER_SOLD:
+            return "Never sold"
+        if d is not None:
+            return f"{int(d)} days inactive"
+        return "—"
+
+    # ── config / warehouse / categories ───────────────────────────────────────────────────
+    try:
+        dcfg = da._load_config()
+    except Exception:  # noqa: BLE001
+        dcfg = {"default_inactivity_days": 90, "minimum_interval_days": 1,
+                "maximum_interval_days": 365, "sales_scope": "ecommerce"}
+    db_path = rs.DEFAULT_DB_PATH
+
+    res = st.session_state.get("deadstock_result")
+    completed = bool(res and not res.get("error"))
+
+    # ── header with DYNAMIC deadstock badges from the completed analysis (never the pilot) ──
+    if completed:
+        s = res["summary"]
+        badges = [
+            ("box", f"{format_number(s['products_scanned'])} SKUs scanned"),
+            ("globe", f"{str(s['sales_scope']).capitalize()} sales scope"),
+            ("calendar", f"Snapshot {_pretty_date(s['snapshot_date'])}"),
+            ("clock", f"Interval {s['inactivity_interval_days']} days"),
+        ]
+    else:
+        badges = [("database", "Warehouse deadstock scan"), ("globe", "Ecommerce sales scope")]
+    render_page_header(
+        "Deadstock Analysis",
+        "Ecommerce inventory inactivity · configurable interval · latest warehouse snapshot",
+        badges=badges)
+    info_banner(
+        "Deadstock candidates have positive current stock but no recorded ecommerce sale during "
+        "the selected interval. This does not prove that the product had no physical-store sales.",
+        kind="info")
+
+    if not db_path.exists():
+        empty_state("Warehouse unavailable",
+                    "The warehouse database (inventory_etl/output/inventory.db) was not found. "
+                    "Deadstock analysis needs the real warehouse snapshot.", "database")
+        return
+    try:
+        cats = da.list_deadstock_categories(db_path)
+    except Exception as exc:  # noqa: BLE001
+        empty_state("Warehouse unavailable", f"Could not read warehouse categories: {exc}", "database")
+        return
+
+    # ── inputs (page-local; independent of the sidebar run/product filters) ───────────────
+    with st.container(key="ipa-dead-inputs"):
+        ic = st.columns([2, 1, 1])
+        with ic[0]:
+            cat_choice = st.selectbox("Category", options=["All Categories"] + cats, key="deadstock_category")
+        with ic[1]:
+            interval = st.number_input(
+                "Inactivity interval (days)", min_value=int(dcfg["minimum_interval_days"]),
+                max_value=int(dcfg["maximum_interval_days"]), value=int(dcfg["default_inactivity_days"]),
+                step=1, key="deadstock_interval")
+        with ic[2]:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            run_clicked = st.button("Analyse Deadstock", type="primary", width="stretch", key="deadstock_run")
+
+    if run_clicked:
+        with st.spinner("Scanning the latest warehouse snapshot…"):
+            try:
+                cat_arg = None if cat_choice == "All Categories" else cat_choice
+                df_all, summ = da.analyse_deadstock(db_path=db_path, inactivity_days=int(interval),
+                                                    category=cat_arg, include_not_deadstock=True)
+                st.session_state["deadstock_result"] = {
+                    "df": df_all, "summary": summ, "analysis_category": cat_choice,
+                    "analysis_inactivity_days": int(interval),
+                    "analysis_snapshot_date": summ["snapshot_date"]}
+                st.session_state["deadstock_queue_shown"] = 8
+            except Exception as exc:  # noqa: BLE001
+                st.session_state["deadstock_result"] = {"error": str(exc)}
+        st.rerun()
+
+    # stale-input warning (retain old result; never relabel it with the new inputs)
+    if da.analysis_inputs_changed(res, cat_choice, int(interval)):
+        info_banner("Inputs have changed. Click <strong>Analyse Deadstock</strong> to refresh the results.",
+                    kind="synthetic")
+
+    if not res:
+        empty_state("Run a deadstock scan",
+                    "Choose a category and inactivity interval, then click Analyse Deadstock. The scan "
+                    "reads the latest warehouse snapshot on demand — it never launches a forecast run "
+                    "or a model.", "search")
+        return
+    if res.get("error"):
+        empty_state("Deadstock scan failed", res["error"], "alert-triangle")
+        return
+
+    # From here everything uses the COMPLETED analysis metadata (not the current form inputs).
+    df_all, summ = res["df"], res["summary"]
+    acat = res["analysis_category"]
+    is_all = (acat == "All Categories")
+    interval_a = int(summ["inactivity_interval_days"])
+    scope = summ["sales_scope"]
+
+    if df_all is None or df_all.empty:
+        empty_state("No stock-carrying products",
+                    f"No active, non-dropship SKU with positive current stock was found "
+                    f"{'across All Categories' if is_all else f'in {acat}'}.", "check-circle")
+        return
+
+    info_banner(
+        f"Interval <strong>{interval_a} days</strong> · snapshot <strong>{summ['snapshot_date'] or '—'}</strong> "
+        f"· sales scope <strong>{scope}</strong> · scanned "
+        f"<strong>{format_number(summ['products_scanned'])}</strong> stock-carrying SKUs "
+        f"{'across All Categories' if is_all else f'in {acat}'}", kind="info")
+
+    # ── Section 1 — five KPI cards (full completed analysis) ──────────────────────────────
+    section_title("Deadstock overview", None)
+    render_kpi_row([
+        {"label": "Deadstock Candidates", "value": format_number(summ["deadstock_candidate_count"]),
+         "icon": "alert-triangle", "tone": "amber",
+         "sub": f"No ecommerce sale in ≥ {interval_a}d (excl. never-sold)"},
+        {"label": "Never-Sold Products", "value": format_number(summ["never_sold_count"]),
+         "icon": "circle-dashed", "tone": "slate", "sub": "In stock, no ecommerce sale ever"},
+        {"label": "Deadstock Units", "value": format_number(summ["deadstock_units"]),
+         "icon": "box", "tone": "navy", "sub": "Candidate + never-sold stock on hand"},
+        {"label": "Estimated Deadstock Value", "value": format_currency(summ["estimated_deadstock_value"]),
+         "icon": "coin", "tone": "teal", "sub": "Priced deadstock only (nulls excluded)"},
+        {"label": "Missing-Cost Products", "value": format_number(summ["missing_cost_count"]),
+         "icon": "search", "tone": "blue", "sub": "Deadstock SKUs without a valid cost"},
+    ], n_cols=5)
+
+    confirmed = df_all[df_all["deadstock_status"].isin([da.STATUS_CANDIDATE, da.STATUS_NEVER_SOLD])].copy()
+
+    # ── Section 2 — Deadstock Exposure Analysis (status donut + inactivity aging) ─────────
+    section_title("Deadstock Exposure Analysis", "Full completed analysis for the selected scope.")
+    ca, cb = st.columns(2)
+    with ca:
+        order = [da.STATUS_CANDIDATE, da.STATUS_NEVER_SOLD, da.STATUS_REVIEW, da.STATUS_NOT]
+        present = [s for s in order if (df_all["deadstock_status"] == s).any()]
+        counts = [int((df_all["deadstock_status"] == s).sum()) for s in present]
+        units = [float(pd.to_numeric(df_all[df_all["deadstock_status"] == s]["stock_on_hand"],
+                                     errors="coerce").sum()) for s in present]
+        vals = [float(pd.to_numeric(df_all[df_all["deadstock_status"] == s]["estimated_deadstock_value"],
+                                    errors="coerce").dropna().sum()) for s in present]
+        donut = go.Figure(go.Pie(
+            labels=present, values=counts, hole=0.62, sort=False, direction="clockwise",
+            marker=dict(colors=[DEAD_HEX[s] for s in present], line=dict(color="white", width=1.5)),
+            textinfo="value", customdata=list(zip(units, vals)),
+            hovertemplate=("<b>%{label}</b><br>Products: %{value} (%{percent})<br>"
+                           "Stock units: %{customdata[0]:,.0f}<br>"
+                           "Est. value: PKR %{customdata[1]:,.0f}<extra></extra>")))
+        donut.update_layout(**plotly_layout(height=330, legend=True))
+        donut.update_layout(annotations=[dict(text=f"{format_number(summ['products_scanned'])}<br>scanned",
+                                              x=0.5, y=0.5, showarrow=False,
+                                              font=dict(size=13, color=COLORS["navy"]))])
+        render_chart(donut, "Status Distribution",
+                     "Share of scanned SKUs by status. Status label stays visible in the legend + hover.")
+    with cb:
+        ag = da.deadstock_aging_summary(df_all, interval_a)
+        bar = go.Figure(go.Bar(
+            x=ag["bucket"], y=ag["products"],
+            marker=dict(color=[COLORS["slate"] if b == "Never Sold" else COLORS["teal"] for b in ag["bucket"]]),
+            customdata=np.stack([ag["units"].to_numpy(), ag["value"].to_numpy()], axis=-1),
+            hovertemplate=("<b>%{x}</b><br>Products: %{y}<br>Stock units: %{customdata[0]:,.0f}<br>"
+                           "Est. value: PKR %{customdata[1]:,.0f}<extra></extra>")))
+        bar.update_layout(**plotly_layout(legend=False, height=330))
+        style_axes(bar)
+        bar.update_yaxes(title_text="Products")
+        bar.update_xaxes(title_text="")
+        render_chart(bar, "Inactivity Aging",
+                     "Mutually exclusive inactivity buckets; Never Sold is separate (no last-sale date).")
+
+    # ── Section 3 — value exposure (context-aware) ─────────────────────────────────────────
+    if is_all:
+        by_cat = (confirmed.dropna(subset=["estimated_deadstock_value"])
+                  .groupby("category", as_index=False)["estimated_deadstock_value"].sum()
+                  .sort_values("estimated_deadstock_value", ascending=True).tail(20))
+        if by_cat.empty:
+            with st.container(border=True):
+                empty_state("No priced deadstock value",
+                            "No candidate/never-sold SKU has a valid cost, so value cannot be ranked.",
+                            "circle-dashed")
+        else:
+            fig = go.Figure(go.Bar(
+                x=by_cat["estimated_deadstock_value"], y=by_cat["category"], orientation="h",
+                marker=dict(color=COLORS["teal"]),
+                hovertemplate="<b>%{y}</b><br>Estimated deadstock value: PKR %{x:,.0f}<extra></extra>"))
+            fig.update_layout(**plotly_layout(legend=False, height=360))
+            style_axes(fig)
+            fig.update_xaxes(title_text="Estimated deadstock value (PKR)")
+            render_chart(fig, "Estimated Deadstock Value by Category",
+                         "Candidate + never-sold SKUs with a valid cost (missing-cost SKUs excluded).")
+    else:
+        top = (confirmed.dropna(subset=["estimated_deadstock_value"])
+               .sort_values("estimated_deadstock_value", ascending=True).tail(15))
+        if top.empty:
+            with st.container(border=True):
+                empty_state("No priced deadstock value",
+                            "No candidate/never-sold SKU in this category has a valid cost.", "circle-dashed")
+        else:
+            names = [_full(n, s) for n, s in zip(top["sku_name"], top["sku"])]
+            cust = list(zip(names, top["sku"].astype(str),
+                            [format_number(v, 0) for v in top["stock_on_hand"]],
+                            [str(x) for x in top["deadstock_status"]]))
+            fig = go.Figure(go.Bar(
+                x=top["estimated_deadstock_value"], y=top["sku"].astype(str), orientation="h",
+                marker=dict(color=COLORS["teal"]), customdata=cust,
+                hovertemplate=("<b>%{customdata[0]}</b><br>SKU %{customdata[1]}<br>"
+                               "Status: %{customdata[3]}<br>Stock: %{customdata[2]} u<br>"
+                               "Estimated deadstock value: PKR %{x:,.0f}<extra></extra>")))
+            fig.update_layout(**plotly_layout(legend=False, height=360))
+            style_axes(fig)
+            fig.update_yaxes(tickmode="array", tickvals=top["sku"].astype(str).tolist(),
+                             ticktext=[_short(n) for n in names], title="", automargin=True)
+            fig.update_xaxes(title_text="Estimated deadstock value (PKR)")
+            render_chart(fig, "Top Deadstock Products by Estimated Value",
+                         "Highest-value candidate / never-sold SKUs. Hover for the full product name.")
+
+    # ── Section 4 — Deadstock Priority Queue (filters + compact rows) ─────────────────────
+    section_title("Deadstock Priority Queue",
+                  "Candidate, never-sold and manual-review stock requiring commercial review.")
+    status_order = [da.STATUS_CANDIDATE, da.STATUS_NEVER_SOLD, da.STATUS_REVIEW, da.STATUS_NOT]
+    status_opts = [s for s in status_order if (df_all["deadstock_status"] == s).any()]
+    default_status = [s for s in (da.STATUS_CANDIDATE, da.STATUS_NEVER_SOLD, da.STATUS_REVIEW)
+                      if s in status_opts]
+    with st.container(key="ipa-dead-toolbar"):
+        tc = st.columns([1.8, 1.7, 1.2])
+        with tc[0]:
+            query = st.text_input("Search product or SKU", key="deadstock_q_search",
+                                  placeholder="product name or SKU code")
+        with tc[1]:
+            statuses = st.multiselect("Status", options=status_opts, default=default_status,
+                                      key="deadstock_q_status")
+        with tc[2]:
+            sort_by = st.selectbox("Sort by", options=list(da.QUEUE_SORT_OPTIONS), key="deadstock_q_sort")
+
+    active_statuses = statuses if statuses else default_status
+    filtered = da.filter_deadstock(df_all, query=query, statuses=active_statuses)
+    ranked = da.sort_deadstock_queue(filtered, sort_by)
+    n_returned = int(df_all["deadstock_status"].isin(da.RETURNED_STATUSES).sum())
+    is_filtered = (len(ranked) != n_returned) or bool(query and query.strip())
+
+    mc1, mc2 = st.columns([3, 1])
+    with mc1:
+        chips = f'<span class="ipa-tier ipa-tier-unknown">{len(ranked)} in queue</span>'
+        if is_filtered:
+            chips += '<span class="ipa-tier ipa-tier-medium">Filtered</span>'
+        st.markdown(f'<div class="ipa-src-row">{chips}</div>', unsafe_allow_html=True)
+    with mc2:
+        with st.container(key="ipa-export-dead"):
+            eu.render_table_export_menu(
+                da.deadstock_export_frame(ranked), filename_stem="deadstock_analysis",
+                title="Deadstock Analysis",
+                metadata={"Category": acat, "Inactivity interval (days)": interval_a,
+                          "Snapshot date": summ["snapshot_date"], "Sales scope": scope,
+                          "Products scanned": summ["products_scanned"], "Rows (filtered)": len(ranked)},
+                key="exp_deadstock")
+
+    if ranked is None or ranked.empty:
+        if summ["deadstock_candidate_count"] == 0 and summ["never_sold_count"] == 0 \
+                and summ["manual_review_count"] == 0:
+            empty_state("No deadstock candidates",
+                        f"No ecommerce deadstock candidates were found for the selected {interval_a}-day "
+                        f"interval {'across All Categories' if is_all else f'in {acat}'}.", "check-circle")
+        else:
+            empty_state("No products match", "No products match the current status filter and search. "
+                        "Adjust the Status filter or clear the search.", "search")
+        return
+
+    # selection state (safe fallback to the top-ranked visible SKU)
+    cur = st.session_state.get("deadstock_selected_sku")
+    valid = ranked["sku"].astype(str).tolist()
+    if cur not in valid:
+        cur = valid[0]
+        st.session_state["deadstock_selected_sku"] = cur
+
+    PAGE = 8
+    shown = int(st.session_state.get("deadstock_queue_shown", PAGE))
+    shown = max(PAGE, min(shown, len(ranked)))
+    for rec in ranked.head(shown).to_dict("records"):
+        sku = str(rec["sku"])
+        safe = _safe_key(sku)
+        status = str(rec.get("deadstock_status"))
+        cls = DEAD_CLS.get(status, "not")
+        name = rec.get("sku_name")
+        nm = None if (name is None or (isinstance(name, float) and pd.isna(name))) else str(name).strip()
+        disp = nm if (nm and nm.lower() != "nan") else sku
+        full = _full(name, sku)
+        is_sel = (sku == str(cur))
+        val = rec.get("estimated_deadstock_value")
+        val_txt = format_currency(val) if _num(val) is not None else "Cost unavailable"
+        rcols = st.columns([3.0, 1.25, 0.9, 1.3, 1.2, 1.35, 0.95])
+        with rcols[0]:
+            st.markdown(
+                f'<div class="ipa-qrow ipa-q-dead-{cls}" title="{_esc(full)}">'
+                f'<div style="min-width:0;"><div class="q-name">{_esc(disp)}</div>'
+                f'<div class="q-sub">SKU {_esc(sku)}</div></div></div>', unsafe_allow_html=True)
+        rcols[1].markdown(f'<div class="ipa-qcell">{_dead_chip(status)}</div>', unsafe_allow_html=True)
+        rcols[2].markdown(f'<div class="ipa-qcell"><b>{format_number(rec.get("stock_on_hand"), 0)}</b>'
+                          f'<div class="q-sub">units</div></div>', unsafe_allow_html=True)
+        rcols[3].markdown(f'<div class="ipa-qcell"><b>{_esc(_inactivity_text(rec))}</b>'
+                          f'<div class="q-sub">inactivity</div></div>', unsafe_allow_html=True)
+        rcols[4].markdown(f'<div class="ipa-qcell"><b>{_esc(str(_dash(rec.get("last_sale_date"))))}</b>'
+                          f'<div class="q-sub">last sale</div></div>', unsafe_allow_html=True)
+        rcols[5].markdown(f'<div class="ipa-qcell"><b>{val_txt}</b>'
+                          f'<div class="q-sub">est. value</div></div>', unsafe_allow_html=True)
+        with rcols[6]:
+            if st.button("Details", key=f"deadbtn-{safe}", width="stretch",
+                         type="primary" if is_sel else "secondary",
+                         help=f"Open full details for {full}"):
+                st.session_state["deadstock_selected_sku"] = sku
+                st.session_state["deadstock_open_dialog"] = True
+                st.rerun()
+    if len(ranked) > shown:
+        if st.button(f"Show more ({len(ranked) - shown} remaining)", key="deadstock_show_more"):
+            st.session_state["deadstock_queue_shown"] = shown + PAGE
+            st.rerun()
+    elif shown > PAGE:
+        if st.button("Show fewer", key="deadstock_show_fewer"):
+            st.session_state["deadstock_queue_shown"] = PAGE
+            st.rerun()
+
+    # ── Selected-product details (modal when supported, inline fallback otherwise) ────────
+    def _render_deadstock_detail(sku):
+        sel = df_all[df_all["sku"].astype(str) == str(sku)]
+        if sel.empty:
+            return
+        r = sel.iloc[0]
+        status = str(r.get("deadstock_status"))
+        stock = _num(r.get("stock_on_hand"))
+        days = _num(r.get("days_since_last_sale"))
+        age = _num(r.get("product_age_days"))
+        val = r.get("estimated_deadstock_value")
+        inactive_val = ("Never sold" if status == da.STATUS_NEVER_SOLD
+                        else (f"{int(days)} days" if days is not None else "—"))
+        # A. four summary cards
+        render_kpi_row([
+            {"label": "Deadstock Status", "value": status, "icon": "alert-triangle",
+             "tone": {"candidate": "amber", "never": "slate", "review": "blue", "not": "success"}[DEAD_CLS.get(status, "not")],
+             "sub": f"{scope} sales scope"},
+            {"label": "Current Stock", "value": f"{format_number(stock, 0)} u", "icon": "box",
+             "tone": "navy", "sub": f"Snapshot {summ['snapshot_date'] or '—'}"},
+            {"label": ("Inactive Days" if status != da.STATUS_NEVER_SOLD else "Sales"),
+             "value": inactive_val, "icon": "clock", "tone": "amber",
+             "sub": f"Configured interval {interval_a}d"},
+            {"label": "Estimated Deadstock Value",
+             "value": (format_currency(val) if _num(val) is not None else "—"), "icon": "coin",
+             "tone": "teal", "sub": "Stock × unit cost" if _num(val) is not None else "Cost unavailable"},
+        ], n_cols=4)
+
+        d1, d2 = st.columns(2)
+        with d1:
+            metric_panel("Product profile", [
+                ("Product name", _esc(str(_dash(r.get("sku_name"))))),
+                ("SKU", _esc(str(r.get("sku")))),
+                ("Product ID", str(_dash(r.get("product_id")))),
+                ("Category", _esc(str(_dash(r.get("category"))))),
+                ("Brand", _esc(str(_dash(r.get("brand"))))),
+                ("Stock snapshot date", str(_dash(r.get("snapshot_date")))),
+                ("Current stock", format_number(stock, 0)),
+                ("Selected interval", f"{interval_a} days"),
+                ("Sales scope", f"{scope} (ecommerce channels only)"),
+            ], sub="Read from the latest warehouse snapshot.")
+        with d2:
+            if status == da.STATUS_CANDIDATE:
+                beyond = (int(days) - interval_a) if days is not None else None
+                rows = [("Last sale date", str(_dash(r.get("last_sale_date")))),
+                        ("Days since last sale", format_number(days, 0)),
+                        ("Configured threshold", f"{interval_a} days"),
+                        ("Days beyond threshold", (format_number(beyond, 0) if beyond is not None else "—"))]
+            elif status == da.STATUS_NEVER_SOLD:
+                rows = [("Last ecommerce sale", "Never recorded"),
+                        ("Product created date", str(_dash(r.get("product_created_date")))),
+                        ("Product age", (f"{int(age)} days" if age is not None else "—")),
+                        ("Configured threshold", f"{interval_a} days")]
+            else:  # Manual Review / other
+                rows = [("Last sale date", str(_dash(r.get("last_sale_date")))),
+                        ("Product created date", str(_dash(r.get("product_created_date")))),
+                        ("Product age", (f"{int(age)} days" if age is not None else "—")),
+                        ("Configured threshold", f"{interval_a} days")]
+            metric_panel("Sales inactivity", rows, sub=f"{scope} sales only — physical-store sales are out of scope.")
+
+        cost = _num(r.get("unit_cost"))
+        cost_note = "Valid" if cost is not None else "Missing / invalid — value not computed"
+        metric_panel("Cost exposure", [
+            ("Unit cost", (format_currency(cost, 2) if cost is not None else "—")),
+            ("Cost source", _esc(str(_dash(r.get("cost_source"))))),
+            ("Current stock", format_number(stock, 0)),
+            ("Estimated deadstock value", (format_currency(val) if _num(val) is not None else "—")),
+            ("Cost status", cost_note),
+        ], sub="“—” means unavailable — never shown as zero.")
+
+        # E. deterministic "why flagged" (from stored row fields only; ecommerce-scoped wording)
+        if status == da.STATUS_CANDIDATE and days is not None:
+            beyond = int(days) - interval_a
+            why = (f"This SKU has {format_number(stock, 0)} units in the latest warehouse snapshot and its "
+                   f"last recorded ecommerce sale was {int(days)} days before the snapshot. The configured "
+                   f"deadstock interval is {interval_a} days, so it exceeds the threshold by {beyond} days.")
+        elif status == da.STATUS_NEVER_SOLD:
+            why = (f"This SKU has {format_number(stock, 0)} units in the latest warehouse snapshot and no "
+                   f"positive ecommerce sale is recorded on or before the snapshot date. Its product age"
+                   + (f" ({int(age)} days)" if age is not None else "")
+                   + f" meets the configured {interval_a}-day interval.")
+        elif status == da.STATUS_REVIEW:
+            why = (f"This SKU has {format_number(stock, 0)} units and no positive ecommerce sale on or before "
+                   f"the snapshot, but its product creation date is unavailable, so its age could not be "
+                   f"verified against the {interval_a}-day interval. It is held for manual review rather than "
+                   f"classified automatically.")
+        else:
+            why = (f"This SKU has {format_number(stock, 0)} units and is not flagged as deadstock for the "
+                   f"configured {interval_a}-day ecommerce interval.")
+        why += " This reflects ecommerce sales only and does not indicate whether the product sold in physical stores."
+        st.markdown(
+            f'<div class="ipa-reason"><div class="h">{icon_svg("file-text", 16)} Why it was flagged</div>'
+            f'{_esc(why)}</div>', unsafe_allow_html=True)
+
+    _sel_row = df_all[df_all["sku"].astype(str) == str(cur)]
+    _sel_full = (_full(_sel_row.iloc[0].get("sku_name"), _sel_row.iloc[0]["sku"])
+                 if not _sel_row.empty else str(cur))
+    if hasattr(st, "dialog"):
+        @st.dialog(f"{_sel_full}", width="large")
+        def _dead_dialog():
+            _render_deadstock_detail(cur)
+            if st.button("Close", key="deadstock_dialog_close", type="primary"):
+                st.session_state["deadstock_open_dialog"] = False
+                st.rerun()
+
+        if st.session_state.get("deadstock_open_dialog"):
+            st.session_state["deadstock_open_dialog"] = False   # one-shot: reopened by a Details click
+            _dead_dialog()
+    else:
+        with st.container(border=True, key="deadstock-inline-detail"):
+            st.markdown(f'<div class="ipa-dd-head">{_esc(_sel_full)}</div>', unsafe_allow_html=True)
+            _render_deadstock_detail(cur)
+
+    # ── Complete dataset (currently filtered rows) ─────────────────────────────────────────
+    with st.expander("View Complete Deadstock Dataset", expanded=False):
+        disp = da.deadstock_export_frame(ranked)
+
+        def _status_css(val):
+            m = {da.STATUS_CANDIDATE: ("#FBF0DC", COLORS["amber"]),
+                 da.STATUS_NEVER_SOLD: ("#EAEEF3", COLORS["slate"]),
+                 da.STATUS_REVIEW: ("#E5EDFD", COLORS["blue"]),
+                 da.STATUS_NOT: ("#E4F5EC", COLORS["success"])}
+            if val in m:
+                bg, fg = m[val]
+                return f"background-color:{bg}; color:{fg}; font-weight:700;"
+            return ""
+
+        st.dataframe(disp.style.map(_status_css, subset=["Status"]),
+                     use_container_width=True, hide_index=True, height=430)
+        st.caption(f"{len(disp)} filtered row(s) · ecommerce sales scope · snapshot {summ['snapshot_date'] or '—'}. "
+                   "Null cost/value stay blank (never zero).")
+        with st.expander("Advanced: technical fields", expanded=False):
+            tech_cols = [c for c in da.OUTPUT_COLUMNS if c in ranked.columns]
+            st.dataframe(ranked[tech_cols], use_container_width=True, hide_index=True)
+
+
 # --------------------------------------------------------------------------
 # Router
 # --------------------------------------------------------------------------
@@ -3524,6 +4018,7 @@ PAGE_FUNCS = {
     "Forecast Runs": page_forecast_runs,
     "Forecast Explorer": page_forecast_explorer,
     "Inventory & Reorder": page_inventory_reorder,
+    "Deadstock": page_deadstock,
     "Stockout Risk": page_stockout_risk,
     "Data Quality & Assumptions": page_data_quality,
 }

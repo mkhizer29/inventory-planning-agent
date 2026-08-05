@@ -757,6 +757,11 @@ CUSTOM_CSS = f"""
     .ipa-q-medium, .ipa-q-watch {{ border-left-color: {COLORS["blue"]}; }}
     .ipa-q-low, .ipa-q-healthy {{ border-left-color: {COLORS["teal"]}; }}
     .ipa-q-unknown {{ border-left-color: {COLORS["slate"]}; }}
+    /* Deadstock queue status stripes (reuse the .ipa-qrow base; recolor the left edge) */
+    .ipa-q-dead-candidate {{ border-left-color: {COLORS["amber"]}; }}
+    .ipa-q-dead-never {{ border-left-color: {COLORS["slate"]}; }}
+    .ipa-q-dead-review {{ border-left-color: {COLORS["blue"]}; }}
+    .ipa-q-dead-not {{ border-left-color: {COLORS["success"]}; }}
     .ipa-qcell {{ min-height: 52px; display: flex; flex-direction: column; justify-content: center;
         align-items: center; text-align: center; font-size: 0.85rem; color: {COLORS["navy"]}; }}
     .ipa-qcell .q-sub {{ font-size: 0.66rem; color: {COLORS["subtext"]}; font-weight: 600; }}
@@ -786,8 +791,11 @@ CUSTOM_CSS = f"""
     .ipa-daterange-result b {{ color: {COLORS["teal"]}; }}
 
     /* --- compact toolbar above tables/queues --- */
-    .st-key-ipa-toolbar [data-testid="stHorizontalBlock"] {{ align-items: end; gap: 8px; }}
-    .st-key-ipa-toolbar [data-testid="stTextInput"] input {{ font-size: 0.85rem; }}
+    .st-key-ipa-toolbar [data-testid="stHorizontalBlock"],
+    .st-key-ipa-dead-inputs [data-testid="stHorizontalBlock"],
+    .st-key-ipa-dead-toolbar [data-testid="stHorizontalBlock"] {{ align-items: end; gap: 8px; }}
+    .st-key-ipa-toolbar [data-testid="stTextInput"] input,
+    .st-key-ipa-dead-toolbar [data-testid="stTextInput"] input {{ font-size: 0.85rem; }}
 
     /* --- export popover stays small and out of the way --- */
     [class*="st-key-ipa-export"] button {{ font-size: 0.78rem !important; padding: 2px 10px !important; }}
@@ -869,5 +877,14 @@ CUSTOM_CSS = f"""
         div[data-testid="stDialog"] div[role="dialog"] {{
             max-width: calc(100vw - 2rem) !important; width: calc(100vw - 2rem) !important; }}
     }}
+
+    /* ---------- Deadstock page: status chips ---------- */
+    .ipa-dead {{ display: inline-flex; align-items: center; gap: 6px; border-radius: 999px;
+        padding: 2px 10px; font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+        letter-spacing: 0.4px; margin-right: 4px; }}
+    .ipa-dead-candidate {{ background: #FBF0DC; color: {COLORS["amber"]}; }}
+    .ipa-dead-never {{ background: #EAEEF3; color: {COLORS["slate"]}; }}
+    .ipa-dead-review {{ background: #E5EDFD; color: {COLORS["blue"]}; }}
+    .ipa-dead-not {{ background: #E4F5EC; color: {COLORS["success"]}; }}
 </style>
 """

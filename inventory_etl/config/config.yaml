@@ -201,3 +201,19 @@ decisioning:
     apply_moq_before_pack_rounding: true
     require_integer_like_moq: true
     require_integer_like_pack_size: true
+
+# ---- Deadstock analysis (separate, on-demand inventory-inactivity scan) ----------------
+# A standalone diagnostic: which stock-carrying SKUs have positive current warehouse stock
+# but no recorded ECOMMERCE sale within a configurable inactivity window. It is INDEPENDENT
+# of demand forecasting, Top-N selection, stockout risk, reorder recommendations and forecast
+# run folders. It reads ONLY the real warehouse (latest inventory_snapshot + sales_transactions
+# + sku_master), never synthetic/forecast stock, and never writes anything.
+deadstock:
+  enabled: true
+  default_inactivity_days: 90     # dashboard default; user may override within the bounds below
+  minimum_interval_days: 1
+  maximum_interval_days: 365
+  minimum_stock_on_hand: 1        # a SKU is "stock-carrying" at or above this net current stock
+  exclude_dropship: true          # dropship SKUs are vendor-fulfilled, not own-warehouse deadstock
+  active_products_only: true      # only enabled catalog products (sku_master.status)
+  sales_scope: ecommerce          # uses pilot.ecommerce_channel_map channels (project convention)
