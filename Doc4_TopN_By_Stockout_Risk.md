@@ -67,18 +67,47 @@ products.
 ## 2. The ranking key
 
 ```
-stockout_probability DESC, expected_shortage_units DESC, sku ASC
+round(stockout_probability, 6) DESC, expected_shortage_units DESC, sku ASC
 ```
 
-The shortage tie-break is load-bearing, not cosmetic. Out-of-stock SKUs dominate the
-top of this ranking (945 of 2,289 eligible Groceries & Pets SKUs hold zero stock).
-Where demand varies their probabilities merely cluster very close together
-(0.9997 vs 0.9994), so probability still discriminates — but a SKU with perfectly
-flat demand has `lt_sigma == 0` and scores an **exact** 1.0, and those tie with each
-other. Breaking on expected shortage orders that block by the size of the exposure
-(out of stock **and** selling fastest first) instead of by SKU id.
+**The rounding is the important part**, and it was not obvious up front.
+
+Out-of-stock SKUs dominate the top of this ranking — 945 of 2,289 eligible
+Groceries & Pets SKUs hold zero stock — and their probabilities *saturate*. They are
+not exactly 1.0 (that only happens when demand is perfectly flat and `lt_sigma == 0`),
+but they agree to roughly 13 decimal places:
+
+```
+IC-1015335   P = 0.9999999999859499   exposure  48.25
+IC-1144527   P = 0.9999999998923177   exposure  47.75
+IC-1186715   P = 0.9999999981593075   exposure 139.25
+```
+
+Sorting the raw float made those digits decide the order. They are numerical noise
+from the far tail of the normal CDF, not a business distinction — every one means
+"certain to stock out". Worse, the noise is driven by the **coefficient of variation**
+(`z = −√L · mean/sigma`), so a *small steady* seller outranks a *large erratic* one.
+On real data IC-1186715, exposed for **139 units**, sat fourth behind SKUs exposed for
+47–63.
+
+Rounding to 6 decimals collapses the saturated block into a genuine tie, so
+`expected_shortage_units` orders it by the size of the exposure — out of stock **and**
+selling fastest first:
+
+```
+IC-1186715  139.25    IC-1177119   90.50    IC-1030208   89.75    IC-1200458  63.75
+```
+
+Probabilities that differ meaningfully still decide the order before exposure is
+consulted. Only the sort key is rounded; the reported `stockout_probability` keeps
+full precision.
 
 Unscored SKUs sort last and can never occupy a Top-N slot.
+
+> **Testing note.** The original test used flat demand, which produces exact 1.0 ties,
+> so it passed while the realistic case was broken. `test_saturated_probabilities_rank_by_exposure`
+> now covers varying demand — the case that actually occurs — and
+> `test_meaningful_probability_gap_still_beats_exposure` guards against over-rounding.
 
 ---
 

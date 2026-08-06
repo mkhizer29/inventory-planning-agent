@@ -85,6 +85,13 @@ SELECTION_RISK_COLUMNS = [
 RANK_COLUMNS = ["stockout_probability", "expected_shortage_units", "sku"]
 RANK_ASCENDING = [False, False, True]
 
+# Probabilities are quantised to this many decimals BEFORE sorting. Beyond ~6 decimals the
+# value is noise from the far tail of the normal CDF, not a business distinction: 0.99999999
+# and 0.999999998 both mean "certain to stock out". Sorting on the raw float let those digits
+# decide the order and pushed the largest exposures down the list. Only the sort key is
+# rounded — the reported stockout_probability keeps full precision.
+RANK_PROBABILITY_DECIMALS = 6
+
 _TIER_ORDER = ("critical", "high", "medium", "low", "unknown")
 
 
@@ -431,15 +438,21 @@ def score_stockout_risk(
 def rank_by_stockout_risk(scored: pd.DataFrame) -> pd.DataFrame:
     """Deterministic highest-risk-first order.
 
-    ``stockout_probability`` desc, then ``expected_shortage_units`` desc, then ``sku`` asc.
+    ``stockout_probability`` (quantised) desc, then ``expected_shortage_units`` desc, then
+    ``sku`` asc.
 
-    The shortage tie-break is load-bearing rather than cosmetic. Out-of-stock SKUs dominate
-    the top of this ranking (on the real warehouse, 945 of 2,289 eligible Groceries & Pets
-    SKUs hold zero stock). Where demand varies at all their probabilities are merely very
-    close, not equal — 0.9997 vs 0.9994 — so probability alone still discriminates. But a SKU
-    with a perfectly flat demand history has ``lt_sigma == 0`` and scores an EXACT 1.0, and
-    those tie with each other. Breaking on expected shortage orders that block by the size of
-    the exposure (out of stock AND selling fastest first) instead of by SKU id.
+    The quantisation is what makes this ranking useful. Out-of-stock SKUs dominate the top
+    (on the real warehouse, 945 of 2,289 eligible Groceries & Pets SKUs hold zero stock) and
+    their probabilities saturate: not exactly 1.0 unless demand is perfectly flat, but equal
+    to ~13 decimal places. Sorting the raw float therefore ordered the most urgent block by
+    numerical noise in the tail of the normal CDF. Worse, that noise is driven by the
+    coefficient of variation, so a small steady seller outranked a large erratic one — on real
+    data a SKU exposed for 139 units sat below SKUs exposed for 47.
+
+    Rounding to ``RANK_PROBABILITY_DECIMALS`` collapses the saturated block into a genuine
+    tie, so ``expected_shortage_units`` orders it by the size of the exposure — out of stock
+    AND selling fastest first. Probabilities that differ meaningfully still decide the order
+    before exposure is consulted.
 
     Unscored rows sort last and are never promoted into a Top-N.
     """
@@ -447,7 +460,8 @@ def rank_by_stockout_risk(scored: pd.DataFrame) -> pd.DataFrame:
         return scored.copy() if scored is not None else scored
     d = scored.copy()
     d["_scored"] = ~d["risk_scored"].astype(bool)           # False sorts first
-    d["_p"] = pd.to_numeric(d["stockout_probability"], errors="coerce")
+    d["_p"] = pd.to_numeric(d["stockout_probability"], errors="coerce").round(
+        RANK_PROBABILITY_DECIMALS)
     d["_s"] = pd.to_numeric(d["expected_shortage_units"], errors="coerce")
     d["_k"] = d["sku"].astype(str)
     d = d.sort_values(["_scored", "_p", "_s", "_k"],

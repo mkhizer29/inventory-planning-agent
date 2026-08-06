@@ -378,6 +378,73 @@ def test_rank_orders_by_probability_then_shortage(tmp_path):
     assert list(ranked["sku"]) == ["TIE-BIG", "TIE-SMALL", "SAFE"]
 
 
+def test_saturated_probabilities_rank_by_exposure(tmp_path):
+    """The realistic case, and the one that matters most in production.
+
+    Both SKUs are out of stock with VARYING demand, so neither probability is exactly 1.0 —
+    they differ only far out in the tail (~1e-13). Those digits are numerical noise, not a
+    business distinction: both mean "certain to stock out". STEADY has the higher raw
+    probability because its demand is less erratic, but ERRATIC is exposed for ~3x as many
+    units. Ranking must put the bigger exposure first.
+    """
+    skus = [{"sku_id": "STEADY-SMALL"}, {"sku_id": "ERRATIC-BIG"}]
+    small = [3, 5, 7, 7, 7, 9, 11] * 4                   # mean 7/day   -> lead-time 49
+    big = [8, 14, 20, 20, 20, 26, 32] * 4                # mean 20/day  -> lead-time 140
+    sales = []
+    for i, (q_s, q_b) in enumerate(zip(small, big)):
+        d = (pd.Timestamp(WINDOW_START) + pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+        sales.append({"sku_id": "STEADY-SMALL", "transaction_date": d, "quantity_sold": q_s})
+        sales.append({"sku_id": "ERRATIC-BIG", "transaction_date": d, "quantity_sold": q_b})
+    stock = [{"sku_id": "STEADY-SMALL", "stock_on_hand": 0},
+             {"sku_id": "ERRATIC-BIG", "stock_on_hand": 0}]
+    db = _make_db(tmp_path, skus, sales, stock)
+    out, _ = _score(db, _write_config(tmp_path), ["STEADY-SMALL", "ERRATIC-BIG"])
+
+    p_small = _row(out, "STEADY-SMALL")["stockout_probability"]
+    p_big = _row(out, "ERRATIC-BIG")["stockout_probability"]
+    s_small = _row(out, "STEADY-SMALL")["expected_shortage_units"]
+    s_big = _row(out, "ERRATIC-BIG")["expected_shortage_units"]
+
+    # preconditions: saturated but NOT exactly equal, and exposure strongly favours ERRATIC
+    assert p_small > p_big, "fixture invalid: STEADY should have the higher raw probability"
+    assert p_small != 1.0 and p_big != 1.0, "fixture invalid: neither should be an exact tie"
+    assert round(p_small, 6) == round(p_big, 6) == 1.0
+    assert s_big > 2 * s_small
+
+    ranked = sr.rank_by_stockout_risk(out)
+    assert list(ranked["sku"]) == ["ERRATIC-BIG", "STEADY-SMALL"]
+
+
+def test_meaningful_probability_gap_still_beats_exposure(tmp_path):
+    """Guard against over-rounding: when probabilities genuinely differ, probability wins
+    even if the lower-risk SKU carries the larger expected shortage."""
+    skus = [{"sku_id": "LIKELY"}, {"sku_id": "UNLIKELY"}]
+    small = [3, 5, 7, 7, 7, 9, 11] * 4                   # lead-time demand ~49
+    big = [8, 14, 20, 20, 20, 26, 32] * 4                # lead-time demand ~140
+    sales = []
+    for i, (q_s, q_b) in enumerate(zip(small, big)):
+        d = (pd.Timestamp(WINDOW_START) + pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+        sales.append({"sku_id": "LIKELY", "transaction_date": d, "quantity_sold": q_s})
+        sales.append({"sku_id": "UNLIKELY", "transaction_date": d, "quantity_sold": q_b})
+    stock = [{"sku_id": "LIKELY", "stock_on_hand": 45},      # just under its 49
+             {"sku_id": "UNLIKELY", "stock_on_hand": 145}]   # comfortably over its 140
+    db = _make_db(tmp_path, skus, sales, stock)
+    out, _ = _score(db, _write_config(tmp_path), ["LIKELY", "UNLIKELY"])
+
+    p_likely = _row(out, "LIKELY")["stockout_probability"]
+    p_unlikely = _row(out, "UNLIKELY")["stockout_probability"]
+    s_likely = _row(out, "LIKELY")["expected_shortage_units"]
+    s_unlikely = _row(out, "UNLIKELY")["expected_shortage_units"]
+
+    # preconditions: a real probability gap, with exposure pointing the OTHER way
+    assert round(p_likely, 6) != round(p_unlikely, 6)
+    assert p_likely > p_unlikely
+    assert s_unlikely > s_likely, "fixture invalid: exposure should favour UNLIKELY"
+
+    ranked = sr.rank_by_stockout_risk(out)
+    assert list(ranked["sku"]) == ["LIKELY", "UNLIKELY"]
+
+
 def test_unscored_rows_always_rank_last(tmp_path):
     skus = [{"sku_id": "GOOD"}, {"sku_id": "NOSTOCK"}]
     sales = _daily("GOOD", WINDOW_START, 28, 1) + _daily("NOSTOCK", WINDOW_START, 28, 50)
