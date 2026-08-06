@@ -5,8 +5,11 @@
 -- customer_id is hashed (SHA2-256) so repeat-purchase features are possible
 -- without exposing customer identity.
 --
--- Placeholder substituted by extract.py:
+-- Placeholders substituted by extract.py:
 --   {SINCE_FILTER}   e.g.  AND oi.created_at >= '2023-01-01'   or (empty)
+--   {PAGE_FILTER}    e.g.  AND oi.item_id > 100 AND oi.item_id <= 200   or (empty)
+--                    Set when the extract is read in primary-key ranges rather
+--                    than one streaming pass (see db.read_sql_key_ranges).
 
 SELECT
     oi.item_id                                         AS transaction_id,
@@ -36,4 +39,5 @@ FROM sales_order_item oi
 JOIN sales_order so ON so.entity_id = oi.order_id
 WHERE (oi.product_type IS NULL OR oi.product_type <> 'configurable')
 {SINCE_FILTER}
+{PAGE_FILTER}
 ;

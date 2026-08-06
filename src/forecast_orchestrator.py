@@ -126,7 +126,7 @@ def _valid_iso_date(s: str) -> str:
 
 def validate_request(*, category, top_n, as_of_date, selection_cutoff, min_history_days,
                      horizons, runs_dir, run_id, db_path, allow_partial_success,
-                     skip_models) -> dict:
+                     skip_models, start_date=None) -> dict:
     """Normalize + validate every input. Raises RequestError on any problem. No I/O side effects."""
     if not isinstance(category, str) or not category.strip():
         raise RequestError("category must be a non-blank string")
@@ -145,6 +145,17 @@ def validate_request(*, category, top_n, as_of_date, selection_cutoff, min_histo
         raise RequestError(f"selection_cutoff is not an ISO date: {selection_cutoff!r}")
     if datetime.strptime(cutoff, "%Y-%m-%d") > datetime.strptime(as_of, "%Y-%m-%d"):
         raise RequestError("selection_cutoff must not be after as_of_date")
+    # Optional hard lower bound on history. None = use everything the warehouse holds
+    # (the previous, unchanged behaviour). Passed straight to prepare_pilot_data's
+    # --start-date, which filters before any feature engineering.
+    start = None
+    if start_date not in (None, ""):
+        try:
+            start = _valid_iso_date(str(start_date))
+        except ValueError:
+            raise RequestError(f"start_date is not an ISO date: {start_date!r}")
+        if datetime.strptime(start, "%Y-%m-%d") > datetime.strptime(as_of, "%Y-%m-%d"):
+            raise RequestError("start_date must not be after as_of_date")
     if isinstance(min_history_days, bool) or not isinstance(min_history_days, int) or min_history_days < 1:
         raise RequestError("min_history_days must be an integer >= 1")
     horizons = tuple(int(h) for h in horizons)
@@ -173,6 +184,7 @@ def validate_request(*, category, top_n, as_of_date, selection_cutoff, min_histo
 
     return {
         "category": category.strip(), "top_n": top_n, "as_of_date": as_of,
+        "start_date": start,
         "selection_cutoff": cutoff, "min_history_days": min_history_days,
         "horizons": horizons, "runs_dir": runs_dir, "run_id": rid,
         "db_path": db, "allow_partial_success": bool(allow_partial_success),
@@ -268,6 +280,8 @@ def _prepare_data(req: dict, run_dir: Path, logger: logging.Logger) -> Path:
             "--output-dir", str(proc),
             "--as-of-date", req["as_of_date"],
             "--selection-cutoff", req["selection_cutoff"], "--strict"]
+    if req.get("start_date"):
+        argv += ["--start-date", req["start_date"]]
     rc = prep.main(argv)
     if rc != 0:
         raise RuntimeError(f"prepare_pilot_data failed (exit {rc})")
@@ -556,7 +570,8 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
                           horizons: tuple[int, ...] = (7, 14), runs_dir="runs",
                           run_id: str | None = None, db_path=None,
                           allow_partial_success: bool = False,
-                          skip_models: tuple[str, ...] = ()) -> dict:
+                          skip_models: tuple[str, ...] = (),
+                          start_date: str | None = None) -> dict:
     """Run the full pipeline. Returns the run manifest dict (status 'completed',
     'completed_with_warnings', or 'failed'). Raises RequestError ONLY for invalid
     requests before the run directory exists."""
@@ -564,7 +579,8 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
     req = validate_request(category=category, top_n=top_n, as_of_date=as_of_date,
                            selection_cutoff=selection_cutoff, min_history_days=min_history_days,
                            horizons=horizons, runs_dir=runs_dir, run_id=run_id, db_path=db_path,
-                           allow_partial_success=allow_partial_success, skip_models=skip_models)
+                           allow_partial_success=allow_partial_success, skip_models=skip_models,
+                           start_date=start_date)
     run_dir = _resolve_run_dir(req["runs_dir"], req["run_id"], explicit)
 
     # create the run tree only after validation passed
@@ -577,6 +593,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
     request_json = {
         "run_id": req["run_id"], "category": req["category"], "top_n": req["top_n"],
         "as_of_date": req["as_of_date"], "selection_cutoff": req["selection_cutoff"],
+        "start_date": req["start_date"],
         "min_history_days": req["min_history_days"], "horizons": list(req["horizons"]),
         "db_path": str(req["db_path"].resolve()), "requested_models": list(req["requested_models"]),
         "allow_partial_success": req["allow_partial_success"], "created_at": created_at,
@@ -794,6 +811,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--top-n", required=True, type=int)
     ap.add_argument("--as-of-date", required=True)
     ap.add_argument("--selection-cutoff", default=None)
+    ap.add_argument("--start-date", default=None,
+                    help="hard lower bound on history (YYYY-MM-DD). Default: all warehouse history.")
     ap.add_argument("--min-history-days", type=int, default=28)
     ap.add_argument("--horizons", nargs="+", type=int, choices=[7, 14], default=[7, 14])
     ap.add_argument("--runs-dir", default="runs")
@@ -809,6 +828,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         manifest = run_forecast_pipeline(
             category=args.category, top_n=args.top_n, as_of_date=args.as_of_date,
+            start_date=args.start_date,
             selection_cutoff=args.selection_cutoff, min_history_days=args.min_history_days,
             horizons=tuple(args.horizons), runs_dir=args.runs_dir, run_id=args.run_id,
             db_path=args.db_path, allow_partial_success=args.allow_partial_success,
