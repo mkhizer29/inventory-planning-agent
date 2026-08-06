@@ -3371,8 +3371,18 @@ def _render_active_run_status(run_id):
 
 @st.cache_data(show_spinner=False)
 def latest_sales_date_cached(db_mtime_ns):
-    """MAX(transaction_date) — cached per warehouse mtime (re-queried only after an ETL refresh)."""
+    """Latest FULL sales day — cached per warehouse mtime (re-queried only after an ETL refresh).
+
+    Not MAX(transaction_date): trailing part-extracted days are discounted, so the default
+    as-of date cannot land on a date with no real demand. See rs.get_latest_sales_date.
+    """
     return rs.get_latest_sales_date()
+
+
+@st.cache_data(show_spinner=False)
+def sales_date_diagnostics_cached(db_mtime_ns):
+    """Usable-window diagnostics so the UI can explain a discounted extract tail."""
+    return rs.sales_date_diagnostics()
 
 
 @st.cache_data(show_spinner="Reading warehouse categories…")
@@ -3391,6 +3401,22 @@ def page_forecast_runs():
 
     # ---- A. Generate Forecast ----------------------------------------------------------
     section_title("Generate Forecast", "Launch the Phase 4 orchestrator over the live warehouse.")
+    if db_ok:
+        _sd = sales_date_diagnostics_cached(db_mtime)
+        _ignored = _sd.get("ignored_dates") or []
+        if _ignored and _sd.get("usable_max"):
+            # Silently shifting the default as-of would be worse than explaining it: the
+            # discounted days are exactly the ones that make a run fail at model ranking.
+            _shown = ", ".join(d.strftime("%d %b") for d in _ignored[:6])
+            _more = f" (+{len(_ignored) - 6} more)" if len(_ignored) > 6 else ""
+            info_banner(
+                f"Sales run to <strong>{_sd['raw_max']:%d %b %Y}</strong>, but the last "
+                f"{len(_ignored)} day(s) — {_shown}{_more} — hold only a few stray rows against "
+                f"a median of <strong>{_sd['median_daily_units']:,.0f}</strong> units/day, so the "
+                f"extract looks incomplete there. As-of defaults to the last full day, "
+                f"<strong>{_sd['usable_max']:%d %b %Y}</strong>. Choosing a later date leaves the "
+                f"holdout window with no real demand, which fails model ranking.",
+                kind="warning")
     if not db_ok:
         empty_state("Warehouse unavailable",
                     "inventory_etl/output/inventory.db was not found — run the ETL first.", "database")
@@ -3419,6 +3445,15 @@ def page_forecast_runs():
         fd1, fd2 = st.columns(2)
         as_of = fd1.date_input("As-of date", value=latest or date.today(), key="run_as_of")
         cutoff = fd2.date_input("Selection cutoff", value=latest or date.today(), key="run_cutoff")
+        rank_by = st.radio(
+            "Rank Top N by",
+            options=list(rs.SUPPORTED_RANKING_METRICS),
+            format_func=rs.ranking_metric_label,
+            horizontal=True, key="run_ranking_metric",
+            help="Units sold ranks by historical ecommerce volume using pre-cutoff sales only. "
+                 "Stockout risk ranks by a pre-forecast risk estimate — lead-time demand from "
+                 "the trailing sales window against current warehouse stock — so the run "
+                 "forecasts the products most likely to run out rather than the best sellers.")
         hz = st.multiselect("Forecast horizons", options=[7, 14], default=[7, 14], key="run_horizons")
         allow_partial = st.checkbox("Allow partial success", value=False, key="run_allow_partial")
 
@@ -3426,9 +3461,21 @@ def page_forecast_runs():
         elig = int(meta["eligible_sku_count"]) if meta is not None else 0
         info_banner(
             f"<strong>{elig}</strong> eligible products in <strong>{run_cat}</strong> · requested "
-            f"<strong>{int(top_n)}</strong> · as-of <strong>{as_of}</strong> · models: Baselines, "
+            f"<strong>{int(top_n)}</strong> ranked by <strong>{rs.ranking_metric_label(rank_by)}</strong> "
+            f"· as-of <strong>{as_of}</strong> · models: Baselines, "
             "Holt-Winters, LightGBM. Fewer than Top N may be selected if eligible history is limited.",
             kind="info")
+        if rank_by == rs.METRIC_STOCKOUT_RISK:
+            # The proxy only ORDERS candidates; Phase B computes the authoritative risk after
+            # the forecast. Saying so here stops the two numbers reading as a contradiction.
+            info_banner(
+                "Ranking uses a <strong>pre-forecast risk proxy</strong>: a flat demand forecast "
+                "from the trailing sales window against the latest warehouse stock snapshot. "
+                "Because that snapshot is not tied to the selection cutoff, selection can be "
+                "influenced by stock recorded after it — the run records the snapshot date. "
+                "Phase B still computes the authoritative per-product risk once the models have "
+                "run, so a product's final tier may differ from the tier that selected it.",
+                kind="warning")
 
         session_active = st.session_state.get("active_run_id")
         active_nonterminal = False
@@ -3444,7 +3491,8 @@ def page_forecast_runs():
                 info = rs.launch_forecast_run(
                     category=run_cat, top_n=int(top_n), as_of_date=as_of.isoformat(),
                     selection_cutoff=cutoff.isoformat(), min_history_days=int(mhd),
-                    horizons=tuple(hz) or (7, 14), allow_partial_success=bool(allow_partial))
+                    horizons=tuple(hz) or (7, 14), allow_partial_success=bool(allow_partial),
+                    ranking_metric=rank_by)
                 st.session_state["active_run_id"] = info["run_id"]
                 st.session_state["active_run_pid"] = info["pid"]
                 st.session_state["run_launch_time"] = info["launched_at"]
@@ -3488,6 +3536,7 @@ def page_forecast_runs():
         rows.append({
             "Status": r.get("status"), "Created": rs.format_local_datetime(r.get("created_at")),
             "Category": r.get("category"), "Top N": r.get("top_n"),
+            "Ranked by": rs.ranking_metric_label(r.get("ranking_metric")),
             "SKUs": r.get("selected_sku_count"), "As-of": r.get("as_of_date"),
             "7-day winner": w.get("7"), "14-day winner": w.get("14"),
             "Operational": r.get("operational_model"),

@@ -8,6 +8,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -231,6 +232,125 @@ def test_19_command_uses_repo_paths():
     c = _cmd(runs_dir="runs", db_path="inventory_etl/output/inventory.db")
     assert c[c.index("--runs-dir") + 1] == "runs"
     assert c[c.index("--db-path") + 1] == "inventory_etl/output/inventory.db"
+
+
+# ── ranking metric (Top-N by units sold vs by stockout risk) ─────────────────────────────
+def test_19a_command_defaults_to_units():
+    c = _cmd()
+    assert c[c.index("--ranking-metric") + 1] == rs.METRIC_UNITS
+
+
+def test_19b_command_carries_stockout_risk():
+    c = _cmd(ranking_metric=rs.METRIC_STOCKOUT_RISK)
+    assert c[c.index("--ranking-metric") + 1] == "stockout_risk"
+
+
+def test_19c_launch_rejects_unknown_metric(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="ranking_metric"):
+        _launch(tmp_path, monkeypatch, ranking_metric="whatever")
+
+
+def test_19d_launch_forwards_metric(tmp_path, monkeypatch):
+    _launch(tmp_path, monkeypatch, ranking_metric=rs.METRIC_STOCKOUT_RISK)
+    cmd = _FakePopen.last["cmd"]
+    assert cmd[cmd.index("--ranking-metric") + 1] == "stockout_risk"
+
+
+def test_19e_metric_labels_cover_every_supported_metric():
+    assert all(rs.ranking_metric_label(m) for m in rs.SUPPORTED_RANKING_METRICS)
+    assert rs.ranking_metric_label(rs.METRIC_STOCKOUT_RISK) == "Stockout risk"
+
+
+def test_19f_legacy_run_without_metric_reads_as_units(tmp_path):
+    """Runs created before this feature have no ranking_metric — they were units-ranked."""
+    run = tmp_path / "runs" / "old_run"
+    run.mkdir(parents=True)
+    (run / "request.json").write_text(json.dumps(
+        {"category": "Groceries", "top_n": 5, "as_of_date": "2026-06-30"}), encoding="utf-8")
+    (run / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    rec = rs.discover_runs(tmp_path / "runs")[0]
+    assert rec["ranking_metric"] == rs.METRIC_UNITS
+    assert rs.is_risk_ranked(rec) is False
+    assert rs.RISK_RANKED_SYMBOL not in rs.format_run_label_short(rec)
+
+
+def test_19g_risk_ranked_run_is_marked_in_labels(tmp_path):
+    run = tmp_path / "runs" / "risk_run"
+    run.mkdir(parents=True)
+    (run / "request.json").write_text(json.dumps(
+        {"category": "Groceries", "top_n": 5, "as_of_date": "2026-06-30",
+         "ranking_metric": "stockout_risk"}), encoding="utf-8")
+    (run / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    rec = rs.discover_runs(tmp_path / "runs")[0]
+    assert rs.is_risk_ranked(rec) is True
+    assert rs.RISK_RANKED_SYMBOL in rs.format_run_label_short(rec)
+    assert "by stockout risk" in rs.format_run_label_full(rec)
+
+
+# ── trailing extract-tail guard on the default as-of date ────────────────────────────────
+def _volume_db(path: Path, days: "list[tuple[str, float]]"):
+    """A warehouse whose daily totals are exactly `days` [(date, units), ...]."""
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE sales_transactions (sku_id TEXT, transaction_date TEXT, "
+                "quantity_sold REAL)")
+    con.executemany("INSERT INTO sales_transactions VALUES (?,?,?)",
+                    [("A", d, u) for d, u in days])
+    con.commit(); con.close()
+
+
+def test_19h_tail_of_stray_rows_is_discounted(tmp_path):
+    """The real failure mode: extract stops mid-day, leaving days with a couple of units."""
+    db = tmp_path / "tail.db"
+    _volume_db(db, [(f"2026-07-{d:02d}", 12000.0) for d in range(1, 24)]
+               + [("2026-07-24", 162.0), ("2026-07-28", 3.0), ("2026-07-31", 2.0)])
+    diag = rs.sales_date_diagnostics(db)
+    assert diag["raw_max"] == date(2026, 7, 31)
+    assert diag["usable_max"] == date(2026, 7, 23)          # last full trading day
+    assert rs.get_latest_sales_date(db) == date(2026, 7, 23)
+    assert [d.isoformat() for d in diag["ignored_dates"]] == \
+        ["2026-07-24", "2026-07-28", "2026-07-31"]
+
+
+def test_19i_clean_warehouse_is_unchanged(tmp_path):
+    """No tail -> the guard must be a no-op and still return the true maximum."""
+    db = tmp_path / "clean.db"
+    _volume_db(db, [(f"2026-07-{d:02d}", 12000.0) for d in range(1, 25)])
+    assert rs.get_latest_sales_date(db) == date(2026, 7, 24)
+    assert rs.sales_date_diagnostics(db)["ignored_dates"] == []
+
+
+def test_19j_low_volume_warehouse_not_penalised(tmp_path):
+    """A genuinely tiny warehouse must not have its newest day discounted — the floor of
+    1 unit exists so the guard only ever removes a near-empty tail."""
+    db = tmp_path / "small.db"
+    _volume_db(db, [("2026-07-01", 3.0), ("2026-07-02", 1.0), ("2026-07-03", 2.0)])
+    assert rs.get_latest_sales_date(db) == date(2026, 7, 3)
+    assert rs.sales_date_diagnostics(db)["ignored_dates"] == []
+
+
+def test_19k_uneven_but_real_days_survive(tmp_path):
+    """Ordinary weekday/weekend swings are not an extract tail."""
+    db = tmp_path / "uneven.db"
+    _volume_db(db, [("2026-07-01", 12000.0), ("2026-07-02", 15000.0),
+                    ("2026-07-03", 9000.0), ("2026-07-04", 6000.0)])
+    assert rs.get_latest_sales_date(db) == date(2026, 7, 4)
+
+
+def test_19l_diagnostics_safe_on_missing_and_empty_db(tmp_path):
+    assert rs.get_latest_sales_date(tmp_path / "nope.db") is None
+    assert rs.sales_date_diagnostics(tmp_path / "nope.db")["usable_max"] is None
+    empty = tmp_path / "empty.db"
+    _volume_db(empty, [])
+    assert rs.get_latest_sales_date(empty) is None
+
+
+def test_19m_guard_never_writes(tmp_path):
+    db = tmp_path / "ro.db"
+    _volume_db(db, [("2026-07-01", 5000.0), ("2026-07-02", 2.0)])
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    rs.get_latest_sales_date(db)
+    rs.sales_date_diagnostics(db)
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
 # ── 20-24 launch ─────────────────────────────────────────────────────────────────────────

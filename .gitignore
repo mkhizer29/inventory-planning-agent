@@ -41,3 +41,6 @@ outputs/*
 
 # Phase 4 orchestrator run directories (isolated per-run artifacts)
 runs/
+
+# local process logs (streamlit / etl / orchestrator launches) — never shared
+*.log

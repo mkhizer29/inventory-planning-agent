@@ -43,6 +43,15 @@ DEFAULT_DB_PATH = REPO_ROOT / "inventory_etl" / "output" / "inventory.db"
 ORCHESTRATOR_PATH = REPO_ROOT / "src" / "forecast_orchestrator.py"
 LAUNCHER_LOG_DIRNAME = ".launcher_logs"
 
+# Top-N ranking metrics, mirrored from src/dynamic_selection so the UI never invents a value.
+METRIC_UNITS = "units"
+METRIC_STOCKOUT_RISK = "stockout_risk"
+SUPPORTED_RANKING_METRICS = (METRIC_UNITS, METRIC_STOCKOUT_RISK)
+RANKING_METRIC_LABELS = {
+    METRIC_UNITS: "Units sold",
+    METRIC_STOCKOUT_RISK: "Stockout risk",
+}
+
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 TERMINAL_STATES = {"completed", "completed_with_warnings", "failed"}
 RUNNING_STATES = {"created", "selecting_skus", "preparing_data", "running_baseline",
@@ -144,6 +153,12 @@ def _run_record(run_dir: Path) -> dict:
         "duration_seconds": manifest.get("duration_seconds"),
         "error_message": status.get("error_message"),
         "decisioning_status": manifest.get("decisioning_status"),
+        # How the Top-N was chosen. Runs created before this feature have no field, and
+        # they were all units-ranked, so that is the correct default for them.
+        "ranking_metric": (request.get("ranking_metric")
+                           or manifest.get("request", {}).get("ranking_metric")
+                           or METRIC_UNITS),
+        "selection": manifest.get("selection") or {},
     }
     rec["is_terminal"] = state in TERMINAL_STATES
     rec["is_completed"] = state in ("completed", "completed_with_warnings")
@@ -252,23 +267,92 @@ def legacy_context() -> dict:
 
 
 # ── warehouse reads (read-only) ─────────────────────────────────────────────────────────
-def get_latest_sales_date(db_path: "str | Path" = DEFAULT_DB_PATH) -> "date | None":
-    """Maximum sales_transactions.transaction_date, read-only. None on any problem."""
+DEFAULT_MIN_SHARE_OF_MEDIAN_DAILY_UNITS = 0.10
+
+
+def _min_share_of_median_daily_units() -> float:
+    """Configured extract-tail threshold; falls back to the module default on any problem."""
+    try:
+        import yaml                                        # noqa: PLC0415 - optional at import time
+        cfg = yaml.safe_load(
+            (REPO_ROOT / "inventory_etl" / "config" / "config.yaml").read_text(encoding="utf-8")) or {}
+        share = float((cfg.get("sales_calendar") or {})
+                      .get("min_share_of_median_daily_units",
+                           DEFAULT_MIN_SHARE_OF_MEDIAN_DAILY_UNITS))
+        return share if 0.0 <= share < 1.0 else DEFAULT_MIN_SHARE_OF_MEDIAN_DAILY_UNITS
+    except Exception:
+        return DEFAULT_MIN_SHARE_OF_MEDIAN_DAILY_UNITS
+
+
+def _daily_totals(db_path: "str | Path") -> "list[tuple[str, float]]":
+    """[(date, total units)] ascending, read-only. Empty list on any problem."""
     db_path = Path(db_path)
     if not db_path.exists():
-        return None
+        return []
     con = None
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        row = con.execute("SELECT MAX(transaction_date) FROM sales_transactions").fetchone()
-        if not row or not row[0]:
-            return None
-        return datetime.strptime(str(row[0])[:10], "%Y-%m-%d").date()
+        rows = con.execute(
+            "SELECT transaction_date, COALESCE(SUM(quantity_sold), 0) FROM sales_transactions "
+            "WHERE transaction_date IS NOT NULL GROUP BY transaction_date "
+            "ORDER BY transaction_date").fetchall()
+        return [(str(d)[:10], float(u or 0.0)) for d, u in rows if d]
     except Exception:
-        return None
+        return []
     finally:
         if con is not None:
             con.close()
+
+
+def sales_date_diagnostics(db_path: "str | Path" = DEFAULT_DB_PATH) -> dict:
+    """Describe the usable sales window and any trailing extract tail that was discounted.
+
+    Keys: ``raw_max`` (plain MAX(transaction_date)), ``usable_max`` (latest day with a
+    plausible full day of demand), ``ignored_dates``, ``median_daily_units``, ``threshold``.
+    All dates are ``datetime.date`` or None. Never raises.
+    """
+    empty = {"raw_max": None, "usable_max": None, "ignored_dates": [],
+             "median_daily_units": None, "threshold": None}
+    totals = _daily_totals(db_path)
+    if not totals:
+        return empty
+
+    def _d(s):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    units = sorted(u for _, u in totals)
+    n = len(units)
+    median = units[n // 2] if n % 2 else (units[n // 2 - 1] + units[n // 2]) / 2.0
+    # Floor of 1 unit keeps tiny fixtures and genuinely low-volume warehouses intact:
+    # the guard should only ever discount a near-empty tail, never a real trading day.
+    threshold = max(1.0, _min_share_of_median_daily_units() * median)
+
+    raw_max = _d(totals[-1][0])
+    usable_max, ignored = None, []
+    for d, u in reversed(totals):                          # walk back from the newest day
+        if u >= threshold:
+            usable_max = _d(d)
+            break
+        ignored.append(_d(d))
+    return {"raw_max": raw_max, "usable_max": usable_max,
+            "ignored_dates": [d for d in reversed(ignored) if d is not None],
+            "median_daily_units": float(median), "threshold": float(threshold)}
+
+
+def get_latest_sales_date(db_path: "str | Path" = DEFAULT_DB_PATH) -> "date | None":
+    """Latest transaction_date carrying a plausible full day of sales. None on any problem.
+
+    NOT a plain MAX(transaction_date): a partially-extracted warehouse leaves trailing dates
+    holding a few stray rows, and defaulting the as-of date onto one of those produces a
+    locked-holdout window with zero actual demand — an undefined WAPE, and a run that fails
+    at model ranking. Trailing days below ``sales_calendar.min_share_of_median_daily_units``
+    of the median daily volume are treated as extract tail. Use
+    :func:`sales_date_diagnostics` to show what was discounted and why.
+    """
+    return sales_date_diagnostics(db_path)["usable_max"]
 
 
 def list_categories(db_path: "str | Path" = DEFAULT_DB_PATH, selection_cutoff=None,
@@ -285,7 +369,8 @@ def list_categories(db_path: "str | Path" = DEFAULT_DB_PATH, selection_cutoff=No
 # ── command building + launch ───────────────────────────────────────────────────────────
 def build_orchestrator_command(*, category, top_n, as_of_date, selection_cutoff,
                                min_history_days, horizons, runs_dir, run_id, db_path,
-                               allow_partial_success: bool = False) -> list[str]:
+                               allow_partial_success: bool = False,
+                               ranking_metric: str = METRIC_UNITS) -> list[str]:
     """A safe argv (list) for the orchestrator. Always begins with the active interpreter
     and the orchestrator script; never a shell string; user input only as list elements."""
     cmd = [
@@ -299,15 +384,19 @@ def build_orchestrator_command(*, category, top_n, as_of_date, selection_cutoff,
         "--runs-dir", str(runs_dir),
         "--run-id", str(run_id),
         "--db-path", str(db_path),
+        "--ranking-metric", str(ranking_metric),
     ]
     if allow_partial_success:
         cmd.append("--allow-partial-success")
     return cmd
 
 
-def _validate_launch_inputs(category, top_n, as_of_date, selection_cutoff, min_history_days, horizons):
+def _validate_launch_inputs(category, top_n, as_of_date, selection_cutoff, min_history_days,
+                            horizons, ranking_metric=METRIC_UNITS):
     if not isinstance(category, str) or not category.strip():
         raise ValueError("category must be a non-blank string")
+    if ranking_metric not in SUPPORTED_RANKING_METRICS:
+        raise ValueError(f"ranking_metric must be one of {SUPPORTED_RANKING_METRICS}")
     if isinstance(top_n, bool) or not isinstance(top_n, int) or not (1 <= top_n <= 100):
         raise ValueError("top_n must be an integer in 1..100")
     a = datetime.strptime(str(as_of_date), "%Y-%m-%d").date()
@@ -319,17 +408,19 @@ def _validate_launch_inputs(category, top_n, as_of_date, selection_cutoff, min_h
     hz = tuple(int(h) for h in horizons)
     if not hz or any(h not in (7, 14) for h in hz):
         raise ValueError("horizons must be a non-empty subset of {7, 14}")
-    return a.isoformat(), c.isoformat(), tuple(sorted(set(hz)))
+    return a.isoformat(), c.isoformat(), tuple(sorted(set(hz))), str(ranking_metric)
 
 
 def launch_forecast_run(*, category, top_n, as_of_date, selection_cutoff=None,
                         min_history_days=28, horizons=(7, 14), runs_dir=DEFAULT_RUNS_DIR,
                         run_id=None, db_path=DEFAULT_DB_PATH,
-                        allow_partial_success: bool = False) -> dict:
+                        allow_partial_success: bool = False,
+                        ranking_metric: str = METRIC_UNITS) -> dict:
     """Validate inputs and launch the orchestrator as a non-blocking subprocess (shell=False).
     Returns run_id/pid/command/launched_at/expected_run_dir. Does NOT create the run dir."""
-    as_of, cutoff, hz = _validate_launch_inputs(
-        category, top_n, as_of_date, selection_cutoff, min_history_days, horizons)
+    as_of, cutoff, hz, metric = _validate_launch_inputs(
+        category, top_n, as_of_date, selection_cutoff, min_history_days, horizons,
+        ranking_metric)
     runs_dir = Path(runs_dir)
     db_path = Path(db_path)
     if not db_path.exists():
@@ -344,7 +435,8 @@ def launch_forecast_run(*, category, top_n, as_of_date, selection_cutoff=None,
     cmd = build_orchestrator_command(
         category=category, top_n=top_n, as_of_date=as_of, selection_cutoff=cutoff,
         min_history_days=min_history_days, horizons=hz, runs_dir=runs_dir, run_id=rid,
-        db_path=db_path, allow_partial_success=allow_partial_success)
+        db_path=db_path, allow_partial_success=allow_partial_success,
+        ranking_metric=metric)
     if cmd[0] != sys.executable:                                # never an arbitrary executable
         raise ValueError("refusing to launch: interpreter is not sys.executable")
 
@@ -529,16 +621,31 @@ def format_local_datetime(value, *, include_date: bool = True, include_time: boo
 
 
 STATUS_SYMBOLS = {"completed": "✓", "completed_with_warnings": "⚠", "failed": "✕"}
+# Marks a Top-N chosen by stockout risk. Units-ranked runs stay unmarked so the hundreds of
+# pre-existing runs read exactly as they always did.
+RISK_RANKED_SYMBOL = "⚡"
+
+
+def ranking_metric_label(metric) -> str:
+    """Human label for a ranking metric; unknown/missing reads as the units default."""
+    return RANKING_METRIC_LABELS.get(str(metric or METRIC_UNITS), str(metric))
+
+
+def is_risk_ranked(record: dict) -> bool:
+    return str((record or {}).get("ranking_metric") or METRIC_UNITS) == METRIC_STOCKOUT_RISK
 
 
 def format_run_label_full(record: dict) -> str:
     """Complete label for tooltips / detail panels:
-    '29 Jul 2026 · 11:03 AM PKT · Groceries & Pets · Top 10 · completed'."""
+    '29 Jul 2026 · 11:03 AM PKT · Groceries & Pets · Top 10 by stockout risk · completed'."""
     when = format_local_datetime(record.get("created_at"))
     if when == "—":
         when = str(record.get("created_at") or "?")
     cat = record.get("category") or "?"
-    return f"{when} · {cat} · Top {record.get('top_n')} · {record.get('status')}"
+    top = f"Top {record.get('top_n')}"
+    if is_risk_ranked(record):
+        top += " by stockout risk"
+    return f"{when} · {cat} · {top} · {record.get('status')}"
 
 
 def format_run_label_short(record: dict, *, disambiguate: bool = False) -> str:
@@ -553,7 +660,10 @@ def format_run_label_short(record: dict, *, disambiguate: bool = False) -> str:
                                  include_timezone=False)
     day = "?" if when == "—" else when[:6].strip()          # '29 Jul 2026' -> '29 Jul'
     cat = record.get("category") or "?"
-    parts = [day, str(cat), f"Top {record.get('top_n')}"]
+    top = f"Top {record.get('top_n')}"
+    if is_risk_ranked(record):
+        top = f"{top} {RISK_RANKED_SYMBOL}"
+    parts = [day, str(cat), top]
     sym = STATUS_SYMBOLS.get(str(record.get("status")))
     if sym:
         parts.append(sym)

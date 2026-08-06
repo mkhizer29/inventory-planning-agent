@@ -202,6 +202,43 @@ decisioning:
     require_integer_like_moq: true
     require_integer_like_pack_size: true
 
+# ---- Trailing extract-tail guard (dashboard default as-of date) -------------------------
+# The warehouse extract can stop part-way through a day, leaving trailing dates that hold a
+# handful of stray rows — e.g. 2 units on a day where normal volume is ~12,000. Plain
+# MAX(transaction_date) then points at a date with effectively no demand. Any forecast run
+# whose locked-holdout window lands in that tail gets an undefined WAPE (its denominator is
+# total actual units, which is zero) and fails with "no finite-WAPE ranking candidate".
+# A trailing day counts as extract tail rather than a real trading day when its total units
+# fall below this share of the median daily volume.
+sales_calendar:
+  min_share_of_median_daily_units: 0.10
+
+# ---- Pre-forecast stockout-risk proxy for Top-N selection (src/selection_risk.py) -------
+# Lets a forecast run rank its Top-N by STOCKOUT RISK instead of units sold. The real risk
+# (Phase B) is forecast-driven and therefore only exists AFTER selection, so selection uses a
+# proxy: a flat demand forecast (trailing-window mean/std of real ecommerce units) against the
+# warehouse stock snapshot, run through the same lead-time arithmetic as Phase B. The proxy
+# only ORDERS candidates; Phase B still computes the authoritative per-SKU risk afterwards and
+# the two can legitimately disagree.
+selection_risk:
+  enabled: true
+  demand_window_days: 28          # trailing calendar days ending at selection_cutoff (>= 2).
+                                  # Days with no sale count as zero demand, so the mean divides
+                                  # by the window, not by active days.
+  # Which inventory snapshot supplies stock. The warehouse holds ONE snapshot and no stock
+  # history, so a SKU's stock on an arbitrary cutoff cannot be reconstructed.
+  #   latest              -> newest snapshot, even if it POSTDATES selection_cutoff. This lets
+  #                          post-cutoff information influence which SKUs are selected; it is
+  #                          recorded per run (stock_snapshot_date / stock_is_post_cutoff).
+  #   on_or_before_cutoff -> strict as-of purity; yields NO rows when every snapshot is newer.
+  stock_snapshot_policy: latest
+  # Already-out-of-stock SKUs (stock 0) all score P(stockout) = 1.0. Keeping them means the
+  # Top-N leads with items that are out AND selling fastest (the shortage tie-break orders
+  # them); excluding them scopes the feature to "about to run out" only.
+  include_zero_stock: true
+  exclude_dropship: false         # dropship items are vendor-fulfilled, but a stockout is
+                                  # still a stockout to the customer — kept in by default
+
 # ---- Deadstock analysis (separate, on-demand inventory-inactivity scan) ----------------
 # A standalone diagnostic: which stock-carrying SKUs have positive current warehouse stock
 # but no recorded ECOMMERCE sale within a configurable inactivity window. It is INDEPENDENT

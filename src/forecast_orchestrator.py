@@ -126,7 +126,8 @@ def _valid_iso_date(s: str) -> str:
 
 def validate_request(*, category, top_n, as_of_date, selection_cutoff, min_history_days,
                      horizons, runs_dir, run_id, db_path, allow_partial_success,
-                     skip_models, start_date=None) -> dict:
+                     skip_models, start_date=None,
+                     ranking_metric=dsel.METRIC_UNITS) -> dict:
     """Normalize + validate every input. Raises RequestError on any problem. No I/O side effects."""
     if not isinstance(category, str) or not category.strip():
         raise RequestError("category must be a non-blank string")
@@ -170,6 +171,11 @@ def validate_request(*, category, top_n, as_of_date, selection_cutoff, min_histo
     if not requested_models:
         raise RequestError("no models requested (all models skipped)")
 
+    metric = str(ranking_metric or dsel.METRIC_UNITS).strip()
+    if metric not in dsel.SUPPORTED_RANKING_METRICS:
+        raise RequestError(
+            f"ranking_metric must be one of {dsel.SUPPORTED_RANKING_METRICS}, got {ranking_metric!r}")
+
     db = Path(db_path) if db_path else DEFAULT_DB
     if not db.exists():
         raise RequestError(f"database not found: {db}")
@@ -189,6 +195,7 @@ def validate_request(*, category, top_n, as_of_date, selection_cutoff, min_histo
         "horizons": horizons, "runs_dir": runs_dir, "run_id": rid,
         "db_path": db, "allow_partial_success": bool(allow_partial_success),
         "skip_models": skip_models, "requested_models": requested_models,
+        "ranking_metric": metric,
     }
 
 
@@ -249,10 +256,11 @@ def _make_logger(run_id: str, log_path: Path) -> tuple[logging.Logger, logging.H
 
 
 # ── selection / preparation ────────────────────────────────────────────────────────────
-def _select_skus(req: dict, run_dir: Path, logger: logging.Logger) -> tuple[pd.DataFrame, list[str]]:
-    df, warnings = dsel.select_top_skus(
+def _select_skus(req: dict, run_dir: Path, logger: logging.Logger) -> tuple[pd.DataFrame, list[str], dict]:
+    df, warnings, meta = dsel.select_top_skus_detailed(
         db_path=req["db_path"], category=req["category"], top_n=req["top_n"],
-        selection_cutoff=req["selection_cutoff"], min_history_days=req["min_history_days"])
+        selection_cutoff=req["selection_cutoff"], min_history_days=req["min_history_days"],
+        ranking_metric=req.get("ranking_metric", dsel.METRIC_UNITS))
     if df is None or len(df) == 0:
         raise RuntimeError("dynamic selection returned no SKUs")
     skus = df["sku"].astype(str).tolist()
@@ -267,10 +275,16 @@ def _select_skus(req: dict, run_dir: Path, logger: logging.Logger) -> tuple[pd.D
     mc.write_dataframe_atomic(df, sku_csv, "csv")
     if not sku_csv.exists():
         raise RuntimeError("selected_skus.csv was not written")
-    logger.info("selected %d SKUs (requested %d): %s", len(df), req["top_n"], ", ".join(skus))
+    logger.info("selected %d SKUs (requested %d, ranked by %s): %s",
+                len(df), req["top_n"], meta.get("ranking_metric"), ", ".join(skus))
+    if meta.get("stock_is_post_cutoff"):
+        # Loud on purpose: the SKU set was chosen using inventory state from after the
+        # cutoff, so a backtest reviewer must be able to see it in the run log.
+        logger.warning("selection used POST-CUTOFF stock snapshot %s (cutoff %s)",
+                       meta.get("stock_snapshot_date"), req["selection_cutoff"])
     for w in warnings:
         logger.info("selection warning: %s", w)
-    return df, list(warnings)
+    return df, list(warnings), meta
 
 
 def _prepare_data(req: dict, run_dir: Path, logger: logging.Logger) -> Path:
@@ -571,7 +585,8 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
                           run_id: str | None = None, db_path=None,
                           allow_partial_success: bool = False,
                           skip_models: tuple[str, ...] = (),
-                          start_date: str | None = None) -> dict:
+                          start_date: str | None = None,
+                          ranking_metric: str = dsel.METRIC_UNITS) -> dict:
     """Run the full pipeline. Returns the run manifest dict (status 'completed',
     'completed_with_warnings', or 'failed'). Raises RequestError ONLY for invalid
     requests before the run directory exists."""
@@ -580,7 +595,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
                            selection_cutoff=selection_cutoff, min_history_days=min_history_days,
                            horizons=horizons, runs_dir=runs_dir, run_id=run_id, db_path=db_path,
                            allow_partial_success=allow_partial_success, skip_models=skip_models,
-                           start_date=start_date)
+                           start_date=start_date, ranking_metric=ranking_metric)
     run_dir = _resolve_run_dir(req["runs_dir"], req["run_id"], explicit)
 
     # create the run tree only after validation passed
@@ -597,6 +612,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
         "min_history_days": req["min_history_days"], "horizons": list(req["horizons"]),
         "db_path": str(req["db_path"].resolve()), "requested_models": list(req["requested_models"]),
         "allow_partial_success": req["allow_partial_success"], "created_at": created_at,
+        "ranking_metric": req["ranking_metric"],
     }
     mc.write_json_atomic(request_json, run_dir / "request.json")
     status = _init_status(req["run_id"], created_at)
@@ -607,6 +623,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
 
     errors: list[str] = []
     selection_warning = None
+    selection_meta: dict = {"ranking_metric": req["ranking_metric"]}
     completed: list[str] = []
     failed: list[str] = []
     combined = ranking = None
@@ -625,12 +642,13 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
         return _finalize(run_dir, req, request_json, created_at, "failed", status,
                          sel_df, selection_warning, completed, failed, req["skip_models"],
                          combined, ranking, op_meta, errors, logger, handler,
+                         selection_meta=selection_meta,
                          decision_summary=decision_summary, reorder_summary=reorder_summary)
 
     try:
         # 1) selection
         _set_step(run_dir, status, "selecting_skus", logger)
-        sel_df, sel_warns = _select_skus(req, run_dir, logger)
+        sel_df, sel_warns, selection_meta = _select_skus(req, run_dir, logger)
         if len(sel_df) < req["top_n"]:
             selection_warning = (f"requested_top_n={req['top_n']} but only "
                                  f"{len(sel_df)} eligible SKUs were selected")
@@ -717,6 +735,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
         return _finalize(run_dir, req, request_json, created_at, final_status, status,
                          sel_df, selection_warning, completed, failed, req["skip_models"],
                          combined, ranking, op_meta, errors, logger, handler,
+                         selection_meta=selection_meta,
                          fingerprint=fingerprint, decision_summary=decision_summary,
                          reorder_summary=reorder_summary)
     except RequestError:
@@ -728,7 +747,7 @@ def run_forecast_pipeline(*, category: str, top_n: int, as_of_date: str,
 def _finalize(run_dir, req, request_json, created_at, final_status, status, sel_df,
               selection_warning, completed, failed, skipped, combined, ranking, op_meta,
               errors, logger, handler, fingerprint=None, decision_summary=None,
-              reorder_summary=None) -> dict:
+              reorder_summary=None, selection_meta=None) -> dict:
     # success/failure timestamp semantics (mirror status.json): completed_at is set only on
     # success and null on failure; failed_at is set only on failure and null on success.
     end_ts = _now()
@@ -752,6 +771,9 @@ def _finalize(run_dir, req, request_json, created_at, final_status, status, sel_
         "selected_sku_count": (0 if sel_df is None else int(len(sel_df))),
         "selected_skus": ([] if sel_df is None else sel_df["sku"].astype(str).tolist()),
         "selection_warning": selection_warning,
+        # How the Top-N was chosen. For stockout_risk this also records the stock snapshot
+        # used and whether it postdated the cutoff, so the SKU set stays auditable.
+        "selection": dict(selection_meta or {"ranking_metric": req.get("ranking_metric")}),
         "processed_files": processed_files,
         "completed_models": completed, "failed_models": failed, "skipped_models": list(skipped),
         "dataset_fingerprint": fingerprint,
@@ -820,6 +842,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--db-path", default=None)
     ap.add_argument("--allow-partial-success", action="store_true")
     ap.add_argument("--skip-model", action="append", choices=list(MODEL_ORDER), default=[])
+    ap.add_argument("--ranking-metric", default=dsel.METRIC_UNITS,
+                    choices=list(dsel.SUPPORTED_RANKING_METRICS),
+                    help="How the Top-N is chosen: 'units' (historical units sold, pre-cutoff "
+                         "data only) or 'stockout_risk' (pre-forecast risk proxy, which also "
+                         "reads the inventory snapshot and may use post-cutoff stock).")
     return ap.parse_args(argv)
 
 
@@ -832,7 +859,7 @@ def main(argv: list[str] | None = None) -> int:
             selection_cutoff=args.selection_cutoff, min_history_days=args.min_history_days,
             horizons=tuple(args.horizons), runs_dir=args.runs_dir, run_id=args.run_id,
             db_path=args.db_path, allow_partial_success=args.allow_partial_success,
-            skip_models=tuple(args.skip_model))
+            skip_models=tuple(args.skip_model), ranking_metric=args.ranking_metric)
     except RequestError as exc:
         print(f"REQUEST INVALID: {exc}", file=sys.stderr)
         return 2

@@ -5,22 +5,38 @@ Model-agnostic. Reads the existing SQLite warehouse
 selects SKUs for later forecasting — it never re-runs the ETL, never writes to
 the warehouse, and knows nothing about any specific forecasting model.
 
-Two public functions:
+Public functions:
   * :func:`list_eligible_categories` — categories that contain forecast-eligible
     products, with counts and history bounds.
+  * :func:`list_eligible_skus` — every eligible SKU of one exact category, unranked.
   * :func:`select_top_skus` — the deterministic top-N eligible SKUs of one exact
     category.
+  * :func:`select_top_skus_detailed` — as above, plus ranking metadata.
 
-Both use ONLY real ecommerce ``quantity_sold`` on or before an as-of cutoff.
-Synthetic stock, cost, price, forecasts and any post-cutoff information are never
-used for selection. The selected SKU list later feeds ``src/prepare_pilot_data.py``
-so every experimental model is compared on the identical SKU subset / as-of date.
+ELIGIBILITY always uses ONLY real ecommerce ``quantity_sold`` on or before the as-of
+cutoff — that rule is identical for every ranking metric. The selected SKU list later
+feeds ``src/prepare_pilot_data.py`` so every experimental model is compared on the
+identical SKU subset / as-of date.
+
+RANKING depends on ``ranking_metric``:
+  * ``units`` (default) — historical units sold. Uses nothing but pre-cutoff sales:
+    no synthetic stock, cost, price, forecast or post-cutoff information.
+  * ``stockout_risk`` — pre-forecast stockout-risk proxy from :mod:`selection_risk`.
+    This metric ADDITIONALLY reads the real ``inventory_snapshot`` and per-SKU lead
+    times, and under the default snapshot policy that snapshot may POSTDATE the
+    cutoff (the warehouse keeps one snapshot and no stock history). Selection can
+    therefore be influenced by post-cutoff inventory state — a deliberate trade-off,
+    reported in the returned metadata as ``stock_snapshot_date`` /
+    ``stock_is_post_cutoff`` so it is auditable rather than silent. It never reads a
+    forecast, so there is no circular dependency on Phase B.
 
 CLI::
 
     python src/dynamic_selection.py --list-categories --selection-cutoff 2026-06-30 --min-history-days 28
     python src/dynamic_selection.py --category "Groceries & Pets" --top-n 10 \
         --selection-cutoff 2026-06-30 --min-history-days 28 --output-file temp_selected_skus.csv
+    python src/dynamic_selection.py --category "Groceries & Pets" --top-n 10 \
+        --selection-cutoff 2026-07-31 --ranking-metric stockout_risk
 """
 from __future__ import annotations
 
@@ -48,7 +64,18 @@ CATEGORY_COLUMNS = ["category", "eligible_sku_count", "historical_units",
 SELECTION_COLUMNS = ["rank", "sku", "sku_name", "category", "sub_category", "brand",
                      "historical_units", "active_days", "history_start", "history_end"]
 
-SUPPORTED_RANKING_METRICS = ("units",)
+# Appended to SELECTION_COLUMNS only when ranking_metric == "stockout_risk", so the CSV
+# carries the evidence for the ordering. prepare_pilot_data explicitly accepts and ignores
+# extra selector columns (SKU is the only key it trusts), so this never affects modelling.
+RISK_SELECTION_COLUMNS = [
+    "stock_on_hand", "stock_snapshot_date", "lead_time_days", "lead_time_demand_mean",
+    "stockout_probability", "expected_shortage_units", "proxy_days_of_cover",
+    "proxy_risk_tier", "risk_assumption_flags",
+]
+
+METRIC_UNITS = "units"
+METRIC_STOCKOUT_RISK = "stockout_risk"
+SUPPORTED_RANKING_METRICS = (METRIC_UNITS, METRIC_STOCKOUT_RISK)
 TOP_N_MIN, TOP_N_MAX = 1, 100
 
 
@@ -100,6 +127,20 @@ def _load_pilot_config() -> dict:
     if not isinstance(pilot, dict) or "ecommerce_channel_map" not in pilot:
         raise DynamicSelectionError("config.yaml is missing a valid 'pilot.ecommerce_channel_map'")
     return pilot
+
+
+def _selection_risk():
+    """Import :mod:`selection_risk` lazily.
+
+    Deferred, not top-level, for two reasons: the ``units`` path must keep working even if
+    the risk module or its config block is unavailable, and ``selection_risk``'s CLI imports
+    this module — a top-level import here would close that cycle.
+    """
+    _here = str(Path(__file__).resolve().parent)
+    if _here not in sys.path:
+        sys.path.insert(0, _here)
+    import selection_risk                                  # noqa: PLC0415 - deliberate
+    return selection_risk
 
 
 def ecommerce_channels() -> list[str]:
@@ -280,21 +321,17 @@ def list_eligible_categories(
     return df[CATEGORY_COLUMNS]
 
 
-def select_top_skus(
+def list_eligible_skus(
     db_path: str | os.PathLike,
     category: str,
-    top_n: int,
     selection_cutoff: object,
     min_history_days: int,
-    ranking_metric: str = "units",
-) -> tuple[pd.DataFrame, list[str]]:
-    """Select the top-N eligible SKUs of one EXACT category (trimmed match).
+) -> pd.DataFrame:
+    """Every eligible SKU of one EXACT category, in the default units ordering.
 
-    Returns ``(dataframe, warnings)``. DataFrame columns (exact order): ``rank, sku,
-    sku_name, category, sub_category, brand, historical_units, active_days,
-    history_start, history_end``. Ranking is deterministic: historical_units desc,
-    active_days desc, sku asc; ``rank`` starts at 1. SKU is the stable identifier;
-    sku_name/sub_category/brand may be null and never break selection.
+    This is the shared candidate set: eligibility is decided here once, so a ranking
+    metric never re-implements (and never drifts from) the eligibility rules. No
+    ``top_n`` cap is applied — the caller ranks and truncates.
 
     Raises :class:`CategoryNotFoundError` if the category is absent from sku_master,
     or :class:`CategoryEligibilityError` if it exists but has no eligible SKUs.
@@ -302,17 +339,13 @@ def select_top_skus(
     if category is None or not str(category).strip():
         raise CategoryEligibilityError("category is required and must be non-empty.")
     category_norm = str(category).strip()
-    top_n = _validate_top_n(top_n)
-    _validate_ranking_metric(ranking_metric)
     cutoff = _normalize_cutoff(selection_cutoff)
     min_history_days = _validate_min_history(min_history_days)
     channels = ecommerce_channels()
 
-    per_sku_sql, per_sku_params = _per_sku_query(channels, cutoff, min_history_days, category=category_norm)
-    sql = (
-        f"{per_sku_sql}\n"
-        "ORDER BY historical_units DESC, active_days DESC, sku ASC"
-    )
+    per_sku_sql, per_sku_params = _per_sku_query(channels, cutoff, min_history_days,
+                                                 category=category_norm)
+    sql = f"{per_sku_sql}\nORDER BY historical_units DESC, active_days DESC, sku ASC"
     with closing(_connect_readonly(db_path)) as con:
         eligible = _read_sql(con, sql, per_sku_params)
         if eligible.empty:
@@ -333,22 +366,123 @@ def select_top_skus(
             )
 
     # Deterministic ordering (belt-and-braces on top of SQL ORDER BY).
-    eligible = eligible.sort_values(
+    return eligible.sort_values(
         ["historical_units", "active_days", "sku"],
         ascending=[False, False, True], kind="mergesort",
     ).reset_index(drop=True)
 
-    eligible_count = int(len(eligible))
-    selected = eligible.head(top_n).copy()
-    selected.insert(0, "rank", range(1, len(selected) + 1))
-    selected = selected.reindex(columns=SELECTION_COLUMNS)
 
+def select_top_skus_detailed(
+    db_path: str | os.PathLike,
+    category: str,
+    top_n: int,
+    selection_cutoff: object,
+    min_history_days: int,
+    ranking_metric: str = METRIC_UNITS,
+    config_path: str | os.PathLike | None = None,
+) -> tuple[pd.DataFrame, list[str], dict]:
+    """:func:`select_top_skus` plus a metadata dict describing how the ranking was made.
+
+    The metadata always carries ``ranking_metric``, ``eligible_count`` and
+    ``selected_count``. For ``stockout_risk`` it also carries the risk-scan metadata
+    from :mod:`selection_risk` — notably ``stock_snapshot_date`` and
+    ``stock_is_post_cutoff``, which callers persist into the run record so a reviewer
+    can see the SKU set was chosen with post-cutoff inventory state.
+    """
+    if category is None or not str(category).strip():
+        raise CategoryEligibilityError("category is required and must be non-empty.")
+    category_norm = str(category).strip()
+    top_n = _validate_top_n(top_n)
+    metric = _validate_ranking_metric(ranking_metric)
+    cutoff = _normalize_cutoff(selection_cutoff)
+    min_history_days = _validate_min_history(min_history_days)
+
+    eligible = list_eligible_skus(db_path, category_norm, cutoff, min_history_days)
+    eligible_count = int(len(eligible))
     warnings: list[str] = []
-    if eligible_count < top_n:
+    meta: dict = {"ranking_metric": metric, "eligible_count": eligible_count}
+    columns = list(SELECTION_COLUMNS)
+
+    if metric == METRIC_STOCKOUT_RISK:
+        # Score the FULL eligible set, then truncate — never a units-ranked shortlist,
+        # which would hide any at-risk SKU that is not also a top seller.
+        scored, risk_meta = _selection_risk().score_stockout_risk(
+            db_path, eligible["sku"].tolist(), selection_cutoff=cutoff,
+            config_path=config_path)
+        ranked = _selection_risk().rank_by_stockout_risk(
+            eligible.merge(scored, on="sku", how="left"))
+        meta.update(risk_meta)
+        columns = columns + RISK_SELECTION_COLUMNS
+
+        scored_count = int(risk_meta.get("scored", 0))
+        if scored_count == 0:
+            raise CategoryEligibilityError(
+                f"No SKU in category {category_norm!r} could be scored for stockout risk "
+                f"(eligible={eligible_count}). "
+                + " ".join(risk_meta.get("warnings", []))
+            )
+        if scored_count < top_n:
+            warnings.append(
+                f"Only {scored_count} of {eligible_count} eligible SKU(s) in "
+                f"{category_norm!r} could be risk-scored; the remainder are excluded "
+                f"({risk_meta.get('exclusion_reasons')}).")
+        if risk_meta.get("stock_is_post_cutoff"):
+            warnings.append(
+                f"Stockout-risk ranking used inventory snapshot "
+                f"{risk_meta.get('stock_snapshot_date')}, which postdates the selection "
+                f"cutoff {cutoff}; selection was influenced by post-cutoff stock.")
+        if risk_meta.get("already_out_of_stock"):
+            warnings.append(
+                f"{risk_meta['already_out_of_stock']} selected-pool SKU(s) are already out "
+                f"of stock (P(stockout) ~ 1.0); ranked among themselves by expected "
+                f"shortage units.")
+        # Never let an unscored SKU occupy a Top-N slot.
+        ranked = ranked[ranked["risk_scored"].astype(bool)]
+        effective_count = scored_count
+    else:
+        ranked = eligible
+        effective_count = eligible_count
+
+    selected = ranked.head(top_n).copy()
+    selected.insert(0, "rank", range(1, len(selected) + 1))
+    selected = selected.reindex(columns=columns)
+
+    if effective_count < top_n:
         warnings.append(
-            f"Requested top_n={top_n} but only {eligible_count} eligible SKU(s) exist in "
+            f"Requested top_n={top_n} but only {effective_count} rankable SKU(s) exist in "
             f"category {category_norm!r}; selected {len(selected)}."
         )
+    meta["selected_count"] = int(len(selected))
+    return selected, warnings, meta
+
+
+def select_top_skus(
+    db_path: str | os.PathLike,
+    category: str,
+    top_n: int,
+    selection_cutoff: object,
+    min_history_days: int,
+    ranking_metric: str = METRIC_UNITS,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Select the top-N eligible SKUs of one EXACT category (trimmed match).
+
+    Returns ``(dataframe, warnings)``. Columns are ``SELECTION_COLUMNS``: ``rank, sku,
+    sku_name, category, sub_category, brand, historical_units, active_days,
+    history_start, history_end`` — plus ``RISK_SELECTION_COLUMNS`` when
+    ``ranking_metric='stockout_risk'``. ``rank`` starts at 1. SKU is the stable
+    identifier; sku_name/sub_category/brand may be null and never break selection.
+
+    Ordering is deterministic in both metrics:
+      * ``units``         — historical_units desc, active_days desc, sku asc
+      * ``stockout_risk`` — stockout_probability desc, expected_shortage_units desc, sku asc
+
+    Use :func:`select_top_skus_detailed` when you need the ranking metadata.
+
+    Raises :class:`CategoryNotFoundError` if the category is absent from sku_master,
+    or :class:`CategoryEligibilityError` if it exists but has no eligible SKUs.
+    """
+    selected, warnings, _meta = select_top_skus_detailed(
+        db_path, category, top_n, selection_cutoff, min_history_days, ranking_metric)
     return selected, warnings
 
 
