@@ -74,6 +74,9 @@ PROGRESS_PCT = {
     "calculating_reorder_recommendations": 98,
     "completed": 100, "completed_with_warnings": 100, "failed": 100,
 }
+# A non-terminal run untouched for this long is treated as STALLED (dead process).
+STALE_RUN_HOURS = 2.0
+
 BASELINE_METHODS = ("last_day_naive", "seasonal_naive_7", "moving_average_7", "moving_average_14")
 
 
@@ -164,6 +167,25 @@ def _run_record(run_dir: Path) -> dict:
     rec["is_completed"] = state in ("completed", "completed_with_warnings")
     rec["is_failed"] = state == "failed"
     rec["is_running"] = state in RUNNING_STATES
+    # A non-terminal run whose status.json has not moved for hours is a dead process whose
+    # status was never finalised (the launcher cannot write a status for a killed child).
+    # Surface it as STALLED so it is not presented as live work — and so it stops sorting
+    # above genuinely recent runs.
+    rec["stale_hours"] = None
+    rec["is_stale"] = False
+    if rec["is_running"]:
+        last = status.get("updated_at") or status.get("started_at") or rec.get("created_at")
+        try:
+            seen = datetime.fromisoformat(str(last))
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=timezone.utc)
+            hours = (datetime.now(timezone.utc) - seen).total_seconds() / 3600.0
+            rec["stale_hours"] = round(hours, 1)
+            rec["is_stale"] = hours >= STALE_RUN_HOURS
+        except (TypeError, ValueError):
+            pass
+    if rec["is_stale"]:
+        rec["is_running"] = False                 # stop treating a dead process as in-progress
     return rec
 
 

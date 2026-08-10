@@ -75,11 +75,16 @@ def _make_completed_run(runs_dir: Path, run_id="20260101T000000Z_groceries-pets_
 
 
 def _make_running_run(runs_dir: Path, run_id="20260102T000000Z_x_top5_def456",
-                      created="2026-07-29T09:00:00+00:00"):
+                      created="2026-07-29T09:00:00+00:00", updated=None):
+    """A LIVE run: status.json was touched moments ago. A non-terminal run whose status has
+    not moved for STALE_RUN_HOURS is a dead process and is reported as stalled instead, so a
+    fixture that means "currently running" must carry a fresh updated_at."""
+    from datetime import datetime as _d, timezone as _tz
     rd = runs_dir / run_id
     rd.mkdir(parents=True)
     _write(rd / "status.json", {"run_id": run_id, "status": "running_lightgbm", "progress_pct": 70,
-                                "current_step": "running_lightgbm", "created_at": created})
+                                "current_step": "running_lightgbm", "created_at": created,
+                                "updated_at": updated or _d.now(_tz.utc).isoformat()})
     _write(rd / "request.json", {"category": "Health & Beauty", "top_n": 5,
                                  "as_of_date": "2026-06-30", "created_at": created})
     return rd
@@ -1358,3 +1363,45 @@ def test_104_decision_artifacts_unaffected_by_the_window():
     at.run()
     after = len([b for b in at.button if b.label == "Details"])
     assert before == after and not at.exception              # risk queue never date-filtered
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Stalled-run detection: a non-terminal run whose status.json stopped moving is a dead
+# process (the launcher cannot finalise a killed child), so it must not be presented as
+# live work — nor sort above genuinely recent runs.
+# ══════════════════════════════════════════════════════════════════════════════════
+def test_110_fresh_running_run_is_live_not_stale(tmp_path):
+    _make_running_run(tmp_path)
+    r = rs.discover_runs(tmp_path)[0]
+    assert r["is_running"] and not r["is_stale"] and not r["is_terminal"]
+
+
+def test_111_untouched_running_run_is_reported_stalled(tmp_path):
+    stale_ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=48)).isoformat()
+    _make_running_run(tmp_path, updated=stale_ts)
+    r = rs.discover_runs(tmp_path)[0]
+    assert r["is_stale"] and not r["is_running"]
+    assert r["stale_hours"] is not None and r["stale_hours"] >= rs.STALE_RUN_HOURS
+    assert not r["is_completed"]          # still never usable as a data source
+
+
+def test_112_stale_run_does_not_sort_above_recent_completed(tmp_path):
+    stale_ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=200)).isoformat()
+    _make_running_run(tmp_path, run_id="zzz_stale", created="2026-01-01T00:00:00+00:00",
+                      updated=stale_ts)
+    _make_completed_run(tmp_path, run_id="aaa_recent", created="2026-07-31T00:00:00+00:00")
+    order = [r["run_id"] for r in rs.discover_runs(tmp_path)]
+    assert order[0] == "aaa_recent", order      # the dead run no longer hogs the top row
+
+
+def test_113_terminal_runs_are_never_marked_stale(tmp_path):
+    _make_completed_run(tmp_path, created="2020-01-01T00:00:00+00:00")
+    _make_failed_run(tmp_path, created="2020-01-01T00:00:00+00:00")
+    for r in rs.discover_runs(tmp_path):
+        assert not r["is_stale"] and r["stale_hours"] is None
+
+
+def test_114_unparseable_timestamp_does_not_crash_discovery(tmp_path):
+    _make_running_run(tmp_path, updated="not-a-timestamp")
+    r = rs.discover_runs(tmp_path)[0]
+    assert r["is_stale"] is False and r["stale_hours"] is None   # unknown age != dead

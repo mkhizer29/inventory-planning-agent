@@ -31,6 +31,7 @@ from styles import (COLORS, CATEGORICAL, DONUT_COLORS, DONUT_HOVER, STATUS_COLOR
 import run_service as rs   # Phase 5 run-aware backend service (framework-free, testable)
 import export_utils as eu  # one reusable in-memory CSV/Excel/PDF export menu
 import deadstock_analysis as da  # standalone ecommerce deadstock (inventory-inactivity) scan
+import dynamic_selection as ds  # read-only: pre-flight "how many will actually be selected?"
 
 # --------------------------------------------------------------------------
 # Paths
@@ -206,6 +207,12 @@ def empty_state(title, message, icon="folder"):
 
 
 _BANNER_ICON = {"info": "info", "success": "check-circle", "synthetic": "flask"}
+
+
+def _esc_html(text):
+    """Escape text destined for one of the unsafe_allow_html banners/cards."""
+    import html as _html
+    return _html.escape(str(text), quote=False)
 
 
 def info_banner(message, kind="info", icon=None):
@@ -576,7 +583,14 @@ def classify_reorder_status(row):
 # --------------------------------------------------------------------------
 # Deterministic executive insights (rule-based, no external LLM)
 # --------------------------------------------------------------------------
-def generate_insights(mp_f, inv_f, manifest):
+def generate_insights(mp_f, inv_f, manifest, reco=None, risk=None):
+    """Rule-based insights.
+
+    When a run carries Phase B/C decision artifacts they are the authoritative source; the
+    legacy synthetic inventory_context simulation is only used as a fallback (legacy mode or
+    a run predating decisioning), so the executive page never mixes forecast-driven
+    recommendations with baseline-simulation commentary.
+    """
     insights = []
     if mp_f is not None and not mp_f.empty:
         cat_totals = mp_f.groupby("category")["units_observed"].sum().sort_values(ascending=False)
@@ -598,7 +612,29 @@ def generate_insights(mp_f, inv_f, manifest):
                 f"{sku_totals.iloc[0]:,.0f} total units sold."
             )
 
-    if inv_f is not None and not inv_f.empty:
+    used_decisions = False
+    if reco is not None and not getattr(reco, "empty", True) and "action" in getattr(reco, "columns", []):
+        used_decisions = True
+        act = reco["action"].astype(str)
+        n_order = int(act.eq("order_now").sum())
+        n_total = int(reco["sku"].nunique())
+        insights.append(
+            f"{n_order} of {n_total} products in view carry a forecast-driven <b>order-now</b> "
+            "proposal awaiting buyer approval.")
+        n_rev = int(act.eq("manual_review").sum())
+        if n_rev:
+            insights.append(f"{n_rev} product(s) are routed to manual review — a buyer decision is "
+                            "required before any quantity is proposed.")
+    if risk is not None and not getattr(risk, "empty", True) and "overall_risk_tier" in getattr(risk, "columns", []):
+        used_decisions = True
+        tiers = risk["overall_risk_tier"].astype(str).str.lower()
+        n_ch = int(tiers.isin(["critical", "high"]).sum())
+        if n_ch:
+            insights.append(f"{n_ch} product(s) sit in the Critical/High forecast-driven stockout "
+                            "tier for this run.")
+
+    if not used_decisions and inv_f is not None and not inv_f.empty:
+        # Legacy / pre-decisioning runs only.
         n_reorder = int((inv_f["recommended_order_quantity"] > 0).sum())
         n_total = inv_f["sku"].nunique()
         insights.append(
@@ -1009,18 +1045,24 @@ else:
 # --------------------------------------------------------------------------
 mp_f = apply_filters(mp_raw, sel_skus, sel_categories, sel_brands, date_range)
 inv_f = apply_filters(inv_joined, sel_skus, sel_categories, sel_brands, None)
+# PRODUCT scope only — deliberately WITHOUT the historical date window. Decision artifacts
+# must never gain or lose a product because of a display date range.
+mp_products = apply_filters(mp_raw, sel_skus, sel_categories, sel_brands, None)
 
 filters_active = {
     "skus": sel_skus, "categories": sel_categories, "brands": sel_brands,
     "date_range": date_range, "horizon": horizon, "scenario": sel_scenario,
 }
 
-# ---- ONE effective SKU set implied by every sidebar filter (category + brand + SKU list).
-# Decision artifacts (stockout risk, reorder recommendations) are keyed by SKU only, so they
-# are narrowed through this set — that is what makes a single sidebar change reflect on
-# EVERY page instead of only the demand pages.
-FILTERED_SKUS = (set(mp_f["sku"].astype(str)) if (mp_f is not None and not mp_f.empty
-                                                  and "sku" in mp_f.columns) else None)
+# ---- ONE effective SKU set implied by the PRODUCT filters (category + brand + SKU list).
+# Decision artifacts (stockout risk, reorder recommendations) are keyed by SKU only and are
+# narrowed through this set, so one product filter reflects on every page. It is built from
+# the date-FREE frame on purpose: a SKU with no sales row inside a narrow display window
+# would otherwise silently vanish from the risk and reorder queues, which are as-of
+# snapshots and have nothing to do with the historical display period.
+FILTERED_SKUS = (set(mp_products["sku"].astype(str))
+                 if (mp_products is not None and not mp_products.empty
+                     and "sku" in mp_products.columns) else None)
 FILTER_IS_NARROWED = bool(sel_skus or sel_brands or
                           (sel_categories and all_categories and
                            len(sel_categories) < len(all_categories)))
@@ -1142,7 +1184,12 @@ def page_executive_overview():
         render_chart(fig, "Units Sold by Category")
 
     # --- D. Secondary row: 2 panels ---
-    if inv_f is not None and not inv_f.empty:
+    # Only disclose the synthetic baseline when this page is actually reporting from it. In
+    # run mode the panels above read Phase B/C artifacts built on the real warehouse snapshot,
+    # and calling those "synthetic" understates data the CEO is being asked to trust.
+    _has_decisions = ((reorder_raw is not None and not reorder_raw.empty)
+                      or (risk_raw is not None and not risk_raw.empty))
+    if inv_f is not None and not inv_f.empty and not _has_decisions:
         synthetic_warning()
     d1, d2 = st.columns([3, 2])
     with d1:
@@ -1168,14 +1215,33 @@ def page_executive_overview():
     with d2:
         # Run mode with Phase C → forecast-driven reorder proposals; else legacy synthetic snapshot.
         if reorder_summary_raw and isinstance(reorder_summary_raw, dict):
-            s = reorder_summary_raw
-            metric_panel("Reorder Recommendations", [
-                ("Order Now", f"{int(s.get('order_now_count', 0))} / {int(s.get('selected_series_count', 0))}"),
-                ("Proposed Units", format_number(s.get("total_proposed_order_units"), 0)),
-                ("Proposed Purchase Value", format_currency(s.get("total_proposed_purchase_value"))),
-                ("Manual Review", format_number(s.get("manual_review_count"), 0)),
-                ("Vendor Follow-up", format_number(s.get("vendor_follow_up_count"), 0)),
-            ], sub="Forecast-driven planning proposals · buyer approval required")
+            # Recompute from the FILTERED recommendation rows so this panel agrees with the
+            # product filter and with the Inventory & Reorder page. The run-level JSON summary
+            # is a whole-run aggregate: using it directly showed "7 / 10 Order Now" while the
+            # rest of the page was narrowed to a single product.
+            _rq = narrow_to_filtered_skus(reorder_raw) if reorder_raw is not None else None
+            if _rq is not None and not _rq.empty and "action" in _rq.columns:
+                _act = _rq["action"].astype(str)
+                _units = pd.to_numeric(_rq.get("recommended_order_quantity"), errors="coerce")
+                _value = pd.to_numeric(_rq.get("recommended_purchase_value"), errors="coerce")
+                _sub = ("Forecast-driven planning proposals · buyer approval required"
+                        + (" · current filter" if FILTER_IS_NARROWED else ""))
+                metric_panel("Reorder Recommendations", [
+                    ("Order Now", f"{int(_act.eq('order_now').sum())} / {int(_rq['sku'].nunique())}"),
+                    ("Proposed Units", format_number(_units.sum(skipna=True), 0)),
+                    ("Proposed Purchase Value", format_currency(_value.sum(skipna=True))),
+                    ("Manual Review", format_number(int(_act.eq('manual_review').sum()), 0)),
+                    ("Vendor Follow-up", format_number(int(_act.eq('vendor_follow_up').sum()), 0)),
+                ], sub=_sub)
+            else:
+                s = reorder_summary_raw
+                metric_panel("Reorder Recommendations", [
+                    ("Order Now", f"{int(s.get('order_now_count', 0))} / {int(s.get('selected_series_count', 0))}"),
+                    ("Proposed Units", format_number(s.get("total_proposed_order_units"), 0)),
+                    ("Proposed Purchase Value", format_currency(s.get("total_proposed_purchase_value"))),
+                    ("Manual Review", format_number(s.get("manual_review_count"), 0)),
+                    ("Vendor Follow-up", format_number(s.get("vendor_follow_up_count"), 0)),
+                ], sub="Forecast-driven planning proposals · whole run")
         elif inv_f is not None and not inv_f.empty:
             avg_cover = inv_f["days_of_cover"].mean()
             n_reco = int((inv_f["recommended_order_quantity"] > 0).sum())
@@ -1193,10 +1259,18 @@ def page_executive_overview():
 
     # --- E. Bottom insight strip: 3 concise insights ---
     section_title("Key Insights")
-    insights = generate_insights(mp_f, inv_f, manifest)
-    inv_ins = [i for i in insights if "reorder recommendation" in i or "days of cover" in i]
-    lead = [insights[0]] if insights else []
-    show = (lead + inv_ins + [i for i in insights if i not in lead + inv_ins])[:3]
+    insights = generate_insights(
+        mp_f, inv_f, manifest,
+        reco=narrow_to_filtered_skus(reorder_raw) if reorder_raw is not None else None,
+        risk=narrow_to_filtered_skus(risk_raw) if "risk_raw" in globals() and risk_raw is not None else None)
+    # Only three cards fit. Decision insights (order-now, manual review, risk tier) are the
+    # ones that carry an action, so they outrank the descriptive demand lines — without this
+    # they are appended last and the slice below drops them entirely.
+    _KEYS = ("order-now", "manual review", "stockout tier",
+             "reorder recommendation", "days of cover")
+    inv_ins = [i for i in insights if any(k in i for k in _KEYS)]
+    lead = [insights[0]] if insights and insights[0] not in inv_ins else []
+    show = (inv_ins + lead + [i for i in insights if i not in lead + inv_ins])[:3]
     if show:
         render_insight_row(show)
     else:
@@ -1437,11 +1511,20 @@ def _render_run_ranking_panel():
                               "Horizon": sel_h}, key="exp_ranking")
 
     if manifest_run:
+        # How the Top-N was chosen, and any caveat the selector recorded (e.g. a stock
+        # snapshot that postdates the cutoff, or fewer eligible SKUs than requested). This
+        # was previously written to the manifest but never shown on screen.
+        _metric = (ACTIVE_RUN or {}).get("ranking_metric") or "units"
+        _sel_warn = manifest_run.get("selection_warning")
+        if _sel_warn:
+            info_banner(f"<strong>Selection note:</strong> {_esc_html(str(_sel_warn))}",
+                        kind="synthetic", icon="alert-triangle")
         with st.expander("Run summary", expanded=False):
             fp = (manifest_run.get("dataset_fingerprint") or "")[:12]
             metric_panel("", [
                 ("Run ID", manifest_run.get("run_id", "—")),
                 ("Category", (manifest_run.get("request") or {}).get("category", "—")),
+                ("Top-N ranked by", rs.RANKING_METRIC_LABELS.get(_metric, _metric)),
                 ("Selected SKUs", manifest_run.get("selected_sku_count", "—")),
                 ("As-of date", (manifest_run.get("request") or {}).get("as_of_date", "—")),
                 ("Dataset fingerprint", f"{fp}…" if fp else "—"),
@@ -1475,7 +1558,11 @@ def page_forecast_explorer():
     available_models = {}
     for label, payload in outputs_forecasts.items():
         available_models[label] = payload["df"]
-    available_models["Prototype Preview (14-day mean)"] = prototype_df
+    # The prototype is a 14-day mean, not a model. It exists so the page still works with no
+    # forecasts at all; once a run has produced real models, offering it alongside them invites
+    # someone to demo a flat mean as if it were the pipeline's output.
+    if not available_models or DATA_MODE != "run":
+        available_models["Prototype Preview (14-day mean)"] = prototype_df
 
     not_yet = [m for m in ["SES / Holt", "Holt-Winters", "LightGBM"] if m not in available_models]
     model_options = list(available_models.keys()) + [f"{m} — not yet generated" for m in not_yet]
@@ -1504,7 +1591,12 @@ def page_forecast_explorer():
     fc_df = available_models[model_choice].copy()
     fc_df["date"] = pd.to_datetime(fc_df["date"])
     for focus_sku in focus_skus:
-        fc_sku = fc_df[fc_df["sku"] == focus_sku].sort_values("date").head(horizon)
+        # Full future forecast for this product, plus the slice the horizon selector
+        # displays. The fixed-horizon KPIs below MUST read the full frame: taking them
+        # from the truncated slice made "Forecasted 14-Day Demand" collapse onto the
+        # 7-day figure whenever the horizon selector was set to 7.
+        fc_all = fc_df[fc_df["sku"] == focus_sku].sort_values("date")
+        fc_sku = fc_all.head(horizon)
         # Historical series honours the From/To display window (display-only — the forecast
         # rows below are NEVER date-filtered). With the full range selected we still cap the
         # view at the most recent 28 days so the chart stays readable next to the forecast.
@@ -1538,10 +1630,11 @@ def page_forecast_explorer():
         if not fc_sku.empty:
             r28 = hist_sku.tail(28)["units_observed"].mean()
             f_daily = fc_sku["y_pred"].mean()
-            f7 = fc_sku["y_pred"].head(7).sum()
-            f14 = fc_sku["y_pred"].head(14).sum()
+            f7 = fc_all["y_pred"].head(7).sum()
+            f14 = fc_all["y_pred"].head(14).sum()
             render_kpi_row([
-                dict(label="Forecasted Daily Avg", value=f"{f_daily:.1f}", icon="sparkle", tone="teal"),
+                dict(label=f"Forecasted Daily Avg ({horizon}d)", value=f"{f_daily:.1f}",
+                     icon="sparkle", tone="teal"),
                 dict(label="Forecasted 7-Day Demand", value=format_number(f7), icon="calendar", tone="blue"),
                 dict(label="Forecasted 14-Day Demand", value=format_number(f14), icon="calendar", tone="amber"),
                 dict(label="Recent 28-Day Actual Mean", value=f"{r28:.1f}", icon="trending-up", tone="slate"),
@@ -1764,7 +1857,7 @@ def _page_inventory_reorder_run():
     reco = enrich_product_names(reco)
     if reco.empty:
         empty_state("No SKUs in the current filter",
-                    "Clear the product filter in the sidebar to see the full recommendation queue.",
+                    "Reset the filters above to see the full recommendation queue.",
                     "search")
         return
 
@@ -2515,7 +2608,7 @@ def page_stockout_risk():
     risk = enrich_product_names(risk)
     if risk.empty:
         empty_state("No SKUs in the current filter",
-                    "Clear the product filter in the sidebar to see the full stockout-risk queue.",
+                    "Reset the filters above to see the full stockout-risk queue.",
                     "search")
         return
 
@@ -2525,10 +2618,18 @@ def page_stockout_risk():
     except (ValueError, TypeError, KeyError):
         op_h = None
 
+    # State what the data actually is rather than hedging: a blanket "may be synthetic" reads
+    # as "none of this is real" even when every stock figure came from the live snapshot.
+    _syn_n = 0
+    if "stock_on_hand_is_synthetic" in risk.columns:
+        _syn_n = int(risk["stock_on_hand_is_synthetic"].fillna(False).astype(bool).sum())
+    _stock_txt = (f"<strong>{_syn_n} of {len(risk)}</strong> stock figures are synthetically "
+                  "reconstructed" if _syn_n else
+                  "Stock figures come from the live warehouse snapshot")
     info_banner(
-        "Inventory stock may be synthetically reconstructed. Lead time, service level, MOQ and "
-        "pack-size values may use pilot assumptions. Risk probabilities are planning estimates, "
-        "not guarantees.", kind="synthetic")
+        f"{_stock_txt}. Lead time, service level, MOQ and pack-size values may use pilot "
+        "assumptions. Risk probabilities are planning estimates, not guarantees.",
+        kind="synthetic")
 
     tiers = risk["overall_risk_tier"].astype(str).str.lower()
 
@@ -3326,7 +3427,9 @@ def _render_active_run_status(run_id):
     status_json = rs._read_json(Path(rec["run_dir"]) / "status.json")
     stj = status_json.get("model_status", {})
     pct = min(int(rec.get("progress_pct") or 0), 100)
-    tone = ("done" if rec.get("is_completed") else "fail" if rec.get("is_failed") else "live")
+    _stale = bool(rec.get("is_stale"))
+    tone = ("done" if rec.get("is_completed") else "fail" if rec.get("is_failed")
+            else "fail" if _stale else "live")
     icon = {"done": "✓", "fail": "✕", "live": "◐"}[tone]
     updated = rs.format_local_datetime(status_json.get("updated_at") or rec.get("created_at"),
                                        include_date=False)
@@ -3339,7 +3442,7 @@ def _render_active_run_status(run_id):
         st.markdown(
             f'<div class="ipa-runbar ipa-rb-{tone}">'
             f'<div class="rb-state"><span class="rb-ico">{icon}</span>'
-            f'<span class="rb-label">{_friendly_status(rec.get("current_step", status))}</span></div>'
+            f'<span class="rb-label">{"Stalled — " + _friendly_status(rec.get("current_step", status)) if _stale else _friendly_status(rec.get("current_step", status))}</span></div>'
             f'<div class="rb-ctx">{rec.get("category") or "—"} · Top {rec.get("top_n") or "—"} · {sel_txt}</div>'
             f'<div class="rb-time">Updated {updated}<span class="rb-run" title="{rec.get("run_id")}">'
             f'Run …{str(rec.get("run_id") or "")[-6:]}</span></div></div>',
@@ -3390,6 +3493,26 @@ def eligible_categories_cached(db_mtime_ns, cutoff_str, min_history_days):
     """Eligible-category aggregation over the full sales table — expensive, so cached per
     (warehouse mtime, cutoff, min-history). Without this it re-ran on every widget keystroke."""
     return rs.list_categories(rs.DEFAULT_DB_PATH, cutoff_str, int(min_history_days))
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def selection_preview_cached(db_mtime_ns, category, top_n, cutoff_str, min_history_days, metric):
+    """How many products would ACTUALLY be selected for this request, before launching.
+
+    Requesting Top 10 in a thin category silently yields far fewer — and under
+    ``stockout_risk`` a product with no row in the stock snapshot cannot be scored at all,
+    so it is dropped rather than ranked last. Surfacing that in the dialog stops a demo run
+    from returning one product when ten were asked for. Read-only; ~3s uncached.
+    """
+    try:
+        sel, warnings, meta = ds.select_top_skus_detailed(
+            rs.DEFAULT_DB_PATH, str(category), int(top_n), str(cutoff_str),
+            int(min_history_days), ranking_metric=str(metric))
+        return {"ok": True, "eligible": int(meta.get("eligible_count") or 0),
+                "scored": meta.get("scored"), "selected": int(meta.get("selected_count") or 0),
+                "excluded": meta.get("exclusion_reasons") or {}, "warnings": list(warnings or [])}
+    except Exception as exc:  # noqa: BLE001 — preview must never block the dialog
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def page_forecast_runs():
@@ -3443,8 +3566,17 @@ def page_forecast_runs():
         top_n = fc2.number_input("Top N", min_value=1, max_value=100, value=10, step=1, key="run_top_n")
         mhd = fc3.number_input("Min history days", min_value=1, max_value=365, value=28, key="run_mhd")
         fd1, fd2 = st.columns(2)
-        as_of = fd1.date_input("As-of date", value=latest or date.today(), key="run_as_of")
-        cutoff = fd2.date_input("Selection cutoff", value=latest or date.today(), key="run_cutoff")
+        # Bound both dates by the latest USABLE ecommerce day. Choosing an as-of after it
+        # produces a holdout with essentially no demand, so the run fails late instead of
+        # being prevented here.
+        as_of = fd1.date_input("As-of date", value=latest or date.today(),
+                               max_value=latest or date.today(), key="run_as_of",
+                               help="Hard boundary: records after this date are dropped. "
+                                    "Capped at the latest usable ecommerce sales date.")
+        cutoff = fd2.date_input("Selection cutoff", value=latest or date.today(),
+                                max_value=as_of or latest or date.today(), key="run_cutoff",
+                                help="Products are ranked using sales up to this date. "
+                                     "Cannot be after the as-of date.")
         rank_by = st.radio(
             "Rank Top N by",
             options=list(rs.SUPPORTED_RANKING_METRICS),
@@ -3465,6 +3597,36 @@ def page_forecast_runs():
             f"· as-of <strong>{as_of}</strong> · models: Baselines, "
             "Holt-Winters, LightGBM. Fewer than Top N may be selected if eligible history is limited.",
             kind="info")
+        # Pre-flight: resolve the ACTUAL selectable count for this exact request. The scan
+        # costs ~4s on a small category and ~20s on the largest, so only run it where a
+        # shortfall is actually possible — a category with many times more eligible products
+        # than requested will always fill Top N. If this gate is ever wrong the post-run
+        # selection warning still reports the shortfall, so it is a UX cost, not a blind spot.
+        _pv = {"ok": False}
+        if cat_names and elig and elig < max(5 * int(top_n), 40):
+            with st.spinner("Checking how many products can actually be selected…"):
+                _pv = selection_preview_cached(db_mtime, run_cat, int(top_n), str(cutoff),
+                                               int(mhd), rank_by)
+        if _pv.get("ok"):
+            _got, _want = _pv["selected"], int(top_n)
+            if _got < _want:
+                _bits = [f"This request will select <strong>{_got}</strong> product(s), not "
+                         f"<strong>{_want}</strong>."]
+                if _pv.get("scored") is not None and _pv["scored"] < _pv["eligible"]:
+                    _lost = _pv["eligible"] - _pv["scored"]
+                    _why = ", ".join(f"{k.replace('_', ' ')}: {v}"
+                                     for k, v in (_pv.get("excluded") or {}).items()) or "unscorable"
+                    _bits.append(f"Only {_pv['scored']} of {_pv['eligible']} eligible product(s) can be "
+                                 f"risk-scored — {_lost} dropped ({_why}). "
+                                 f"Ranking by <strong>Units sold</strong> instead would select "
+                                 f"up to {min(_want, _pv['eligible'])}.")
+                else:
+                    _bits.append(f"Only {_pv['eligible']} product(s) in this category meet the "
+                                 f"{int(mhd)}-day history requirement. Lower Min history days or "
+                                 f"pick a larger category to widen the pool.")
+                info_banner(" ".join(_bits), kind="warning")
+            else:
+                st.caption(f"Pre-flight check: {_got} of {_want} requested product(s) available.")
         if rank_by == rs.METRIC_STOCKOUT_RISK:
             # The proxy only ORDERS candidates; Phase B computes the authoritative risk after
             # the forecast. Saying so here stops the two numbers reading as a contradiction.
@@ -3534,7 +3696,8 @@ def page_forecast_runs():
     for r in RUNS_ALL:
         w = r.get("winners_by_horizon") or {}
         rows.append({
-            "Status": r.get("status"), "Created": rs.format_local_datetime(r.get("created_at")),
+            "Status": (f"stalled ({r['stale_hours']}h)" if r.get("is_stale") else r.get("status")),
+            "Created": rs.format_local_datetime(r.get("created_at")),
             "Category": r.get("category"), "Top N": r.get("top_n"),
             "Ranked by": rs.ranking_metric_label(r.get("ranking_metric")),
             "SKUs": r.get("selected_sku_count"), "As-of": r.get("as_of_date"),
@@ -3564,6 +3727,28 @@ def page_forecast_runs():
     with st.expander("View pipeline log (last 200 lines)", expanded=False):
         log_path = Path(next(r["run_dir"] for r in RUNS_ALL if r["run_id"] == insp)) / "pipeline.log"
         st.text(rs.tail_log(log_path, 200) or "(no log yet)")
+
+
+@st.cache_data(show_spinner=False)
+def sales_history_window(db_path_str):
+    """(min, max) ecommerce transaction date actually present in the warehouse, read-only.
+
+    Used to state the deadstock caveat concretely: "no sale recorded" can only ever mean
+    "within this extracted window", and most catalogue SKUs predate it by years.
+    """
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{db_path_str}?mode=ro", uri=True)
+        try:
+            lo, hi = con.execute(
+                "SELECT MIN(transaction_date), MAX(transaction_date) FROM sales_transactions"
+            ).fetchone()
+        finally:
+            con.close()
+        to_d = lambda v: pd.to_datetime(v).date() if v else None
+        return to_d(lo), to_d(hi)
+    except Exception:
+        return None, None
 
 
 def page_deadstock():
@@ -3636,10 +3821,20 @@ def page_deadstock():
         "Deadstock Analysis",
         "Ecommerce inventory inactivity · configurable interval · latest warehouse snapshot",
         badges=badges)
+    # Honest scope disclosure. "No sale recorded" is only ever a statement about the
+    # EXTRACTED ecommerce window — most catalogue SKUs predate it by years — so the UI must
+    # never imply "never sold in the product's life".
+    _sales_lo, _sales_hi = sales_history_window(str(db_path))
+    _window = (f"{_pretty_date(_sales_lo)} to {_pretty_date(_sales_hi)}"
+               if _sales_lo and _sales_hi else "the extracted sales window")
     info_banner(
-        "Deadstock candidates have positive current stock but no recorded ecommerce sale during "
-        "the selected interval. This does not prove that the product had no physical-store sales.",
+        "Deadstock candidates have positive current stock but <strong>no ecommerce sale recorded "
+        f"in the available sales history ({_window})</strong> — not a claim that the product never "
+        "sold. Physical-store sales are out of scope, and unit cost uses the pilot's unconfirmed "
+        "per-unit basis, so values are planning estimates.",
         kind="info")
+    st.caption("This page scans the whole warehouse snapshot — it is independent of the active "
+               "Data source run and of the product filters used on the other pages.")
 
     if not db_path.exists():
         empty_state("Warehouse unavailable",
@@ -3715,14 +3910,42 @@ def page_deadstock():
         f"<strong>{format_number(summ['products_scanned'])}</strong> stock-carrying SKUs "
         f"{'across All Categories' if is_all else f'in {acat}'}", kind="info")
 
+    # ── Sales-coverage guard ──────────────────────────────────────────────────────────────
+    # The backend measures inactivity against the STOCK SNAPSHOT date, but ecommerce sales
+    # only extend to _sales_hi. Every day in between is counted as "no sale" when in fact no
+    # sale COULD have been observed. We must not silently reclassify the backend result, so
+    # the gap is disclosed and the affected band is quantified instead.
+    try:
+        _snap_d = pd.to_datetime(summ["snapshot_date"]).date() if summ.get("snapshot_date") else None
+        _gap = (_snap_d - _sales_hi).days if (_snap_d and _sales_hi) else 0
+    except Exception:
+        _snap_d, _gap = None, 0
+    if _gap > 0:
+        _dsl = pd.to_numeric(df_all.get("days_since_last_sale"), errors="coerce")
+        _is_cand = df_all["deadstock_status"].astype(str).eq(da.STATUS_CANDIDATE)
+        _band = _is_cand & _dsl.ge(interval_a) & _dsl.lt(interval_a + _gap)
+        _n_band = int(_band.sum())
+        _bv = pd.to_numeric(df_all.loc[_band, "estimated_deadstock_value"], errors="coerce").sum()
+        _extra = ""
+        if _n_band:
+            _extra = (f" <strong>{format_number(_n_band)}</strong> candidate(s) "
+                      f"({format_currency(_bv)}) sit within {_gap} days of the threshold and would "
+                      f"fall below it if measured from the last sales date — treat those as "
+                      f"borderline, not confirmed.")
+        info_banner(
+            f"<strong>Sales-coverage gap:</strong> inactivity is measured to the stock snapshot "
+            f"({_pretty_date(_snap_d)}) but ecommerce sales only run to {_pretty_date(_sales_hi)} — "
+            f"a {_gap}-day window in which no sale could be recorded either way.{_extra}",
+            kind="warning")
+
     # ── Section 1 — five KPI cards (full completed analysis) ──────────────────────────────
     section_title("Deadstock overview", None)
     render_kpi_row([
         {"label": "Deadstock Candidates", "value": format_number(summ["deadstock_candidate_count"]),
          "icon": "alert-triangle", "tone": "amber",
          "sub": f"No ecommerce sale in ≥ {interval_a}d (excl. never-sold)"},
-        {"label": "Never-Sold Products", "value": format_number(summ["never_sold_count"]),
-         "icon": "circle-dashed", "tone": "slate", "sub": "In stock, no ecommerce sale ever"},
+        {"label": "No Sale In History", "value": format_number(summ["never_sold_count"]),
+         "icon": "circle-dashed", "tone": "slate", "sub": "In stock, no sale in available history"},
         {"label": "Deadstock Units", "value": format_number(summ["deadstock_units"]),
          "icon": "box", "tone": "navy", "sub": "Candidate + never-sold stock on hand"},
         {"label": "Estimated Deadstock Value", "value": format_currency(summ["estimated_deadstock_value"]),
@@ -3971,7 +4194,7 @@ def page_deadstock():
                         ("Configured threshold", f"{interval_a} days"),
                         ("Days beyond threshold", (format_number(beyond, 0) if beyond is not None else "—"))]
             elif status == da.STATUS_NEVER_SOLD:
-                rows = [("Last ecommerce sale", "Never recorded"),
+                rows = [("Last ecommerce sale", "None in available sales history"),
                         ("Product created date", str(_dash(r.get("product_created_date")))),
                         ("Product age", (f"{int(age)} days" if age is not None else "—")),
                         ("Configured threshold", f"{interval_a} days")]
