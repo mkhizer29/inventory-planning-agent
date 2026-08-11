@@ -659,7 +659,7 @@ CUSTOM_CSS = f"""
         margin: 2px 0 1px 0; }}
     .ipa-dd-sub {{ color: {COLORS["subtext"]}; font-size: 0.82rem; margin-bottom: 6px; }}
 
-    /* ---------- Phase C: Inventory & Reorder page ---------- */
+    /* ---------- Phase C: Inventory & Replenishment page ---------- */
     .ipa-action {{ display: inline-flex; align-items: center; gap: 6px; border-radius: 999px;
         padding: 2px 10px; font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
         letter-spacing: 0.4px; }}
@@ -740,10 +740,23 @@ CUSTOM_CSS = f"""
     .ipa-mchip.ipa-ms-failed {{ background: #FAE7E9; color: {COLORS["red"]}; }}
     .ipa-mchip.ipa-ms-skipped {{ background: #F2F4F7; color: {COLORS["slate"]}; }}
 
-    /* --- equal-height KPI rows: labels clamp to 2 lines, values align --- */
-    .st-key-ipa-kpirow .ipa-card {{ height: 100%; min-height: 132px; }}
+    /* --- equal-height KPI rows -------------------------------------------------------
+       Matches EVERY kpi row (the key is suffixed with a counter to stay unique), not just
+       one page's. Three rules do the alignment:
+         card  -> full-height flex column, so all cards in a row share the tallest height
+         label -> always reserves two lines, so a one-line label does not lift its value
+         sub   -> margin-top:auto pins the footnote to the bottom of every card
+       Without these a longer label or a wrapped currency value made one card taller and
+       knocked the whole row out of line. */
+    [class*="st-key-ipa-kpirow"] .ipa-card {{ height: 100%; min-height: 132px;
+        display: flex; flex-direction: column; }}
+    [class*="st-key-ipa-kpirow"] .ipa-kpi-sub {{ margin-top: auto; padding-top: 6px; }}
     .ipa-kpi-label {{ display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-        overflow: hidden; }}
+        overflow: hidden; line-height: 1.25; min-height: 2.5em; }}
+    /* The label is vertically centred against the icon, so keep the block, not the text,
+       aligned to the top once it reserves two lines. */
+    .ipa-kpi-top {{ align-items: flex-start; }}
+    .ipa-kpi-icon {{ margin-top: 1px; }}
 
     /* --- dense risk queue rows (fixed height, semantic left border, no bright fills) --- */
     .ipa-qrow {{ display: flex; align-items: center; gap: 12px; background: {COLORS["card"]};

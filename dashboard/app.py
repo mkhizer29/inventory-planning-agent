@@ -93,6 +93,54 @@ def format_number(x, decimals=0):
         return "—"
 
 
+# Product quantities are counts of physical items. A stock level of 41.64 or an expected
+# shortage of 3.1e-225 units is noise, not precision, so every unit-bearing column shown to
+# a reader is displayed as a whole number. Accuracy metrics (WAPE/MASE/MAE/RMSE/bias),
+# probabilities, days-of-cover and money keep their own precision — they are not item counts.
+UNIT_COLUMN_HINTS = ("stock", "units", "quantity", "qty", "demand", "shortage",
+                     "reorder point", "target stock", "gap", "moq", "pack size",
+                     "safety stock", "inventory position", "predicted", "cumulative")
+
+
+def format_days_cover(x):
+    """Days of cover as a whole number, rounded UP.
+
+    Display-only: risk tiers, the Critical/Watch thresholds and every downstream decision
+    are computed by the backend from the raw value, so this changes what is read, never
+    what is classified. Note that rounding up is the optimistic direction — 0.3 days of
+    cover reads as 1 — which is why the raw value is kept in the detail panels' tooltips
+    and in the exported technical columns.
+    """
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return "—"
+    try:
+        return f"{int(np.ceil(float(x))):,}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def as_whole_days_cover(series):
+    """Series form of :func:`format_days_cover`; blanks stay blank."""
+    s = pd.to_numeric(series, errors="coerce")
+    return np.ceil(s).astype("Int64")
+
+
+def as_whole_units(series):
+    """Nullable-integer view of a unit column. Blanks stay blank — never coerced to 0."""
+    return pd.to_numeric(series, errors="coerce").round(0).astype("Int64")
+
+
+def whole_unit_columns(df, columns):
+    """Round the named unit columns in a DISPLAY frame to whole items, in place-safe copy."""
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df.copy()
+    for c in columns:
+        if c in out.columns:
+            out[c] = as_whole_units(out[c])
+    return out
+
+
 def format_percentage(fraction, decimals=1):
     """fraction is expected on a 0-1 scale."""
     if fraction is None or (isinstance(fraction, float) and pd.isna(fraction)):
@@ -124,16 +172,27 @@ def render_kpi_card(label, value, icon="dot", sub="", tone="teal", compact=False
     st.markdown(html, unsafe_allow_html=True)
 
 
+_KPIROW_COUNTER = {"n": 0}
+
+
 def render_kpi_row(kpis, n_cols=None, compact=False):
-    """kpis: list of dicts with keys label, value, icon, sub. Tones auto-cycle unless given."""
+    """kpis: list of dicts with keys label, value, icon, sub. Tones auto-cycle unless given.
+
+    Always wrapped in an ``ipa-kpirow`` container so the equal-height CSS applies to every
+    row in the dashboard. Previously only two pages opted in, so rows elsewhere (Deadstock
+    overview) rendered ragged whenever one card's label wrapped or its value was long. The
+    counter keeps the container key unique when a page draws more than one row.
+    """
     n_cols = n_cols or len(kpis)
-    cols = st.columns(n_cols)
-    for i, (col, kpi) in enumerate(zip(cols, kpis)):
-        kpi = {**kpi}
-        kpi.setdefault("tone", TONE_CYCLE[i % len(TONE_CYCLE)])
-        kpi.setdefault("compact", compact)
-        with col:
-            render_kpi_card(**kpi)
+    _KPIROW_COUNTER["n"] += 1
+    with st.container(key=f"ipa-kpirow-{_KPIROW_COUNTER['n']}"):
+        cols = st.columns(n_cols)
+        for i, (col, kpi) in enumerate(zip(cols, kpis)):
+            kpi = {**kpi}
+            kpi.setdefault("tone", TONE_CYCLE[i % len(TONE_CYCLE)])
+            kpi.setdefault("compact", compact)
+            with col:
+                render_kpi_card(**kpi)
 
 
 def render_chart(fig, title=None, sub=None):
@@ -644,7 +703,7 @@ def generate_insights(mp_f, inv_f, manifest, reco=None, risk=None):
         if n_critical:
             insights.append(
                 f"{n_critical} SKU(s) show 2 days of cover or less under the synthetic baseline snapshot — "
-                "flagged Critical on the Inventory & Reorder page."
+                "flagged Critical on the Inventory & Replenishment page."
             )
 
     return insights
@@ -805,14 +864,22 @@ with st.sidebar.container(key="ipa-datasource"):
         help=(rs.format_run_label_full(ACTIVE_RUN) if (DATA_MODE == "run" and ACTIVE_RUN)
               else "Legacy fixed 30-SKU pilot (data/processed)"))
     if DATA_MODE == "run" and ACTIVE_RUN is not None:
-        _op = ACTIVE_RUN.get("operational_model") or "—"
+        # Spell out what this run actually is. The count chip must be the SELECTED total, not
+        # the requested Top N, and the ranking method has to be readable rather than an icon.
+        _op = rs.operational_model_label(ACTIVE_RUN.get("operational_model"))
         _sym = rs.STATUS_SYMBOLS.get(str(ACTIVE_RUN.get("status")), "•")
+        _scope, _is_actual = rs.selected_or_requested(ACTIVE_RUN)
+        _scope_chip = _esc_html(_scope if _is_actual else f"{_scope} requested")
+        _rank_txt = _esc_html(rs.ranking_metric_label(ACTIVE_RUN.get("ranking_metric")))
         st.markdown(
             f'<div class="ipa-src"><div class="ipa-src-row">'
-            f'<span class="ipa-src-chip">{ACTIVE_RUN.get("selected_sku_count", "—")} SKUs</span>'
-            f'<span class="ipa-src-chip">{ACTIVE_RUN.get("category") or "—"}</span></div>'
-            f'<div class="ipa-src-row"><span class="ipa-src-meta">As-of {ACTIVE_RUN.get("as_of_date") or "—"}'
-            f' · {_op} · {_sym}</span></div></div>', unsafe_allow_html=True)
+            f'<span class="ipa-src-chip">{_scope_chip}</span>'
+            f'<span class="ipa-src-chip">{_esc_html(ACTIVE_RUN.get("category") or "—")}</span></div>'
+            f'<div class="ipa-src-row"><span class="ipa-src-meta">Ranked by: {_rank_txt}</span></div>'
+            f'<div class="ipa-src-row"><span class="ipa-src-meta">As-of: '
+            f'{_esc_html(_pretty_date(ACTIVE_RUN.get("as_of_date")))}</span></div>'
+            f'<div class="ipa-src-row"><span class="ipa-src-meta">Operational model: '
+            f'{_esc_html(_op)} · {_sym}</span></div></div>', unsafe_allow_html=True)
     else:
         st.markdown('<div class="ipa-src"><div class="ipa-src-row">'
                     '<span class="ipa-src-chip">30 SKUs</span>'
@@ -826,9 +893,9 @@ NAV_ITEMS = [
     ("Demand Analytics", "bar_chart"),
     ("Forecast Runs", "rocket_launch"),
     ("Forecast Explorer", "auto_graph"),
-    ("Inventory & Reorder", "inventory_2"),
-    ("Deadstock", "hourglass_empty"),
     ("Stockout Risk", "crisis_alert"),
+    ("Inventory & Replenishment", "inventory_2"),
+    ("Deadstock", "hourglass_empty"),
     ("Data Quality & Assumptions", "fact_check"),
 ]
 PAGES = [name for name, _ in NAV_ITEMS]
@@ -899,8 +966,13 @@ if mp_raw is not None:
     sel_skus = [s for s in _flt("flt_skus", []) if s in all_skus]
     sel_brands = [b for b in _flt("flt_brands", []) if b in all_brands]
 
-    _focus = [s for s in _flt("flt_focus_sku", []) if s in all_skus]
-    focus_skus = _focus if _focus else ([all_skus[0]] if all_skus else [])
+    # The Products filter narrows every page, so the deep-dive has to stay inside it.
+    # Previously the fallback was all_skus[0] — the first product in the WHOLE catalogue —
+    # so filtering to one product and leaving "Compare products" blank deep-dived a
+    # different, excluded product and rendered "No data for this product in the current view".
+    _focus_pool = sel_skus if sel_skus else all_skus
+    _focus = [s for s in _flt("flt_focus_sku", []) if s in _focus_pool]
+    focus_skus = _focus if _focus else ([_focus_pool[0]] if _focus_pool else [])
 
     # A preset button writes _pending_date_* (a NON-widget key) and reruns; we apply it
     # here, BEFORE the From/To widgets are instantiated — a widget-keyed value cannot be
@@ -933,6 +1005,7 @@ else:
     min_date = max_date = date_from = date_to = None
     DATE_RANGE_ERROR = None
     focus_skus = []
+    _focus_pool = []
     horizon = 14
     sel_scenario = SCENARIO_NAMES[0]
 
@@ -1004,7 +1077,7 @@ def render_filter_bar(*, products=True, category=True, dates=False, horizon_ctl=
                 st.multiselect("Products (blank = all)", options=all_skus,
                                format_func=lambda s: SKU_LABELS.get(s, s),
                                placeholder="Search by product name, brand or SKU…",
-                               help="Narrows every page: totals, charts, risk and reorder queues.",
+                               help="Narrows every page: totals, charts, risk and replenishment queues.",
                                key="flt_skus")
         if horizon_ctl:
             with cols[3]:
@@ -1021,15 +1094,29 @@ def render_filter_bar(*, products=True, category=True, dates=False, horizon_ctl=
         if dates:
             render_history_date_controls(key_prefix)
         if compare:
-            c1, c2 = st.columns([3, 1.4])
-            with c1:
-                st.multiselect("Compare products", options=all_skus,
-                               default=focus_skus if focus_skus else None,
-                               format_func=lambda s: SKU_LABELS.get(s, s),
-                               placeholder="Search by product name, brand or SKU…",
-                               key="flt_focus_sku")
-            with c2:
-                st.selectbox("Comparison labels", options=CMP_LABEL_MODES, key="flt_cmp_labels")
+            render_compare_controls()
+
+
+def render_compare_controls():
+    """Deep-dive / comparison picker.
+
+    Rendered next to the deep-dive rather than in the top filter bar: it selects which
+    products get their own chart further down the page, which is a different job from the
+    Products filter that narrows the whole view, and stacking the two at the top read as
+    one control with two boxes.
+    """
+    c1, c2 = st.columns([3, 1.4])
+    with c1:
+        st.multiselect("Compare products (blank = first product in view)",
+                       options=_focus_pool or all_skus,
+                       default=focus_skus if focus_skus else None,
+                       format_func=lambda s: SKU_LABELS.get(s, s),
+                       placeholder="Search by product name, brand or SKU…",
+                       help="Adds a deep-dive section per product, and overlays them on one "
+                            "comparison chart. Limited to the products left by the filters above.",
+                       key="flt_focus_sku")
+    with c2:
+        st.selectbox("Comparison labels", options=CMP_LABEL_MODES, key="flt_cmp_labels")
 
 st.sidebar.markdown("---")
 if manifest:
@@ -1216,7 +1303,7 @@ def page_executive_overview():
         # Run mode with Phase C → forecast-driven reorder proposals; else legacy synthetic snapshot.
         if reorder_summary_raw and isinstance(reorder_summary_raw, dict):
             # Recompute from the FILTERED recommendation rows so this panel agrees with the
-            # product filter and with the Inventory & Reorder page. The run-level JSON summary
+            # product filter and with the Inventory & Replenishment page. The run-level JSON summary
             # is a whole-run aggregate: using it directly showed "7 / 10 Order Now" while the
             # rest of the page was narrowed to a single product.
             _rq = narrow_to_filtered_skus(reorder_raw) if reorder_raw is not None else None
@@ -1226,7 +1313,7 @@ def page_executive_overview():
                 _value = pd.to_numeric(_rq.get("recommended_purchase_value"), errors="coerce")
                 _sub = ("Forecast-driven planning proposals · buyer approval required"
                         + (" · current filter" if FILTER_IS_NARROWED else ""))
-                metric_panel("Reorder Recommendations", [
+                metric_panel("Replenishment Recommendations", [
                     ("Order Now", f"{int(_act.eq('order_now').sum())} / {int(_rq['sku'].nunique())}"),
                     ("Proposed Units", format_number(_units.sum(skipna=True), 0)),
                     ("Proposed Purchase Value", format_currency(_value.sum(skipna=True))),
@@ -1235,7 +1322,7 @@ def page_executive_overview():
                 ], sub=_sub)
             else:
                 s = reorder_summary_raw
-                metric_panel("Reorder Recommendations", [
+                metric_panel("Replenishment Recommendations", [
                     ("Order Now", f"{int(s.get('order_now_count', 0))} / {int(s.get('selected_series_count', 0))}"),
                     ("Proposed Units", format_number(s.get("total_proposed_order_units"), 0)),
                     ("Proposed Purchase Value", format_currency(s.get("total_proposed_purchase_value"))),
@@ -1247,11 +1334,11 @@ def page_executive_overview():
             n_reco = int((inv_f["recommended_order_quantity"] > 0).sum())
             baseline_stockouts = int((inv_f["days_of_cover"] <= 0).sum())
             n_skus = inv_f["sku"].nunique()
-            metric_panel("Inventory & Reorder Summary", [
+            metric_panel("Inventory & Replenishment Summary", [
                 ("Total Simulated Stock Value", format_currency(inv_f["inventory_value"].sum())),
                 ("Recommended Purchase Value", format_currency(inv_f["recommended_purchase_value"].sum())),
                 ("SKUs With Reorder", f"{n_reco} / {n_skus}"),
-                ("Avg Days of Cover", f"{avg_cover:.1f}"),
+                ("Avg Days of Cover", format_days_cover(avg_cover)),
                 ("Synthetic Stockout SKUs", f"{baseline_stockouts} / {n_skus}"),
             ], sub="Synthetic baseline snapshot")
         else:
@@ -1283,7 +1370,7 @@ def page_executive_overview():
 def page_demand_analytics():
     render_page_header("Demand Analytics", "Real historical sales — units observed on naheed_web",
                        badges=ACTIVE_BADGES)
-    render_filter_bar(products=True, category=True, dates=True, compare=True, key_prefix="demand")
+    render_filter_bar(products=True, category=True, dates=True, compare=False, key_prefix="demand")
     if mp_raw is None:
         empty_state("Historical demand data not found", "data/processed/model_panel.parquet is missing or unreadable.", "mail")
         return
@@ -1311,6 +1398,11 @@ def page_demand_analytics():
         fig.update_xaxes(title="")
         fig.update_yaxes(title="Avg units / day")
         render_chart(fig, "Average Demand by Day of Week")
+
+    # --- Deep-dive / comparison picker: sits with the sections it drives, not in the
+    # --- top filter bar where it was mistaken for a second product filter. ---
+    section_title("Product Deep-Dive", "Pick one or more products to chart individually.")
+    render_compare_controls()
 
     # --- Multi-product comparison: one overlaid line per selected product ---
     # Readability rule: 1 -> detailed single chart only; 2-8 -> overlaid comparison;
@@ -1369,11 +1461,12 @@ def page_demand_analytics():
                     ("Brand", meta_row["brand"] if meta_row is not None else "—"),
                     ("Date Range", f"{sku_all['date'].min():%d %b} – {sku_all['date'].max():%d %b %Y}"),
                     ("Total Units", format_number(sku_all["units_observed"].sum())),
-                    ("Avg / Median Daily", f"{sku_all['units_observed'].mean():.2f} / {sku_all['units_observed'].median():.1f}"),
+                    ("Avg / Median Daily", f"{format_number(sku_all['units_observed'].mean())}"
+                                          f" / {format_number(sku_all['units_observed'].median())}"),
                     ("Zero-Demand %", format_percentage((sku_all['units_observed'] == 0).mean())),
                     ("Promotion-Day %", format_percentage(sku_all['on_promo'].mean())),
                     ("Latest Effective Price", format_currency(sku_all['effective_unit_price'].iloc[-1])),
-                    ("Recent 7 / 28-Day Avg", f"{recent7:.2f} / {recent28:.2f}"),
+                    ("Recent 7 / 28-Day Avg", f"{format_number(recent7)} / {format_number(recent28)}"),
                 ])
 
     # --- Secondary analytics tucked into expanders ---
@@ -1471,11 +1564,18 @@ def _winner_card(title, row):
             f'MAE {row["mae"]:.2f} · bias {row["bias"]:+.2f}</div></div>')
 
 
-def _render_run_ranking_panel():
-    """Run-mode: model-ranking winner cards + comparison table + run summary (locked-holdout)."""
-    ranking, r_status = load_active(CTX["model_ranking"])
-    manifest_run, _ = load_active(CTX["run_manifest"])
-    section_title("Model Ranking", "Historical locked-holdout performance — not a guarantee of future accuracy.")
+def _render_run_ranking_panel(ctx=None, *, heading=True):
+    """Model-ranking winner cards + comparison table + run summary (locked-holdout).
+
+    Takes a run context so Run History can show the ranking for whichever run you pick,
+    not only the active one. Defaults to the active run's context.
+    """
+    ctx = ctx or CTX
+    ranking, r_status = load_active(ctx["model_ranking"])
+    manifest_run, _ = load_active(ctx["run_manifest"])
+    if heading:
+        section_title("Model Ranking",
+                      "Historical locked-holdout performance — not a guarantee of future accuracy.")
     if ranking is None or getattr(ranking, "empty", True):
         info_banner("Model ranking is unavailable for this run.", kind="synthetic")
     else:
@@ -1545,13 +1645,27 @@ def page_forecast_explorer():
     render_page_header("Forecast Explorer", "7–14 day demand forecast · historical backtest vs real future",
                        badges=ACTIVE_BADGES)
     render_filter_bar(products=True, category=True, dates=True, horizon_ctl=True,
-                      compare=True, key_prefix="forecast")
+                      compare=False, key_prefix="forecast")
     if mp_raw is None:
         empty_state("Historical demand data not found", "data/processed/model_panel.parquet is missing or unreadable.", "mail")
         return
 
-    if DATA_MODE == "run" and ACTIVE_RUN is not None:
-        _render_run_ranking_panel()
+    # One product at a time. This page charts history vs forecast, per-model comparison and a
+    # daily table for a SINGLE product; a multi-select just stacked N of those sections and
+    # made the page scroll for ever. Cross-product comparison belongs on Demand Analytics.
+    # Model ranking now lives with the run that produced it, on Forecast Runs -> Run History.
+    _explorer_pool = _focus_pool or all_skus
+    if not _explorer_pool:
+        empty_state("No products in view", "Clear the filters above to pick a product.", "mail")
+        return
+    # No product picker here: the Products filter above already chooses what this page shows.
+    # A second control would be a duplicate of it. With several products still in view we
+    # chart the first and say so, rather than silently dropping the rest.
+    explorer_skus = [_explorer_pool[0]]
+    if len(_explorer_pool) > 1:
+        st.caption(f"Showing **{SKU_LABELS.get(explorer_skus[0], explorer_skus[0])}** — "
+                   f"first of {len(_explorer_pool)} products in view. Pick a single product in "
+                   "the Products filter above to explore a different one.")
 
     prototype_df = build_prototype_forecast(mp_raw, horizon_days=14)
 
@@ -1590,7 +1704,7 @@ def page_forecast_explorer():
 
     fc_df = available_models[model_choice].copy()
     fc_df["date"] = pd.to_datetime(fc_df["date"])
-    for focus_sku in focus_skus:
+    for focus_sku in explorer_skus:
         # Full future forecast for this product, plus the slice the horizon selector
         # displays. The fixed-horizon KPIs below MUST read the full frame: taking them
         # from the truncated slice made "Forecasted 14-Day Demand" collapse onto the
@@ -1608,7 +1722,7 @@ def page_forecast_explorer():
         # --- One large historical + forecast chart ---
         if hist_recent.empty and fc_sku.empty:
             empty_state("No historical or forecast data for this product",
-                        comparison_display_label(focus_sku, cmp_label_mode, focus_skus), "mail")
+                        comparison_display_label(focus_sku, cmp_label_mode, explorer_skus), "mail")
         else:
             fig = go.Figure()
             if not hist_recent.empty:
@@ -1622,7 +1736,7 @@ def page_forecast_explorer():
                               annotation_text="Forecast horizon", annotation_position="top left")
             fig.update_layout(**plotly_layout(height=360))
             style_axes(fig)
-            render_chart(fig, f"Historical vs Forecast — {comparison_display_label(focus_sku, cmp_label_mode, focus_skus)}",
+            render_chart(fig, f"Historical vs Forecast — {comparison_display_label(focus_sku, cmp_label_mode, explorer_skus)}",
                          (f"{_pretty_date(date_from)} – {_pretty_date(date_to)} (solid) + next {horizon} forecast days (dashed)" if _narrowed else
                           f"Last 28 historical days (solid) + next {horizon} forecast days (dashed)"))
     
@@ -1633,11 +1747,12 @@ def page_forecast_explorer():
             f7 = fc_all["y_pred"].head(7).sum()
             f14 = fc_all["y_pred"].head(14).sum()
             render_kpi_row([
-                dict(label=f"Forecasted Daily Avg ({horizon}d)", value=f"{f_daily:.1f}",
+                dict(label=f"Forecasted Daily Avg ({horizon}d)", value=format_number(f_daily),
                      icon="sparkle", tone="teal"),
                 dict(label="Forecasted 7-Day Demand", value=format_number(f7), icon="calendar", tone="blue"),
                 dict(label="Forecasted 14-Day Demand", value=format_number(f14), icon="calendar", tone="amber"),
-                dict(label="Recent 28-Day Actual Mean", value=f"{r28:.1f}", icon="trending-up", tone="slate"),
+                dict(label="Recent 28-Day Actual Mean", value=format_number(r28),
+                     icon="trending-up", tone="slate"),
             ], n_cols=4)
     
         # --- Compact forecast table + cumulative ---
@@ -1651,7 +1766,11 @@ def page_forecast_explorer():
                     st.markdown('<div class="ipa-card-title">Daily Forecast Table</div>', unsafe_allow_html=True)
                     table = fc_sku[["date", "y_pred"]].rename(columns={"date": "Date", "y_pred": "Predicted"})
                     table["Date"] = table["Date"].dt.strftime("%d %b")
-                    table["Cumulative"] = table["Predicted"].cumsum()
+                    # Cumulative is built from the RAW series, then rounded — so the final row
+                    # reconciles with the 7/14-day KPI cards instead of drifting by the sum of
+                    # the per-row rounding errors.
+                    table["Cumulative"] = as_whole_units(table["Predicted"].cumsum())
+                    table["Predicted"] = as_whole_units(table["Predicted"])
                     st.dataframe(table, width="stretch", hide_index=True, height=300)
         with t2:
             if not fc_sku.empty:
@@ -1736,12 +1855,12 @@ def _reorder_badges():
         cat = ACTIVE_RUN.get("category") or "All categories"
         asof_raw = ACTIVE_RUN.get("as_of_date")
         asof = rs.format_local_datetime(asof_raw, include_time=False) if asof_raw else "—"
-        opm = ACTIVE_RUN.get("operational_model") or "—"
+        opm = rs.operational_model_label(ACTIVE_RUN.get("operational_model"))
         tcd = 14
         if reorder_summary_raw and isinstance(reorder_summary_raw, dict):
             tcd = reorder_summary_raw.get("target_cover_days", 14)
         return [
-            ("box", f"{n_sel if n_sel is not None else '—'} selected SKUs"),
+            ("box", f"{rs.format_sku_count(n_sel) or '—'} selected"),
             ("tag", str(cat)),
             ("calendar", f"As-of {asof}"),
             ("layers", f"Model: {opm}"),
@@ -1764,7 +1883,7 @@ def page_inventory_reorder():
             _page_inventory_reorder_run()
         else:
             render_page_header(
-                "Inventory & Reorder",
+                "Inventory & Replenishment",
                 "Forecast-driven replenishment proposals · MOQ and pack rounding · buyer approval required",
                 badges=_reorder_badges())
             empty_state(
@@ -1845,7 +1964,7 @@ def _page_inventory_reorder_run():
     # Header + prominent, non-expander disclosure
     # ------------------------------------------------------------------
     render_page_header(
-        "Inventory & Reorder",
+        "Inventory & Replenishment",
         "Forecast-driven replenishment proposals · MOQ and pack rounding · buyer approval required",
         badges=_reorder_badges())
     render_filter_bar(products=True, category=True, key_prefix="reorder")
@@ -1869,7 +1988,7 @@ def _page_inventory_reorder_run():
     # ==================================================================
     # SECTION 1 — Reorder overview (exactly five KPIs)
     # ==================================================================
-    section_title("Reorder overview",
+    section_title("Replenishment overview",
                   "Aggregated from the validated Phase C recommendations for the current selection.")
     actions = reco["action"].astype(str).str.lower()
     n_order = int((actions == "order_now").sum())
@@ -1893,8 +2012,7 @@ def _page_inventory_reorder_run():
     ]
     # Four equal-height primary KPIs; Vendor follow-up + Manual review appear as chips
     # beside the queue filters so they stop competing with the headline numbers.
-    with st.container(key="ipa-kpirow"):
-        render_kpi_row(kpis, n_cols=4)
+    render_kpi_row(kpis, n_cols=4)
 
     # ==================================================================
     # SECTION 2 — Action distribution + purchase exposure
@@ -2003,7 +2121,7 @@ def _page_inventory_reorder_run():
         with st.container(key="ipa-export-2"):
             eu.render_table_export_menu(
                 ranked, filename_stem="inventory_action_queue",
-                title="Inventory & Reorder — Priority Action Queue",
+                title="Inventory & Replenishment — Priority Action Queue",
                 metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"),
                           "Category": (ACTIVE_RUN or {}).get("category", "—")},
                 key="exp_reco_queue")
@@ -2030,7 +2148,7 @@ def _page_inventory_reorder_run():
                 unsafe_allow_html=True)
         rcols[1].markdown(f'<div class="ipa-qcell">{_action_chip(rec_row.get("action"))}</div>',
                           unsafe_allow_html=True)
-        rcols[2].markdown(f'<div class="ipa-qcell"><b>{format_number(rec_row.get("days_of_cover"), 1)}</b>'
+        rcols[2].markdown(f'<div class="ipa-qcell"><b>{format_days_cover(rec_row.get("days_of_cover"))}</b>'
                           f'<div class="q-sub">days cover</div></div>', unsafe_allow_html=True)
         rcols[3].markdown(f'<div class="ipa-qcell"><b>{format_number(rec_row.get("recommended_order_quantity"), 0)}</b>'
                           f'<div class="q-sub">proposed qty</div></div>', unsafe_allow_html=True)
@@ -2104,7 +2222,7 @@ def _page_inventory_reorder_run():
                     ("Inventory position", format_number(r.get("inventory_position_for_risk"), 0)),
                     ("Forecast-driven reorder point", format_number(r.get("forecast_driven_reorder_point"), 0)),
                     ("Reorder triggered", trig),
-                    ("Days of cover", format_number(r.get("days_of_cover"), 1)),
+                    ("Days of cover", format_days_cover(r.get("days_of_cover"))),
                     ("Risk tier", str(r.get("overall_risk_tier") or "—").capitalize()),
                     ("Stockout probability", format_percentage(r.get("stockout_probability"))),
                     ("Projected stockout date", _date_str(r.get("projected_stockout_date"))),
@@ -2177,7 +2295,7 @@ def _page_inventory_reorder_run():
                     ("Lead-time safety stock", format_number(r.get("lead_time_safety_stock"), 0)),
                     ("Target-cover days", format_number(r.get("target_cover_days"), 0)),
                     ("Planning-horizon days", format_number(r.get("planning_horizon_days"), 0)),
-                    ("Planning-horizon demand", format_number(r.get("planning_horizon_demand_mean"), 1)),
+                    ("Planning-horizon demand", format_number(r.get("planning_horizon_demand_mean"), 0)),
                     ("Planning-horizon sigma", format_number(r.get("planning_horizon_sigma"), 1)),
                     ("Service-level target", format_percentage(r.get("service_level_target"))),
                     ("Service-level z", format_number(r.get("service_level_z"), 2)),
@@ -2321,6 +2439,10 @@ def _page_inventory_reorder_run():
             if ccol in disp.columns:
                 disp[ccol] = disp[ccol].map(lambda v: format_currency(v, 2) if ccol == "unit_cost_effective" else format_currency(v))
         disp = disp.rename(columns=dict(colmap))
+        disp = whole_unit_columns(disp, ["Inventory Position", "Reorder Point", "Target Stock",
+                                         "Raw Gap", "MOQ", "Pack Size", "Proposed Quantity"])
+        if "Days of Cover" in disp.columns:
+            disp["Days of Cover"] = as_whole_days_cover(disp["Days of Cover"])
         _sty = disp.style
         for _c in ("Action", "Risk"):
             if _c in disp.columns:
@@ -2330,7 +2452,7 @@ def _page_inventory_reorder_run():
         with st.container(key="ipa-export-3"):
             eu.render_table_export_menu(
                 disp, filename_stem="reorder_recommendations_complete",
-                title="Inventory & Reorder — Complete Recommendations",
+                title="Inventory & Replenishment — Complete Recommendations",
                 metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"),
                           "Rows": len(disp)}, key="exp_reco_full")
         st.caption("One row per SKU/channel, read directly from the run's validated reorder artifact.")
@@ -2342,7 +2464,7 @@ def _page_inventory_reorder_run():
 
 
 def _page_inventory_reorder_legacy():
-    render_page_header("Inventory & Reorder",
+    render_page_header("Inventory & Replenishment",
                        "Legacy fixed pilot · synthetic baseline snapshot · prioritised replenishment queue",
                        badges=ACTIVE_BADGES)
     synthetic_warning(INVENTORY_PAGE_WARNING)
@@ -2383,18 +2505,19 @@ def _page_inventory_reorder_legacy():
         "SKU": table["sku"],
         "Category": table.get("category", "—"),
         "Sim. Stock": table["stock_on_hand"],
-        "Days Cover": table["days_of_cover"].round(1),
+        "Days Cover": as_whole_days_cover(table["days_of_cover"]),
         "Reorder Pt": table["reorder_point"],
         "Reco. Qty": table["recommended_order_quantity"],
         "Purchase Value": table["recommended_purchase_value"].map(lambda v: format_currency(v)),
         "Unit Cost": table["unit_cost_effective"].map(lambda v: format_currency(v, 2)),
         "Cost Source": table["cost_source"],
     })
+    view = whole_unit_columns(view, ["Sim. Stock", "Reorder Pt", "Reco. Qty"])
     styler = view.style.map(_status_cell_css, subset=["Status"])
     st.dataframe(styler, width="stretch", hide_index=True, height=430)
     with st.container(key="ipa-export-4"):
         eu.render_table_export_menu(view, filename_stem="inventory_action_queue",
-                                    title="Inventory & Reorder — Priority Action Queue", metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"), "Category": (ACTIVE_RUN or {}).get("category", "—"), "As-of": (ACTIVE_RUN or {}).get("as_of_date", "—")},
+                                    title="Inventory & Replenishment — Priority Action Queue", metadata={"Run": (ACTIVE_RUN or {}).get("run_id", "legacy"), "Category": (ACTIVE_RUN or {}).get("category", "—"), "As-of": (ACTIVE_RUN or {}).get("as_of_date", "—")},
                                     key="exp_invqueue")
 
     # --- Two focused charts ---
@@ -2413,6 +2536,7 @@ def _page_inventory_reorder_legacy():
         d = inv_status_df.sort_values("days_of_cover")
         colors = [COLORS["red"] if v <= 2 else COLORS["amber"] if v <= d["lead_time_days"].iloc[i] else COLORS["success"]
                   for i, v in enumerate(d["days_of_cover"])]
+        d = d.assign(days_of_cover=as_whole_days_cover(d["days_of_cover"]))
         fig = px.bar(d, x="sku", y="days_of_cover")
         fig.update_traces(marker_color=colors)
         fig.update_layout(**plotly_layout(legend=False, height=320))
@@ -2619,16 +2743,19 @@ def page_stockout_risk():
         op_h = None
 
     # State what the data actually is rather than hedging: a blanket "may be synthetic" reads
-    # as "none of this is real" even when every stock figure came from the live snapshot.
+    # as "none of this is real" even when every stock figure came from the warehouse. Equally,
+    # a completed run is frozen — its stock is the snapshot the run used, never "live".
     _syn_n = 0
     if "stock_on_hand_is_synthetic" in risk.columns:
         _syn_n = int(risk["stock_on_hand_is_synthetic"].fillna(False).astype(bool).sum())
-    _stock_txt = (f"<strong>{_syn_n} of {len(risk)}</strong> stock figures are synthetically "
-                  "reconstructed" if _syn_n else
-                  "Stock figures come from the live warehouse snapshot")
+    _snap_used = None
+    if DATA_MODE == "run" and ACTIVE_RUN is not None:
+        _snap_used = (ACTIVE_RUN.get("selection") or {}).get("stock_snapshot_date")
+    _stock_txt = rs.stock_provenance_note(_syn_n, len(risk),
+                                          _pretty_date(_snap_used) if _snap_used else None)
     info_banner(
-        f"{_stock_txt}. Lead time, service level, MOQ and pack-size values may use pilot "
-        "assumptions. Risk probabilities are planning estimates, not guarantees.",
+        f"{_esc_html(_stock_txt)}. Lead time, service level, MOQ and pack-size values may use "
+        "pilot assumptions. Risk probabilities are planning estimates, not guarantees.",
         kind="synthetic")
 
     tiers = risk["overall_risk_tier"].astype(str).str.lower()
@@ -2660,7 +2787,7 @@ def page_stockout_risk():
                       "Sum of estimated revenue at risk across priced SKUs. Unpriced SKUs (null) are "
                       "excluded from the total, never counted as zero.")},
         {"label": "Average Days of Cover",
-         "value": (format_number(avg_cover, 1) if avg_cover is not None else "—"),
+         "value": (format_days_cover(avg_cover) if avg_cover is not None else "—"),
          "icon": "clock", "tone": "blue",
          "sub": _help("Across SKUs with a cover estimate",
                       "Mean forecast days of cover over SKUs where it is defined; SKUs without an "
@@ -2668,8 +2795,7 @@ def page_stockout_risk():
     ]
     # Exactly four equal-height primary KPIs. Manual-review count moved to a chip beside
     # the queue filters (see SECTION 3) so it no longer competes with the headline numbers.
-    with st.container(key="ipa-kpirow"):
-        render_kpi_row(kpis, n_cols=4)
+    render_kpi_row(kpis, n_cols=4)
 
     # ==================================================================
     # SECTION 2 — Risk composition (secondary → progressive disclosure)
@@ -2714,6 +2840,7 @@ def page_stockout_risk():
                     names,
                     sub["sku"].astype(str),
                     [(_meta_val(c) or "—") for c in sub["channel"]],
+                    [format_days_cover(v) for v in sub["forecast_days_of_cover"]],
                     [str(x).capitalize() for x in sub["overall_risk_tier"]],
                     [format_number(v, 0) for v in sub["stock_on_hand"]],
                     [_date_str(x) for x in sub["projected_stockout_date"]],
@@ -2727,11 +2854,12 @@ def page_stockout_risk():
                                 color=_tier_hex(t), line=dict(color="white", width=1)),
                     customdata=cust,
                     hovertemplate=("<b>%{customdata[0]}</b><br>SKU %{customdata[1]} · %{customdata[2]}<br>"
-                                   "Tier: %{customdata[3]}<br>P(stockout): %{y:.0%}<br>"
-                                   "Days of cover: %{x:.1f}<br>Current stock: %{customdata[4]} u<br>"
-                                   "Projected stockout: %{customdata[5]}<br>"
-                                   "Expected shortage: %{customdata[6]} u<br>"
-                                   "Revenue at risk: %{customdata[7]}<extra></extra>")))
+                                   "Tier: %{customdata[4]}<br>P(stockout): %{y:.0%}<br>"
+                                   "Days of cover: %{customdata[3]}<br>"
+                                   "Current stock: %{customdata[5]} u<br>"
+                                   "Projected stockout: %{customdata[6]}<br>"
+                                   "Expected shortage: %{customdata[7]} u<br>"
+                                   "Revenue at risk: %{customdata[8]}<extra></extra>")))
             scatter.update_layout(**plotly_layout(height=330, legend=True))
             style_axes(scatter)
             scatter.update_yaxes(range=[-0.03, 1.03], tickformat=".0%", title_text="P(stockout) in lead time")
@@ -2818,7 +2946,7 @@ def page_stockout_risk():
         rcols[1].markdown(f'<div class="ipa-qcell">{_tier_chip(tier)}</div>', unsafe_allow_html=True)
         rcols[2].markdown(f'<div class="ipa-qcell"><b>{format_percentage(rec_row.get("stockout_probability"))}</b>'
                           f'<div class="q-sub">P(stockout)</div></div>', unsafe_allow_html=True)
-        rcols[3].markdown(f'<div class="ipa-qcell"><b>{format_number(rec_row.get("forecast_days_of_cover"), 1)}</b>'
+        rcols[3].markdown(f'<div class="ipa-qcell"><b>{format_days_cover(rec_row.get("forecast_days_of_cover"))}</b>'
                           f'<div class="q-sub">days cover</div></div>', unsafe_allow_html=True)
         rcols[4].markdown(f'<div class="ipa-qcell"><b>{_date_str(rec_row.get("projected_stockout_date"))}</b>'
                           f'<div class="q-sub">projected</div></div>', unsafe_allow_html=True)
@@ -2876,7 +3004,7 @@ def page_stockout_risk():
             {"label": "P(stockout) in lead time", "value": format_percentage(r.get("stockout_probability")),
              "icon": "percent", "tone": "amber",
              "sub": f"Service level {format_percentage(r.get('service_level'))}"},
-            {"label": "Forecast days of cover", "value": format_number(r.get("forecast_days_of_cover"), 1),
+            {"label": "Forecast days of cover", "value": format_days_cover(r.get("forecast_days_of_cover")),
              "icon": "clock", "tone": "blue",
              "sub": f"Lead time {format_number(r.get('lead_time_days'), 0)} d"},
             {"label": "Projected stockout date", "value": _date_str(r.get("projected_stockout_date")),
@@ -2905,7 +3033,7 @@ def page_stockout_risk():
             ("Reported on-order qty", format_number(r.get("reported_on_order_quantity"), 0)),
             ("Usable on-order qty", format_number(r.get("usable_on_order_quantity"), 0)),
             ("Inventory position (for risk)", format_number(r.get("inventory_position_for_risk"), 0)),
-            ("Mean daily forecast", format_number(mean_daily, 1)),
+            ("Mean daily forecast", format_number(mean_daily, 0)),
             ("Lead-time days",
              f"{format_number(r.get('lead_time_days'), 0)} ({_meta_val(r.get('lead_time_source')) or '—'})"),
             ("Lead-time demand (mean / P80 / P95)",
@@ -3155,6 +3283,10 @@ def page_stockout_risk():
         if "overall_risk_tier" in disp.columns:
             disp["overall_risk_tier"] = disp["overall_risk_tier"].map(lambda t: str(t).capitalize())
         disp = disp.rename(columns=dict(colmap))
+        disp = whole_unit_columns(disp, ["Current Stock", "Lead-Time Demand", "Safety Stock",
+                                         "Reorder Point", "Expected Shortage"])
+        if "Days of Cover" in disp.columns:   # a duration, not an item count
+            disp["Days of Cover"] = as_whole_days_cover(disp["Days of Cover"])
         _sty = disp.style
         if "Risk" in disp.columns:
             _sty = _sty.map(_risk_tier_cell_css, subset=["Risk"])
@@ -3434,7 +3566,7 @@ def _render_active_run_status(run_id):
     updated = rs.format_local_datetime(status_json.get("updated_at") or rec.get("created_at"),
                                        include_date=False)
     sel = rec.get("selected_sku_count")
-    sel_txt = f"{sel} selected" if sel is not None else "selecting…"
+    sel_txt = f"{rs.format_sku_count(sel)} selected" if sel is not None else "selecting…"
 
     # ONE compact status strip: state (left) · context (center) · updated (right).
     # The run id is small text here; the full id lives in Run details.
@@ -3443,7 +3575,7 @@ def _render_active_run_status(run_id):
             f'<div class="ipa-runbar ipa-rb-{tone}">'
             f'<div class="rb-state"><span class="rb-ico">{icon}</span>'
             f'<span class="rb-label">{"Stalled — " + _friendly_status(rec.get("current_step", status)) if _stale else _friendly_status(rec.get("current_step", status))}</span></div>'
-            f'<div class="rb-ctx">{rec.get("category") or "—"} · Top {rec.get("top_n") or "—"} · {sel_txt}</div>'
+            f'<div class="rb-ctx">{rec.get("category") or "—"} · {sel_txt} · Top {rec.get("top_n") or "—"} requested</div>'
             f'<div class="rb-time">Updated {updated}<span class="rb-run" title="{rec.get("run_id")}">'
             f'Run …{str(rec.get("run_id") or "")[-6:]}</span></div></div>',
             unsafe_allow_html=True)
@@ -3698,12 +3830,14 @@ def page_forecast_runs():
         rows.append({
             "Status": (f"stalled ({r['stale_hours']}h)" if r.get("is_stale") else r.get("status")),
             "Created": rs.format_local_datetime(r.get("created_at")),
-            "Category": r.get("category"), "Top N": r.get("top_n"),
+            "Category": r.get("category"), "Top N requested": r.get("top_n"),
             "Ranked by": rs.ranking_metric_label(r.get("ranking_metric")),
-            "SKUs": r.get("selected_sku_count"), "As-of": r.get("as_of_date"),
+            "SKUs selected": r.get("selected_sku_count"), "As-of": r.get("as_of_date"),
             "7-day winner": w.get("7"), "14-day winner": w.get("14"),
             "Operational": r.get("operational_model"),
-            "Duration (s)": r.get("duration_seconds"), "Run ID": r.get("run_id"),
+            "Duration (s)": (round(float(r["duration_seconds"]), 1)
+                             if r.get("duration_seconds") is not None else None),
+            "Run ID": r.get("run_id"),
         })
     _hist_df = pd.DataFrame(rows)
     st.dataframe(_hist_df, width="stretch", hide_index=True, height=280)
@@ -3716,12 +3850,25 @@ def page_forecast_runs():
     completed_ids = [r["run_id"] for r in RUNS_ALL if r["is_completed"]]
     if completed_ids:
         ac1, ac2 = st.columns([3, 1])
-        pick = ac1.selectbox("Activate a completed run", options=completed_ids, key="activate_pick")
+        pick = ac1.selectbox("Inspect / activate a completed run", options=completed_ids,
+                             key="activate_pick",
+                             help="Shows that run's model ranking below. Use Activate to make "
+                                  "it the data source for every page.")
         if ac2.button("Activate", key="activate_history"):
             rec = next(r for r in RUNS_ALL if r["run_id"] == pick)
             st.session_state["_pending_data_source"] = _short_by_id.get(rec["run_id"], rs.format_run_label_short(rec))
             st.rerun()
 
+        _pick_rec = next((r for r in RUNS_ALL if r["run_id"] == pick), None)
+        if _pick_rec is not None:
+            with st.expander(f"Run details — {rs.format_run_label_short(_pick_rec)}", expanded=False):
+                st.caption(rs.format_run_label_full(_pick_rec))
+                try:
+                    _pick_ctx = rs.resolve_run_context(_pick_rec)
+                except rs.RunContextError as exc:
+                    info_banner(f"Run artifacts unavailable: {_esc_html(str(exc))}", kind="synthetic")
+                else:
+                    _render_run_ranking_panel(_pick_ctx, heading=False)
     insp = st.selectbox("Inspect pipeline log (any run)", options=[r["run_id"] for r in RUNS_ALL],
                         key="inspect_run")
     with st.expander("View pipeline log (last 200 lines)", expanded=False):
@@ -3759,6 +3906,10 @@ def page_deadstock():
                 da.STATUS_REVIEW: COLORS["blue"], da.STATUS_NOT: COLORS["success"]}
     DEAD_CLS = {da.STATUS_CANDIDATE: "candidate", da.STATUS_NEVER_SOLD: "never",
                 da.STATUS_REVIEW: "review", da.STATUS_NOT: "not"}
+    # Our sales extract is finite, so the backend's "Never Sold" can only ever mean "no sale
+    # in the history we hold". Relabel for display only; the status values stay untouched.
+    DEAD_LABEL = {da.STATUS_NEVER_SOLD: "No Sale In History"}
+    _dlabel = lambda s: DEAD_LABEL.get(str(s), str(s))
 
     def _short(s, n=42):
         s = str(s)
@@ -3911,31 +4062,47 @@ def page_deadstock():
         f"{'across All Categories' if is_all else f'in {acat}'}", kind="info")
 
     # ── Sales-coverage guard ──────────────────────────────────────────────────────────────
-    # The backend measures inactivity against the STOCK SNAPSHOT date, but ecommerce sales
-    # only extend to _sales_hi. Every day in between is counted as "no sale" when in fact no
-    # sale COULD have been observed. We must not silently reclassify the backend result, so
-    # the gap is disclosed and the affected band is quantified instead.
+    # The backend measures inactivity against the STOCK SNAPSHOT date, but reliable ecommerce
+    # sales coverage ends earlier. Two boundaries matter and they are NOT the same:
+    #   raw_max    — the last date any sales row exists (the tail is sparse and unreliable)
+    #   usable_max — the last date with a plausible full day of demand (the project's own
+    #                completeness rule, shared with the forecast pipeline)
+    # The honest gap is measured to usable_max: days after it cannot be treated as "no sale"
+    # evidence just because a handful of rows leaked into the extract. We disclose and
+    # quantify rather than reclassify — the backend classification contract is untouched.
     try:
         _snap_d = pd.to_datetime(summ["snapshot_date"]).date() if summ.get("snapshot_date") else None
-        _gap = (_snap_d - _sales_hi).days if (_snap_d and _sales_hi) else 0
-    except Exception:
-        _snap_d, _gap = None, 0
+    except (TypeError, ValueError):
+        _snap_d = None
+    try:
+        _sd_diag = sales_date_diagnostics_cached(db_path.stat().st_mtime_ns)
+    except Exception:  # noqa: BLE001 — a diagnostics failure must not take the page down
+        _sd_diag = {}
+    _cov = rs.reliable_coverage_gap(_snap_d, _sd_diag or {"raw_max": _sales_hi})
+    _raw_max, _usable_max, _gap = _cov["raw_max"], _cov["usable_max"], _cov["gap_days"]
     if _gap > 0:
         _dsl = pd.to_numeric(df_all.get("days_since_last_sale"), errors="coerce")
         _is_cand = df_all["deadstock_status"].astype(str).eq(da.STATUS_CANDIDATE)
         _band = _is_cand & _dsl.ge(interval_a) & _dsl.lt(interval_a + _gap)
         _n_band = int(_band.sum())
         _bv = pd.to_numeric(df_all.loc[_band, "estimated_deadstock_value"], errors="coerce").sum()
+        _dates = [f"Inventory snapshot: <strong>{_pretty_date(_snap_d)}</strong>"]
+        if _raw_max:
+            _dates.append(f"raw sales extract through <strong>{_pretty_date(_raw_max)}</strong>")
+        if _usable_max:
+            _dates.append("sales considered complete through "
+                          f"<strong>{_pretty_date(_usable_max)}</strong>")
         _extra = ""
         if _n_band:
             _extra = (f" <strong>{format_number(_n_band)}</strong> candidate(s) "
-                      f"({format_currency(_bv)}) sit within {_gap} days of the threshold and would "
-                      f"fall below it if measured from the last sales date — treat those as "
-                      f"borderline, not confirmed.")
+                      f"({format_currency(_bv)}) fall within {_gap} days of the "
+                      f"{interval_a}-day threshold and would drop below it if measured from the "
+                      f"reliable sales boundary — treat those as borderline, not confirmed.")
         info_banner(
-            f"<strong>Sales-coverage gap:</strong> inactivity is measured to the stock snapshot "
-            f"({_pretty_date(_snap_d)}) but ecommerce sales only run to {_pretty_date(_sales_hi)} — "
-            f"a {_gap}-day window in which no sale could be recorded either way.{_extra}",
+            f"<strong>Sales-coverage gap:</strong> {' · '.join(_dates)}. Inactivity is classified "
+            f"against the stock snapshot, but reliable ecommerce sales coverage ends "
+            f"<strong>{_gap} days</strong> earlier, so products near the threshold are being aged "
+            f"over a window we cannot fully observe.{_extra}",
             kind="warning")
 
     # ── Section 1 — five KPI cards (full completed analysis) ──────────────────────────────
@@ -3968,7 +4135,8 @@ def page_deadstock():
         vals = [float(pd.to_numeric(df_all[df_all["deadstock_status"] == s]["estimated_deadstock_value"],
                                     errors="coerce").dropna().sum()) for s in present]
         donut = go.Figure(go.Pie(
-            labels=present, values=counts, hole=0.62, sort=False, direction="clockwise",
+            labels=[_dlabel(s) for s in present], values=counts, hole=0.62, sort=False,
+            direction="clockwise",
             marker=dict(colors=[DEAD_HEX[s] for s in present], line=dict(color="white", width=1.5)),
             textinfo="value", customdata=list(zip(units, vals)),
             hovertemplate=("<b>%{label}</b><br>Products: %{value} (%{percent})<br>"
@@ -3983,8 +4151,9 @@ def page_deadstock():
     with cb:
         ag = da.deadstock_aging_summary(df_all, interval_a)
         bar = go.Figure(go.Bar(
-            x=ag["bucket"], y=ag["products"],
-            marker=dict(color=[COLORS["slate"] if b == "Never Sold" else COLORS["teal"] for b in ag["bucket"]]),
+            x=[_dlabel(b) for b in ag["bucket"]], y=ag["products"],
+            marker=dict(color=[COLORS["slate"] if b == da.STATUS_NEVER_SOLD else COLORS["teal"]
+                               for b in ag["bucket"]]),
             customdata=np.stack([ag["units"].to_numpy(), ag["value"].to_numpy()], axis=-1),
             hovertemplate=("<b>%{x}</b><br>Products: %{y}<br>Stock units: %{customdata[0]:,.0f}<br>"
                            "Est. value: PKR %{customdata[1]:,.0f}<extra></extra>")))
@@ -3993,7 +4162,8 @@ def page_deadstock():
         bar.update_yaxes(title_text="Products")
         bar.update_xaxes(title_text="")
         render_chart(bar, "Inactivity Aging",
-                     "Mutually exclusive inactivity buckets; Never Sold is separate (no last-sale date).")
+                     "Mutually exclusive inactivity buckets; No Sale In History is separate "
+                     "(no last-sale date in the available extract).")
 
     # ── Section 3 — value exposure (context-aware) ─────────────────────────────────────────
     if is_all:
@@ -4261,10 +4431,20 @@ def page_deadstock():
     # ── Complete dataset (currently filtered rows) ─────────────────────────────────────────
     with st.expander("View Complete Deadstock Dataset", expanded=False):
         disp = da.deadstock_export_frame(ranked)
+        # Stock is a count of items; cost and value are money. Neither should render as a
+        # bare float. Status uses the same corrected wording as the KPI and the charts.
+        disp = whole_unit_columns(disp, ["Current Stock"])
+        if "Unit Cost" in disp.columns:
+            disp["Unit Cost"] = disp["Unit Cost"].map(lambda v: format_currency(v, 2))
+        if "Estimated Deadstock Value" in disp.columns:
+            disp["Estimated Deadstock Value"] = disp["Estimated Deadstock Value"].map(format_currency)
+        if "Status" in disp.columns:
+            disp["Status"] = disp["Status"].map(_dlabel)
 
         def _status_css(val):
             m = {da.STATUS_CANDIDATE: ("#FBF0DC", COLORS["amber"]),
                  da.STATUS_NEVER_SOLD: ("#EAEEF3", COLORS["slate"]),
+                 DEAD_LABEL[da.STATUS_NEVER_SOLD]: ("#EAEEF3", COLORS["slate"]),
                  da.STATUS_REVIEW: ("#E5EDFD", COLORS["blue"]),
                  da.STATUS_NOT: ("#E4F5EC", COLORS["success"])}
             if val in m:
@@ -4289,7 +4469,7 @@ PAGE_FUNCS = {
     "Demand Analytics": page_demand_analytics,
     "Forecast Runs": page_forecast_runs,
     "Forecast Explorer": page_forecast_explorer,
-    "Inventory & Reorder": page_inventory_reorder,
+    "Inventory & Replenishment": page_inventory_reorder,
     "Deadstock": page_deadstock,
     "Stockout Risk": page_stockout_risk,
     "Data Quality & Assumptions": page_data_quality,

@@ -288,7 +288,9 @@ def test_19g_risk_ranked_run_is_marked_in_labels(tmp_path):
     (run / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
     rec = rs.discover_runs(tmp_path / "runs")[0]
     assert rs.is_risk_ranked(rec) is True
-    assert rs.RISK_RANKED_SYMBOL in rs.format_run_label_short(rec)
+    short = rs.format_run_label_short(rec)
+    assert "Risk" in short                       # spelled out, not an unexplained glyph
+    assert rs.RISK_RANKED_SYMBOL not in short
     assert "by stockout risk" in rs.format_run_label_full(rec)
 
 
@@ -651,7 +653,7 @@ def test_56_format_run_label_uses_pakistan_time():
                                  "category": "Groceries & Pets", "top_n": 10, "status": "completed"})
     assert label.startswith(PKT_EXPECTED)
     assert "PKT" in label and "06:03" not in label
-    assert label == f"{PKT_EXPECTED} · Groceries & Pets · Top 10 · completed"
+    assert label == f"{PKT_EXPECTED} · Groceries & Pets · Top 10 by units sold · completed"
 
 
 def test_57_display_timezone_is_karachi():
@@ -1033,7 +1035,10 @@ def test_70_short_label_is_compact_format():
 
 
 def test_71_short_label_status_symbol():
-    assert rs.format_run_label_short(_lbl_rec(status="completed")).endswith("✓")
+    # A plain ✓ is dropped — every completed run would carry one, so it costs sidebar width
+    # without distinguishing anything. States that need attention still show their symbol.
+    done = rs.format_run_label_short(_lbl_rec(status="completed"))
+    assert not done.endswith("✓") and done.endswith("Sales")
     assert rs.format_run_label_short(_lbl_rec(status="failed")).endswith("✕")
     assert rs.format_run_label_short(_lbl_rec(status="completed_with_warnings")).endswith("⚠")
 
@@ -1217,7 +1222,7 @@ def test_89_date_controls_only_on_historical_pages():
     at = _app()
     for page, expected in (("Executive Overview", True), ("Demand Analytics", True),
                            ("Forecast Explorer", True), ("Stockout Risk", False),
-                           ("Inventory & Reorder", False), ("Data Quality & Assumptions", False)):
+                           ("Inventory & Replenishment", False), ("Data Quality & Assumptions", False)):
         at.session_state["nav_page"] = page
         at.run()
         labels = {d.label for d in at.date_input}
@@ -1405,3 +1410,291 @@ def test_114_unparseable_timestamp_does_not_crash_discovery(tmp_path):
     _make_running_run(tmp_path, updated="not-a-timestamp")
     r = rs.discover_runs(tmp_path)[0]
     assert r["is_stale"] is False and r["stale_hours"] is None   # unknown age != dead
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# CEO-demo regression guards. Each test below pins a bug that was reproduced on real
+# data and fixed; the comment names the wrong behaviour so a regression is obvious.
+# Pure-helper tests first (fast, no app), then AppTest cases for app-level wiring.
+# ══════════════════════════════════════════════════════════════════════════════════
+def _run_rec(run_id="r1", *, created="2026-08-10T10:34:00+00:00", category="Phones & Computers",
+             top_n=10, selected=None, metric="stockout_risk", status="completed"):
+    """A discover_runs-shaped record; only the label-relevant keys matter here."""
+    return {"run_id": run_id, "created_at": created, "category": category, "top_n": top_n,
+            "selected_sku_count": selected, "ranking_metric": metric, "status": status}
+
+
+def test_115_sku_count_is_grammatical_and_absent_when_unknown():
+    assert rs.format_sku_count(1) == "1 SKU"          # never "1 SKUs"
+    assert rs.format_sku_count(10) == "10 SKUs"
+    assert rs.format_sku_count(0) == "0 SKUs"
+    assert rs.format_sku_count(None) is None          # unknown must not read as zero
+
+
+def test_116_selected_count_preferred_over_requested_top_n():
+    actual, is_actual = rs.selected_or_requested(_run_rec(selected=1, top_n=10))
+    assert (actual, is_actual) == ("1 SKU", True)
+    # Selection has not happened yet -> fall back to the request, flagged as a request.
+    pending, is_actual = rs.selected_or_requested(_run_rec(selected=None, top_n=10,
+                                                           status="running_baseline"))
+    assert (pending, is_actual) == ("Top 10", False)
+
+
+def test_117_risk_run_label_shows_actual_count_and_ranking_not_top_n():
+    # The bug: a run that requested Top 10 and selected ONE product was labelled
+    # "Top 10", and risk ranking was implied only by a bare ⚡ icon.
+    label = rs.format_run_label_short(_run_rec(selected=1, top_n=10, metric="stockout_risk"))
+    assert "1 SKU" in label and "1 SKUs" not in label
+    assert "Risk" in label
+    assert "Top 10" not in label
+    assert rs.RISK_RANKED_SYMBOL not in label          # a word, not an unexplained glyph
+
+
+def test_118_units_run_label_reads_sku_count_and_sales():
+    label = rs.format_run_label_short(
+        _run_rec(run_id="r2", category="Groceries & Pets", selected=10, top_n=10, metric="units"))
+    assert "10 SKUs" in label and "Sales" in label and "Top 10" not in label
+
+
+def test_119_labels_stay_unique_when_runs_are_otherwise_identical():
+    same = [_run_rec(run_id="20260803T010000Z_a_aaaaaa", selected=10, metric="units"),
+            _run_rec(run_id="20260803T020000Z_b_bbbbbb", selected=10, metric="units")]
+    labels = rs.build_short_labels(same)
+    assert len(set(labels.values())) == 2, labels
+
+
+def test_120_coverage_gap_anchors_on_usable_max_not_raw_max():
+    # Real warehouse shape: snapshot 07 Aug, raw sales tail to 31 Jul, but only 23 Jul is
+    # complete. Anchoring on raw_max reports a 7-day gap and understates the borderline band.
+    cov = rs.reliable_coverage_gap(
+        "2026-08-07", {"raw_max": date(2026, 7, 31), "usable_max": date(2026, 7, 23)})
+    assert cov["anchor"] == date(2026, 7, 23)
+    assert cov["gap_days"] == 15                       # NOT 7
+    assert cov["raw_max"] == date(2026, 7, 31)         # still reported, for disclosure
+
+
+def test_121_coverage_gap_degrades_safely():
+    # No completeness verdict -> fall back to raw_max rather than claiming no gap.
+    assert rs.reliable_coverage_gap("2026-08-07", {"raw_max": date(2026, 7, 31)})["gap_days"] == 7
+    assert rs.reliable_coverage_gap("2026-08-07", {})["gap_days"] == 0
+    assert rs.reliable_coverage_gap(None, {"usable_max": date(2026, 7, 23)})["gap_days"] == 0
+    # A snapshot OLDER than sales coverage is not a negative gap.
+    assert rs.reliable_coverage_gap("2026-07-01", {"usable_max": date(2026, 7, 23)})["gap_days"] == 0
+
+
+def test_122_stock_provenance_never_claims_live_for_a_completed_run():
+    real = rs.stock_provenance_note(0, 12, "07 Aug 2026")
+    assert "live" not in real.lower()
+    assert "used by this run" in real and "07 Aug 2026" in real
+    partial = rs.stock_provenance_note(3, 12)
+    assert "3 of 12" in partial and "remaining rows use warehouse stock" in partial
+    assert rs.stock_provenance_note(12, 12) == "12 of 12 stock figures are synthetically reconstructed"
+
+
+# ── App-level wiring (AppTest). These read the REAL runs/ directory, so each test skips
+# ── when the repo has no run of the shape it needs rather than asserting on absent data.
+def _completed_runs_on_disk():
+    return [r for r in rs.discover_runs() if r.get("is_completed")]
+
+
+def _label_for(rec):
+    return rs.build_short_labels(_completed_runs_on_disk())[rec["run_id"]]
+
+
+def _has_decisions(rec):
+    d = Path(rec["run_dir"]) / "decisions"
+    return d.is_dir() and any(d.glob("*.parquet"))
+
+
+def _pick_run(min_skus=2, *, decisions=True):
+    """Largest completed run matching the shape a test needs.
+
+    ``decisions`` matters: runs made before Phase B/C have no decision artifacts and are
+    SUPPOSED to fall back to the baseline simulation, so decision-behaviour tests must not
+    pick one.
+    """
+    cands = [r for r in _completed_runs_on_disk()
+             if (r.get("selected_sku_count") or 0) >= min_skus
+             and _has_decisions(r) == decisions]
+    if not cands:
+        pytest.skip(f"no completed run with >= {min_skus} SKUs and decisions={decisions}")
+    return max(cands, key=lambda r: r.get("selected_sku_count") or 0)
+
+
+def _app_on(page, *, source=None, state=None):
+    from streamlit.testing.v1 import AppTest
+    at = AppTest.from_file(str(APP_PY), default_timeout=300)
+    if source is not None:
+        at.session_state["data_source_choice"] = source
+    for k, v in (state or {}).items():
+        at.session_state[k] = v
+    at.session_state["nav_page"] = page
+    at.run()
+    assert not at.exception, f"{page}: {at.exception}"
+    return at
+
+
+def _text(at):
+    return " ".join(str(m.value) for m in at.markdown)
+
+
+def _queue_count(at):
+    m = _re.search(r">(\d+) in queue<", _text(at))
+    return int(m.group(1)) if m else None
+
+
+def _queue_skus(at):
+    return sorted(set(_re.findall(r'class="q-sub">SKU ([^<]+)<', _text(at))))
+
+
+def _panel_rows(at):
+    """metric_panel label -> value pairs."""
+    return {k.strip(): v.strip() for k, v in
+            _re.findall(r'class="l">([^<]+)</span><span class="v">([^<]+)<', _text(at))}
+
+
+def test_123_fixed_horizon_forecast_kpis_do_not_follow_the_horizon_selector():
+    # The bug: the 7d/14d KPIs were sliced from the horizon-truncated frame, so selecting a
+    # 7-day horizon made "Forecasted 14-Day Demand" collapse onto the 7-day number.
+    run = _pick_run(min_skus=2)
+    label = _label_for(run)
+    # Pin the page to a product that actually has demand in days 8-14, otherwise the
+    # magnitude check below compares 0 with 0 and proves nothing. The product filter also
+    # makes the page's focus deterministic instead of "whichever SKU sorts first".
+    fc = pd.read_parquet(Path(run["run_dir"]) / "selected_forecasts.parquet")
+    fc = fc.sort_values(["sku", "date"])
+    totals = {sku: (g["y_pred"].head(7).sum(), g["y_pred"].head(14).sum())
+              for sku, g in fc.groupby("sku")}
+    busiest = [s for s, (a, b) in sorted(totals.items(), key=lambda kv: -kv[1][1]) if b > a]
+    if not busiest:
+        pytest.skip("no product in this run has demand beyond day 7")
+    state = {"flt_skus": [busiest[0]]}
+    k7 = _kpis(_app_on("Forecast Explorer", source=label, state={**state, "flt_horizon": 7}))
+    k14 = _kpis(_app_on("Forecast Explorer", source=label, state={**state, "flt_horizon": 14}))
+    key7, key14 = "Forecasted 7-Day Demand", "Forecasted 14-Day Demand"
+    if key7 not in k7 or key14 not in k7:
+        pytest.skip("forecast KPI cards not rendered for this run")
+    assert k7[key7] == k14[key7], "7-day KPI moved with the horizon selector"
+    assert k7[key14] == k14[key14], "14-day KPI moved with the horizon selector"
+    num = lambda s: float(str(s).replace(",", ""))
+    assert num(k7[key14]) > num(k7[key7]), "14-day demand collapsed onto the 7-day value"
+
+
+def test_124_historical_date_filter_does_not_change_decision_queues():
+    # Historical From/To is a DISPLAY control for sales history. Decision artifacts are
+    # produced by the run and must not shrink because a sparse date was selected.
+    label = _label_for(_pick_run(min_skus=2))
+    narrow = {"flt_date_from": _dt.date(2026, 1, 1), "flt_date_to": _dt.date(2026, 1, 1)}
+    for page in ("Stockout Risk", "Inventory & Replenishment"):
+        wide = _queue_count(_app_on(page, source=label))
+        if wide is None:
+            pytest.skip(f"{page} renders no queue for this run")
+        tight = _queue_count(_app_on(page, source=label, state=narrow))
+        assert tight == wide, f"{page}: date filter changed the queue ({wide} -> {tight})"
+
+
+def test_125_product_filter_still_narrows_decision_queues():
+    # Guard against "fixing" 124 by disconnecting product filtering entirely.
+    label = _label_for(_pick_run(min_skus=2))
+    at = _app_on("Stockout Risk", source=label)
+    full, skus = _queue_count(at), _queue_skus(at)
+    if not full or full < 2 or not skus:
+        pytest.skip("run has too few risk rows to narrow")
+    for page in ("Stockout Risk", "Inventory & Replenishment"):
+        n = _queue_count(_app_on(page, source=label, state={"flt_skus": [skus[0]]}))
+        assert n is not None and n < full, f"{page}: product filter did not narrow ({n} vs {full})"
+
+
+def test_126_executive_reorder_cards_respect_the_product_filter():
+    # The bug: the Executive panel read the whole-run reorder_summary.json, so filtering to
+    # one product still showed the run-wide order count.
+    run = _pick_run(min_skus=2)
+    label = _label_for(run)
+    wide = _panel_rows(_app_on("Executive Overview", source=label))
+    if "Order Now" not in wide:
+        pytest.skip("no reorder panel for this run")
+    skus = _queue_skus(_app_on("Stockout Risk", source=label))
+    if not skus:
+        pytest.skip("cannot recover a SKU to filter by")
+    tight = _panel_rows(_app_on("Executive Overview", source=label, state={"flt_skus": [skus[0]]}))
+    denom = lambda s: s.split("/")[-1].strip()
+    assert denom(wide["Order Now"]) == str(run["selected_sku_count"]),         f"unfiltered panel should cover the whole run, got {wide['Order Now']}"
+    assert denom(tight["Order Now"]) == "1",         f"filtered panel should cover 1 product, got {tight['Order Now']}"
+
+
+def test_127_run_mode_insights_use_decision_artifacts_not_the_baseline_simulation():
+    cards = _re.findall(r'class="txt">([^<]+)<',
+                        _text(_app_on("Executive Overview", source=_label_for(_pick_run(min_skus=1)))))
+    joined = " ".join(cards)
+    assert "baseline simulation" not in joined,         "run mode still shows the legacy synthetic reorder insight"
+    assert any(k in joined for k in ("order-now", "stockout tier", "manual review")),         f"no forecast-driven insight surfaced: {cards}"
+
+
+def test_128_pre_decisioning_run_keeps_the_baseline_insight_fallback():
+    # The other half of 127: a run with no Phase B/C artifacts must still say something,
+    # and the honest thing to say is that it came from the baseline simulation.
+    run = _pick_run(min_skus=1, decisions=False)
+    cards = _re.findall(r'class="txt">([^<]+)<', _text(_app_on("Executive Overview",
+                                                               source=_label_for(run))))
+    assert any("baseline simulation" in c for c in cards), cards
+
+
+def test_129_deep_dive_follows_the_product_filter():
+    # The bug: with a product selected in the filter but "Compare products" left blank, the
+    # deep-dive fell back to the first SKU of the WHOLE catalogue — so it charted a product
+    # the filter had excluded and rendered "No data for this product in the current view".
+    run = _pick_run(min_skus=3)
+    panel = pd.read_parquet(Path(run["run_dir"]) / "processed" / "model_panel.parquet")
+    skus = sorted(panel["sku"].unique().tolist())
+    target = skus[-1]                                  # deliberately not the first product
+    at = _app_on("Demand Analytics", source=_label_for(run), state={"flt_skus": [target]})
+    txt = _text(at)
+    heads = _re.findall(r'ipa-section-title">Deep-Dive · ([^<]+)<', txt)
+    assert heads, "no deep-dive rendered"
+    assert target in heads[0], f"deep-dive charted {heads[0]!r} instead of the filtered {target}"
+    assert "No data for this product" not in _re.sub(r"<[^>]+>", " ", txt)
+
+
+def test_130_forecast_table_shows_whole_units():
+    # Products are counted in whole items; a predicted 41.642857 in a CEO-facing table is
+    # noise. Accuracy metrics keep their decimals and are checked separately.
+    at = _app_on("Forecast Explorer", source=_label_for(_pick_run(min_skus=2)))
+    tables = [el.value for el in at.dataframe]
+    frames = [t for t in tables if isinstance(t, pd.DataFrame)
+              and {"Date", "Predicted", "Cumulative"} <= set(t.columns)]
+    if not frames:
+        pytest.skip("daily forecast table not rendered for this run")
+    daily = frames[0]
+    for col in ("Predicted", "Cumulative"):
+        vals = pd.to_numeric(daily[col], errors="coerce").dropna()
+        assert (vals % 1 == 0).all(), f"{col} still shows fractional units: {vals.head().tolist()}"
+    assert daily["Cumulative"].iloc[-1] >= daily["Predicted"].iloc[0]
+
+
+def test_131_days_of_cover_displays_as_whole_days_rounded_up():
+    # Days of cover is read off the queue cards at a glance; "6.2 days cover" is precision
+    # the number does not carry. Displayed as whole days, rounded up. Tiering still happens
+    # in the backend on the raw value, so this is presentation only.
+    import math
+    run = _pick_run(min_skus=2)
+    label = _label_for(run)
+    reco = pd.read_parquet(Path(run["run_dir"]) / "decisions" / "reorder_recommendations.parquet")
+    raw = pd.to_numeric(reco.get("days_of_cover"), errors="coerce").dropna()
+    for page in ("Stockout Risk", "Inventory & Replenishment"):
+        at = _app_on(page, source=label)
+        cards = _re.findall(r'<b>([\d,.—]+)</b><div class="q-sub">days cover</div>', _text(at))
+        assert cards, f"{page}: no days-cover cards rendered"
+        assert not [c for c in cards if "." in c], \
+            f"{page}: fractional days of cover still shown: {[c for c in cards if '.' in c]}"
+        for el in at.dataframe:
+            v = el.value
+            if not isinstance(v, pd.DataFrame):
+                continue
+            for col in [c for c in v.columns if str(c) in ("Days of Cover", "Days Cover")]:
+                vals = pd.to_numeric(v[col], errors="coerce").dropna()
+                assert (vals % 1 == 0).all(), f"{page}/{col} still fractional"
+    if not raw.empty:
+        expected = {str(int(math.ceil(x))) for x in raw}
+        shown = set(_re.findall(r'<b>([\d]+)</b><div class="q-sub">days cover</div>',
+                                _text(_app_on("Inventory & Replenishment", source=label))))
+        assert shown <= expected, f"displayed days {shown - expected} are not ceil() of the artifact"

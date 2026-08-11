@@ -653,6 +653,126 @@ def ranking_metric_label(metric) -> str:
     return RANKING_METRIC_LABELS.get(str(metric or METRIC_UNITS), str(metric))
 
 
+# One-word ranking tag for space-constrained labels (the sidebar selectbox).
+RANKING_METRIC_TAGS = {METRIC_UNITS: "Sales", METRIC_STOCKOUT_RISK: "Risk"}
+
+
+def ranking_metric_tag(metric) -> str:
+    """'Sales' / 'Risk' — the compact form used in the Data source dropdown."""
+    return RANKING_METRIC_TAGS.get(str(metric or METRIC_UNITS), str(metric or "?"))
+
+
+def format_sku_count(n) -> "str | None":
+    """'1 SKU' / '10 SKUs', or None when the count is not yet known.
+
+    A run only has a real count once selection has happened, so callers must fall back to
+    the REQUESTED Top N — never present a request as an outcome.
+    """
+    try:
+        count = int(n)
+    except (TypeError, ValueError):
+        return None
+    if count < 0:
+        return None
+    return f"{count} SKU" if count == 1 else f"{count} SKUs"
+
+
+def selected_or_requested(record: dict) -> "tuple[str, bool]":
+    """(text, is_actual) describing how many products a run covers.
+
+    Returns the ACTUAL selected count when the run got far enough to select, otherwise the
+    requested Top N clearly marked as a request. Requesting Top 10 in a thin category can
+    yield a single product, so a label that just says "Top 10" misrepresents the run.
+    """
+    rec = record or {}
+    actual = format_sku_count(rec.get("selected_sku_count"))
+    if actual:
+        return actual, True
+    top_n = rec.get("top_n")
+    return (f"Top {top_n}" if top_n not in (None, "") else "?"), False
+
+
+# Display-only names for the operational model. Presentation layer: the winner is chosen by
+# the ranking rule in the backend and is never influenced by anything here.
+OPERATIONAL_MODEL_LABELS = {
+    "last_day_naive": "Last-day naive",
+    "seasonal_naive_7": "Seasonal naive (7d)",
+    "moving_average_7": "Moving average (7d)",
+    "moving_average_14": "Moving average (14d)",
+    "holtwinters": "Holt-Winters",
+    "lightgbm": "LightGBM",
+}
+
+
+def operational_model_label(model) -> str:
+    """Readable name for the winning model; unknown values pass through unchanged."""
+    if model in (None, ""):
+        return "—"
+    return OPERATIONAL_MODEL_LABELS.get(str(model), str(model))
+
+
+def reliable_coverage_gap(snapshot_date, diagnostics: dict) -> dict:
+    """Days between a stock snapshot and the RELIABLE end of ecommerce sales coverage.
+
+    Deadstock ages a product against the stock snapshot, but the extract's trailing days are
+    sparse — ``raw_max`` is simply the last row that exists, not the last day we can treat as
+    fully observed. Anchoring on ``usable_max`` is what makes the borderline band honest;
+    anchoring on ``raw_max`` understates it and implies coverage we do not have.
+
+    Returns ``{snapshot, raw_max, usable_max, anchor, gap_days}``. ``gap_days`` is 0 when the
+    dates are missing or the snapshot is not newer than the anchor. Never raises.
+    """
+    diag = diagnostics or {}
+
+    def _as_date(v):
+        if v in (None, ""):
+            return None
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+        try:
+            return datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return None
+
+    snap = _as_date(snapshot_date)
+    raw_max = _as_date(diag.get("raw_max"))
+    usable_max = _as_date(diag.get("usable_max"))
+    anchor = usable_max or raw_max
+    gap = (snap - anchor).days if (snap and anchor) else 0
+    return {"snapshot": snap, "raw_max": raw_max, "usable_max": usable_max,
+            "anchor": anchor, "gap_days": max(0, gap)}
+
+
+def stock_provenance_note(synthetic_count, total_rows, snapshot_date=None) -> str:
+    """Describe where a COMPLETED run's stock figures came from.
+
+    A finished run is frozen: it may hold real warehouse stock, but that stock is whatever
+    the snapshot held when the run executed, not today's position. Calling it "live" claims
+    a freshness the artifact cannot support, so the wording is tied to the run. The Deadstock
+    page is different — it queries the shared warehouse at render time — and keeps its own
+    wording.
+    """
+    try:
+        syn = int(synthetic_count or 0)
+    except (TypeError, ValueError):
+        syn = 0
+    try:
+        total = int(total_rows or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if syn > 0:
+        note = f"{syn} of {total} stock figures are synthetically reconstructed"
+        if syn < total:
+            note += "; remaining rows use warehouse stock"
+        return note
+    base = "Real warehouse stock snapshot used by this run"
+    if snapshot_date:
+        return f"{base} · {snapshot_date}"
+    return base
+
+
 def is_risk_ranked(record: dict) -> bool:
     return str((record or {}).get("ranking_metric") or METRIC_UNITS) == METRIC_STOCKOUT_RISK
 
@@ -664,31 +784,33 @@ def format_run_label_full(record: dict) -> str:
     if when == "—":
         when = str(record.get("created_at") or "?")
     cat = record.get("category") or "?"
-    top = f"Top {record.get('top_n')}"
-    if is_risk_ranked(record):
-        top += " by stockout risk"
-    return f"{when} · {cat} · {top} · {record.get('status')}"
+    scope, is_actual = selected_or_requested(record)
+    if is_actual and record.get("top_n") not in (None, ""):
+        scope = f"{scope} of Top {record.get('top_n')} requested"
+    scope += f" by {ranking_metric_label(record.get('ranking_metric')).lower()}"
+    return f"{when} · {cat} · {scope} · {record.get('status')}"
 
 
 def format_run_label_short(record: dict, *, disambiguate: bool = False) -> str:
-    """Compact selectbox label that fits the sidebar: '31 Jul · Groceries & Pets · Top 10 · ✓'.
+    """Compact selectbox label that fits the sidebar: '31 Jul · Groceries & Pets · 10 SKUs · Sales'.
 
     Deliberately omits the full timestamp, 'PKT', the operational model, the complete run id
     and the long status word — those live in the tooltip and the Run details expander.
     ``disambiguate`` appends the run id's last 6 characters when two runs would otherwise
-    collide (same day + category + Top N).
+    collide (same day + category + SKU count + ranking).
     """
     when = format_local_datetime(record.get("created_at"), include_time=False,
                                  include_timezone=False)
     day = "?" if when == "—" else when[:6].strip()          # '29 Jul 2026' -> '29 Jul'
     cat = record.get("category") or "?"
-    top = f"Top {record.get('top_n')}"
-    if is_risk_ranked(record):
-        top = f"{top} {RISK_RANKED_SYMBOL}"
-    parts = [day, str(cat), top]
+    # Actual SKU count + a spelled-out ranking tag. The previous label read "Top 10" even
+    # when the run selected one product, and used a bare ⚡ as the only hint that ranking was
+    # risk-based — neither survives being read aloud in a presentation.
+    scope, _ = selected_or_requested(record)
+    parts = [day, str(cat), scope, ranking_metric_tag(record.get("ranking_metric"))]
     sym = STATUS_SYMBOLS.get(str(record.get("status")))
-    if sym:
-        parts.append(sym)
+    if sym and sym != STATUS_SYMBOLS.get("completed"):
+        parts.append(sym)                                   # surface ⚠ / ✕, not a plain ✓
     if disambiguate:
         parts.append(str(record.get("run_id") or "")[-6:])
     return " · ".join(p for p in parts if p)
@@ -696,7 +818,7 @@ def format_run_label_short(record: dict, *, disambiguate: bool = False) -> str:
 
 def build_short_labels(records: "list[dict]") -> dict:
     """run_id -> UNIQUE short label. Collisions get the run-id suffix appended so two runs
-    from the same day/category/Top-N stay distinguishable in the selectbox."""
+    from the same day/category/SKU-count/ranking stay distinguishable in the selectbox."""
     counts: dict[str, int] = {}
     for r in records:
         counts[format_run_label_short(r)] = counts.get(format_run_label_short(r), 0) + 1
